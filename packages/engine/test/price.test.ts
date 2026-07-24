@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { createRng } from '../src/rng'
-import { advance, tickStock, type Stock } from '../src/price'
+import { advance, driftTowardStep, tickStock, type Stock } from '../src/price'
 import { DEFAULT_DT_YEARS, dtYears, TIME_COMPRESSION_FACTOR } from '../src/config'
 
 function makeStock(overrides: Partial<Stock> = {}): Stock {
@@ -110,5 +110,61 @@ describe('GBM price model', () => {
     const totalSimYears = realEventSeconds * dtYears(1)
     expect(totalSimYears).toBeCloseTo(0.5, 6)
     expect(TIME_COMPRESSION_FACTOR).toBeCloseTo(2190, 6)
+  })
+})
+
+describe('driftTowardStep — news absorption (wiggle + drift toward target)', () => {
+  const dt = dtYears(1)
+
+  /** Run a full absorption window of `n` ticks from `start` toward `target`. */
+  function absorb(start: number, target: number, vol: number, reversion: number, n: number, seed: number) {
+    const rng = createRng(seed)
+    const path = [start]
+    let price = start
+    for (let i = 0; i < n; i++) {
+      price = driftTowardStep(price, target, vol, rng.normal(), reversion, dt)
+      path.push(price)
+    }
+    return path
+  }
+
+  it('wanders up and down but trends toward the target over a full window', () => {
+    const start = 70
+    const target = 80
+    const move = target - start
+    const path = absorb(start, target, 0.35, 0.025, 120, 4242)
+    const end = path[path.length - 1]
+
+    // Lands CLOSE to the target — within a small fraction of the total move...
+    expect(Math.abs(end - target)).toBeLessThan(0.2 * move)
+    // ...and much nearer the target than where it started (it really moved there).
+    expect(Math.abs(end - target)).toBeLessThan(Math.abs(end - start))
+
+    // GENUINE up-and-down variation, not a monotonic ramp/snap.
+    let ups = 0
+    let downs = 0
+    for (let i = 1; i < path.length; i++) {
+      if (path[i] > path[i - 1]) ups++
+      else if (path[i] < path[i - 1]) downs++
+    }
+    expect(ups).toBeGreaterThan(5)
+    expect(downs).toBeGreaterThan(5) // it dips even while trending up
+    const monotonic = path.every((p, i) => i === 0 || p >= path[i - 1])
+    expect(monotonic).toBe(false)
+  })
+
+  it('is NOT an instant snap: after the first tick it is nowhere near the target', () => {
+    const path = absorb(70, 80, 0.35, 0.025, 120, 4242)
+    // One tick moves only ~reversion of the way, so it is still close to start.
+    expect(Math.abs(path[1] - 70)).toBeLessThan(0.15 * (80 - 70))
+  })
+
+  it('works downward too (target below start) and stays deterministic per seed', () => {
+    const down = absorb(250, 225, 0.4, 0.03, 120, 99)
+    expect(down[down.length - 1]).toBeLessThan(235) // clearly pulled down toward 225
+    // Same seed => identical path (engine determinism carries through).
+    const a = absorb(100, 110, 0.3, 0.03, 50, 7)
+    const b = absorb(100, 110, 0.3, 0.03, 50, 7)
+    expect(a).toEqual(b)
   })
 })
