@@ -3,11 +3,16 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "npm test --workspace=packages/engine",
+    "test:engine": "npm test --workspace @iimb-trading/engine"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.110.7",
