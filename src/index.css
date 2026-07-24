@@ -2,19 +2,46 @@
 @import "tailwindcss";
 
 /*
- * PP Editorial New (display font) is licensed and not bundled here.
- * Once you have the font files, drop them in src/assets/fonts/ and
- * uncomment the @font-face below, then swap the --font-display value
- * in the @theme block from the serif fallback to 'PP Editorial New'.
- *
- * @font-face {
- *   font-family: 'PP Editorial New';
- *   src: url('./assets/fonts/PPEditorialNew-Regular.woff2') format('woff2');
- *   font-weight: 400;
- *   font-style: normal;
- *   font-display: swap;
- * }
+ * PP Editorial New (display font). Licensed OTF files live in
+ * src/assets/fonts/, decoded from the base64 sources in the Mochatrade
+ * marketing site. Five weights/styles are registered below; the marketing
+ * site's display treatment uses the Ultralight (200) cut.
  */
+@font-face {
+  font-family: 'PP Editorial New';
+  src: url('./assets/fonts/PPEditorialNew-Ultralight.otf') format('opentype');
+  font-weight: 200;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PP Editorial New';
+  src: url('./assets/fonts/PPEditorialNew-UltralightItalic.otf') format('opentype');
+  font-weight: 200;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PP Editorial New';
+  src: url('./assets/fonts/PPEditorialNew-Regular.otf') format('opentype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PP Editorial New';
+  src: url('./assets/fonts/PPEditorialNew-Ultrabold.otf') format('opentype');
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'PP Editorial New';
+  src: url('./assets/fonts/PPEditorialNew-UltraboldItalic.otf') format('opentype');
+  font-weight: 800;
+  font-style: italic;
+  font-display: swap;
+}
 
 @theme {
   --color-background: #030303;
