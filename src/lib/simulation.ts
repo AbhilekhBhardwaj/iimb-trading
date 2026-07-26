@@ -169,11 +169,17 @@ export function stepPrices(prev: readonly number[], elapsed: number, rng: Rng, d
   return INITIAL_STOCKS.map((base, i) => {
     const price = prev[i]
     const inf = influenceOn(base.ticker, base.sector, elapsed)
-    if (inf.frozen) return price
+    // Absorption from an EARLIER headline continues even while a NEWER headline
+    // is inside its 30s reaction window. The newer headline's delta is simply
+    // deferred (it's not yet in targetDelta) — we must not freeze the whole
+    // stock, which would wrongly halt an in-progress meander. So `absorbing`
+    // takes precedence over `frozen`.
     if (inf.absorbing) {
       const target = START_PRICE[base.ticker] * (1 + inf.targetDelta)
       return driftTowardStep(price, target, base.vol, rng.normal(), NEWS_REVERSION, dt)
     }
+    // Not absorbing: either purely inside a reaction window (frozen, nothing else
+    // in progress) or fully settled between events — hold flat either way.
     return price
   })
 }
@@ -305,8 +311,10 @@ function buildDisplay(prices: readonly number[], elapsed: number): DisplayStock[
       sector: base.sector,
       price,
       pct: (price / START_PRICE[base.ticker] - 1) * 100,
-      moving: inf.absorbing && !inf.frozen,
-      reacting: inf.frozen,
+      // Absorbing (from any still-active headline) reads as "moving"; a stock is
+      // only "reacting" when it's purely frozen with nothing else in progress.
+      moving: inf.absorbing,
+      reacting: inf.frozen && !inf.absorbing,
     }
   })
 }
