@@ -1,16 +1,19 @@
 import { describe, it, expect } from 'vitest'
-import { createRng, dtYears } from '../src'
-import { INITIAL_STOCKS, NEWS_TIMELINE, stepPrices } from '../../../src/lib/simulation'
+import { createRng, dtYears } from '@iimb-trading/engine'
+import { INITIAL_STOCKS, NEWS_TIMELINE, stepPrices } from './simulation'
 
 /**
- * Cross-layer guard for the terminal's simulation: multiple headlines must
+ * Integration test for the terminal's simulation layer: multiple headlines must
  * compose over their FULL respective windows. A stock still absorbing an earlier
  * headline must keep moving when a later headline fires — the meander-toward-
  * target behavior must not re-introduce a global freeze that overrides it.
  *
  * Scenario uses the real timeline: news #1 (t=15) lifts NVDA/Tech; news #2
  * (t=80) is MARKET-WIDE (market -0.03), so it touches every stock — which is
- * exactly why the earlier bug flat-lined the whole board during t=80..110.
+ * exactly why an earlier bug flat-lined the whole board during t=80..110.
+ *
+ * Lives in the app (not the engine) because it depends on app-side simulation
+ * code that uses browser globals; the engine stays DOM-free.
  */
 describe('terminal simulation: headlines compose across their windows', () => {
   const NV = INITIAL_STOCKS.findIndex((s) => s.ticker === 'NVDA')
@@ -49,9 +52,9 @@ describe('terminal simulation: headlines compose across their windows', () => {
 
   it('after the window passes, the market-wide delta finally prices into SPY', () => {
     // One tick past the window, SPY begins absorbing the -0.03 and moves down.
-    let p = spyStart
     let localPrices = INITIAL_STOCKS.map((s) => s.price)
     const r = createRng(2024)
+    let p = spyStart
     for (let t = 1; t <= 140; t++) {
       localPrices = stepPrices(localPrices, t, r, dt)
       p = localPrices[SPY]
