@@ -22,6 +22,34 @@ function ord(
   }
 }
 
+describe('OrderBook.restResting — recovery insertion (no matching)', () => {
+  it('restores a partially-filled order preserving remainingQty, then matches it', () => {
+    const book = new OrderBook('AAPL')
+    // A resting sell that was already half-filled before the "crash": qty 10, remaining 4.
+    const restored = ord({ id: 'r1', side: 'sell', price: 100, qty: 10, timestamp: 1 })
+    restored.remainingQty = 4
+    restored.status = 'partially_filled'
+    book.restResting(restored)
+
+    // It rests with its true remaining (4), not reset to 10.
+    expect(book.getDepth().asks).toEqual([{ price: 100, qty: 4 }])
+
+    // A crossing buy takes exactly the remaining 4.
+    const trades = book.placeLimitOrder(ord({ side: 'buy', price: 100, qty: 4, timestamp: 2 }))
+    expect(trades).toHaveLength(1)
+    expect(trades[0].qty).toBe(4)
+    expect(book.getDepth().asks).toEqual([])
+  })
+
+  it('rejects restoring a market order or an empty remainder', () => {
+    const book = new OrderBook('AAPL')
+    expect(() => book.restResting(ord({ side: 'buy', type: 'market', qty: 5 }))).toThrow()
+    const done = ord({ side: 'buy', price: 100, qty: 5 })
+    done.remainingQty = 0
+    expect(() => book.restResting(done)).toThrow()
+  })
+})
+
 describe('OrderBook — resting & price-time priority', () => {
   it('a limit order that does not cross rests correctly (aggregated, sorted)', () => {
     const book = new OrderBook('AAPL')

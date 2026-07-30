@@ -1,108 +1,65 @@
-import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { NEWS_WINDOW_SECONDS, stockTargetDelta } from '@iimb-trading/engine'
+import { applyLeveredFill, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW, MOTION } from '../../lib/design-patterns'
+import { supabase } from '../../lib/supabase'
+import { USD_INR } from '../../lib/marketConfig'
 import {
-  clock,
-  inr,
-  inrSigned,
-  liquidationHealth,
-  liquidationPrice,
-  marginUsedUsd,
-  newsAffects,
-  pct,
-  positionPnlUsd,
-  SEED_POSITIONS,
-  STARTING_CASH_INR,
-  usd,
-  usdAxis,
-  USD_INR,
-  useSimulation,
-  type DisplayStock,
-  type FiredNews,
-  type Position,
+  api,
+  type Bootstrap,
+  type InstrumentRow,
+  type MyOrder,
+  type Notification,
+  type OrderType,
   type Side,
-} from '../../lib/simulation'
+  type Snapshot,
+} from '../../lib/api'
 
-const LEVERAGES = [1, 2, 5, 10, 20] as const
 const UP = '#22c55e'
 const DOWN = '#d4183d'
-const AMBER = '#fbbf24'
+const LEVERAGES = [1, 2, 5, 10, 20] as const
 const TIMEFRAMES = [
-  { k: '1m', s: 60 },
-  { k: '5m', s: 300 },
-  { k: 'All', s: Infinity },
+  { k: '1min', s: 60 },
+  { k: '2min', s: 120 },
+  { k: '5min', s: 300 },
+  { k: '10min', s: 600 },
 ] as const
 type TF = (typeof TIMEFRAMES)[number]['k']
 
 // ---------------------------------------------------------------------------
-// Small shared building blocks
+// Formatters
 // ---------------------------------------------------------------------------
-
-/** A value that briefly tints green/red (~400ms) when it moves up/down. */
-function Flash({ value, children, className = '' }: { value: number; children: ReactNode; className?: string }) {
-  const prev = useRef(value)
-  const [dir, setDir] = useState(0)
-  useEffect(() => {
-    if (value > prev.current) setDir(1)
-    else if (value < prev.current) setDir(-1)
-    prev.current = value
-    const id = window.setTimeout(() => setDir(0), 400)
-    return () => window.clearTimeout(id)
-  }, [value])
-  const bg = dir > 0 ? 'bg-up/15' : dir < 0 ? 'bg-destructive/15' : ''
-  return <span className={`rounded px-1 transition-colors duration-[400ms] ${bg} ${className}`}>{children}</span>
+const inrFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 })
+const inr = (v: number) => inrFmt.format(v)
+const usd = (v: number) => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+const clockHMS = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { hour12: false })
+function mmss(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
 }
 
-/** Pinging status dot. */
-function PulseDot({ color }: { color: string }) {
-  return (
-    <span className="relative flex h-1.5 w-1.5">
-      <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-70" style={{ background: color }} />
-      <span className="relative inline-flex h-1.5 w-1.5 rounded-full" style={{ background: color }} />
-    </span>
-  )
-}
-
-/**
- * Panel layout modes:
- *   'fill' (default) — CARD's h-full; use when the panel is a grid cell.
- *   'auto'           — natural content height (shrink-0); for stacked panels.
- *   'grow'           — fills leftover space in a flex column and scrolls inside.
- * 'auto'/'grow' override CARD's hardcoded h-full via an inline height so stacked
- * panels don't each claim the full column height (which hid the news feed).
- */
-function Panel({
-  title,
-  right,
-  children,
-  className = '',
-  delay = 0,
-  layout = 'fill',
-  style: styleProp,
-}: {
+// ---------------------------------------------------------------------------
+// Shared shell bits
+// ---------------------------------------------------------------------------
+function Panel({ title, right, children, className = '', delay = 0 }: {
   title?: string
   right?: ReactNode
   children: ReactNode
   className?: string
   delay?: number
-  layout?: 'fill' | 'auto' | 'grow'
-  style?: CSSProperties
 }) {
-  const layoutCls = layout === 'auto' ? 'shrink-0' : layout === 'grow' ? 'min-h-0 flex-1' : ''
-  const style: CSSProperties = { boxShadow: CARD_SHADOW, ...styleProp }
-  if (layout !== 'fill' && style.height === undefined) style.height = 'auto'
   return (
     <motion.section
       initial={MOTION.card.initial}
       animate={MOTION.card.animate}
-      transition={{ duration: 0.5, delay, ease: EASE }}
-      className={`${CARD} ${layoutCls} ${className}`}
-      style={style}
+      transition={{ duration: 0.45, delay, ease: EASE }}
+      className={`${CARD} min-h-0 ${className}`}
+      style={{ boxShadow: CARD_SHADOW }}
     >
       {title && (
-        <header className="flex shrink-0 items-center justify-between border-b border-white/[0.06] px-4 py-2.5">
+        <header className="flex shrink-0 items-center justify-between border-b border-white/[0.06] px-4 py-2">
           <h2 className="text-[11px] uppercase tracking-[0.18em] text-subtle">{title}</h2>
           {right}
         </header>
@@ -112,84 +69,126 @@ function Panel({
   )
 }
 
-function PhaseBadge({ fired }: { fired: FiredNews }) {
-  const remaining = Math.ceil(NEWS_WINDOW_SECONDS - fired.secondsSinceFire)
-  const map = {
-    reaction: { text: `REACTION · frozen ${remaining}s`, cls: 'border-amber-400/40 bg-amber-400/10 text-amber-300' },
-    absorbing: { text: 'PRICING IN', cls: 'border-[#E8C46A]/40 bg-[#E8C46A]/10 text-[#E8C46A]' },
-    settled: { text: 'SETTLED', cls: 'border-white/10 bg-white/[0.02] text-subtle' },
-  } as const
-  const m = map[fired.phase]
-  return <span className={`rounded-full border px-2 py-0.5 text-[9px] uppercase tracking-wide ${m.cls}`}>{m.text}</span>
-}
-
-function impactChips(item: FiredNews['item']) {
-  const out: { label: string; v: number }[] = []
-  for (const [t, v] of Object.entries(item.impact.primary)) out.push({ label: t, v })
-  for (const [t, v] of Object.entries(item.impact.related)) out.push({ label: t, v })
-  for (const [s, v] of Object.entries(item.impact.sector)) out.push({ label: s, v })
-  if (item.impact.market) out.push({ label: 'MARKET', v: item.impact.market })
-  return out
-}
-
-/** Primary ticker labels for a headline (fallback to sector / MARKET). */
-function primaryLabels(item: FiredNews['item']): string[] {
-  const primary = Object.keys(item.impact.primary)
-  if (primary.length) return primary
-  const sector = Object.keys(item.impact.sector)
-  if (sector.length) return sector
-  return ['MARKET']
+function PulseDot({ color }: { color: string }) {
+  return (
+    <span className="relative flex h-1.5 w-1.5">
+      <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-70" style={{ background: color }} />
+      <span className="relative inline-flex h-1.5 w-1.5 rounded-full" style={{ background: color }} />
+    </span>
+  )
 }
 
 // ---------------------------------------------------------------------------
-// Left — instrument list
+// Top — round status bar
 // ---------------------------------------------------------------------------
+function RoundBar({ snap, username, role, onSignOut }: {
+  snap: Snapshot | null
+  username: string
+  role: string
+  onSignOut: () => void
+}) {
+  const r = snap?.round
+  const active = !!r?.active
+  return (
+    <header className="flex shrink-0 items-center justify-between border-b border-white/[0.07] px-5 py-2.5">
+      <div className="flex items-baseline gap-3">
+        <span className="text-lg text-bright" style={EDITORIAL_SERIF}>MochaTrade</span>
+        <span className="text-[11px] text-subtle">IIM Bangalore Trading Competition</span>
+      </div>
+      <div className="flex items-center gap-5 font-mono text-[11px]">
+        {active ? (
+          <>
+            <span className="flex items-center gap-1.5 text-up"><PulseDot color={UP} />ROUND {(r!.index ?? 0) + 1}</span>
+            <span className="text-muted uppercase">{r!.mode?.replace(/_/g, ' ')}</span>
+            <span className={r!.commissionEnabled ? 'text-[#E8C46A]' : 'text-subtle'}>
+              COMMISSION {r!.commissionEnabled ? 'ON' : 'OFF'}
+            </span>
+            <span className="tabular-nums text-bright">{mmss(r!.remainingSeconds ?? 0)}</span>
+          </>
+        ) : (
+          <span className="flex items-center gap-1.5 text-subtle"><PulseDot color="#71717a" />NO ACTIVE ROUND</span>
+        )}
+        <span className="text-subtle">·</span>
+        <span className="text-muted">{username} <span className="text-subtle">({role.replace('_', ' ')})</span></span>
+        <button onClick={onSignOut} className="text-subtle transition-colors hover:text-destructive">sign out</button>
+      </div>
+    </header>
+  )
+}
 
-function InstrumentList({
-  stocks,
-  selected,
-  onSelect,
-}: {
-  stocks: DisplayStock[]
+// ---------------------------------------------------------------------------
+// Bottom — persistent notification strip
+// ---------------------------------------------------------------------------
+function NotificationStrip({ notifications }: { notifications: Notification[] }) {
+  const sections = [
+    { kind: 'announcement', label: 'Announcement', accent: 'text-[#E8C46A]' },
+    { kind: 'daily_news', label: 'Daily News', accent: 'text-zinc-200' },
+    { kind: 'data', label: 'Data', accent: 'text-up' },
+  ] as const
+  return (
+    <footer className="grid shrink-0 grid-cols-3 gap-px border-t border-white/[0.07] bg-white/[0.04]">
+      {sections.map((s) => {
+        const items = notifications.filter((n) => n.kind === s.kind) // already newest-first
+        return (
+          <div key={s.kind} className="min-w-0 bg-background px-4 py-2">
+            <div className={`text-[9px] font-semibold uppercase tracking-[0.16em] ${s.accent}`}>{s.label}</div>
+            <div className="mt-0.5 flex gap-3 overflow-x-auto whitespace-nowrap text-[11px] text-muted">
+              {items.length === 0 ? (
+                <span className="text-subtle">—</span>
+              ) : (
+                items.slice(0, 6).map((n) => (
+                  <span key={n.id} className="shrink-0">
+                    <span className="text-zinc-300">{n.title}</span>
+                    {n.body ? <span className="text-subtle"> · {n.body}</span> : null}
+                  </span>
+                ))
+              )}
+            </div>
+          </div>
+        )
+      })}
+    </footer>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Left 1 — instrument list
+// ---------------------------------------------------------------------------
+function InstrumentList({ rows, selected, onSelect }: {
+  rows: InstrumentRow[]
   selected: string
   onSelect: (t: string) => void
 }) {
   return (
-    <Panel title="Instruments" right={<span className="font-mono text-[10px] text-subtle">{stocks.length}</span>} delay={0}>
-      <div className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto p-2">
-        {stocks.map((s) => {
-          const isSel = s.ticker === selected
-          const up = s.pct >= 0
+    <Panel title="Instruments" right={<span className="font-mono text-[10px] text-subtle">{rows.length}</span>} delay={0}>
+      <div className="min-h-0 flex-1 overflow-y-auto p-2">
+        <div className="mb-1 flex items-center gap-2 px-3 text-[9px] uppercase tracking-wider text-subtle">
+          <span className="flex-1">Ticker</span>
+          <span className="w-16 text-right">LTP</span>
+          <span className="w-14 text-right">Qty</span>
+          <span className="w-16 text-right">Avg</span>
+        </div>
+        {rows.map((s) => {
+          const sel = s.ticker === selected
+          const pos = s.position
           return (
             <button
               key={s.ticker}
               onClick={() => onSelect(s.ticker)}
-              className={`${LIST_ROW} relative w-full text-left`}
-              style={{
-                gap: 8,
-                paddingLeft: 14,
-                paddingRight: 12,
-                paddingTop: 8,
-                paddingBottom: 8,
-                ...(isSel ? { borderColor: 'rgba(232,196,106,0.45)', background: 'rgba(255,255,255,0.055)' } : null),
-              }}
+              className={`${LIST_ROW} relative mb-1 w-full text-left`}
+              style={{ gap: 8, paddingLeft: 14, paddingRight: 12, paddingTop: 7, paddingBottom: 7,
+                ...(sel ? { borderColor: 'rgba(232,196,106,0.45)', background: 'rgba(255,255,255,0.055)' } : null) }}
             >
-              {isSel && (
-                <span className="absolute bottom-1.5 left-0 top-1.5 w-[3px] rounded-full" style={{ background: GOLD.solid }} />
-              )}
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-1.5">
-                  <span className="font-mono text-[13px] font-semibold text-bright">{s.ticker}</span>
-                  {s.reacting ? <PulseDot color={AMBER} /> : s.moving ? <PulseDot color={up ? UP : DOWN} /> : null}
-                </div>
-                <div className="truncate text-[10px] text-subtle">{s.name}</div>
-              </div>
-              <div className="text-right">
-                <Flash value={s.price} className="block font-mono text-[13px] tabular-nums text-foreground">
-                  {usd(s.price)}
-                </Flash>
-                <div className={`font-mono text-[10px] tabular-nums ${up ? 'text-up' : 'text-destructive'}`}>{pct(s.pct)}</div>
-              </div>
+              {sel && <span className="absolute bottom-1.5 left-0 top-1.5 w-[3px] rounded-full" style={{ background: GOLD.solid }} />}
+              <span className="min-w-0 flex-1">
+                <span className="block font-mono text-[13px] font-semibold text-bright">{s.ticker}</span>
+                <span className="block truncate text-[10px] text-subtle">{s.name}</span>
+              </span>
+              <span className="w-16 text-right font-mono text-[12px] tabular-nums text-foreground">{usd(s.ltp)}</span>
+              <span className={`w-14 text-right font-mono text-[12px] tabular-nums ${pos ? (pos.qty >= 0 ? 'text-up' : 'text-destructive') : 'text-subtle'}`}>
+                {pos ? pos.qty : '—'}
+              </span>
+              <span className="w-16 text-right font-mono text-[12px] tabular-nums text-muted">{pos ? usd(pos.avgPrice) : '—'}</span>
             </button>
           )
         })}
@@ -199,107 +198,134 @@ function InstrumentList({
 }
 
 // ---------------------------------------------------------------------------
-// Center — dedicated stock view (chart + order ticket + relevant news)
+// Left 2 — order window (+ working orders + confirm popup)
 // ---------------------------------------------------------------------------
+interface PendingOrder { side: Side; type: OrderType; qty: number; price: number; leverage: number; requiredInr: number; liq: number | null }
 
-function PriceTooltip({ active, payload, label }: { active?: boolean; payload?: any[]; label?: number }) {
-  if (!active || !payload || payload.length === 0) return null
-  return (
-    <div className="rounded-lg border border-white/10 bg-[#0a0a0a] px-3 py-2 text-[11px] shadow-xl">
-      <div className="mb-0.5 font-mono text-subtle">{clock(label ?? 0)}</div>
-      <div className="font-mono tabular-nums text-bright">{usd(payload[0].value)}</div>
-    </div>
-  )
-}
-
-function OrderTicket({ price }: { price: number }) {
-  const [side, setSide] = useState<Side>('Long')
+function OrderWindow({ ticker, row, roundActive, onConfirmPlace, myOrders, onCancel }: {
+  ticker: string
+  row: InstrumentRow | undefined
+  roundActive: boolean
+  onConfirmPlace: (o: PendingOrder) => void
+  myOrders: MyOrder[]
+  onCancel: (o: MyOrder) => void
+}) {
+  const [side, setSide] = useState<Side>('buy')
+  const [type, setType] = useState<OrderType>('limit')
   const [qty, setQty] = useState(10)
   const [leverage, setLeverage] = useState(5)
-  const [placed, setPlaced] = useState(false)
+  const [price, setPrice] = useState(0)
 
-  const orderValueUsd = price * qty
-  const marginInr = (orderValueUsd / leverage) * USD_INR
-  const liq = liquidationPrice(price, leverage, side)
+  const ltp = row?.ltp ?? 0
+  // Keep the limit price synced to LTP until the user edits it.
+  const edited = useRef(false)
+  useEffect(() => { edited.current = false }, [ticker])
+  useEffect(() => { if (!edited.current) setPrice(Number(ltp.toFixed(2))) }, [ltp])
 
-  function place() {
-    setPlaced(true)
-    window.setTimeout(() => setPlaced(false), 1600)
-  }
+  const px = type === 'limit' ? price : ltp
+  const existing = row?.position
+    ? { qty: row.position.qty, avgPrice: row.position.avgPrice, leverage: row.position.leverage }
+    : { qty: 0, avgPrice: 0, leverage }
+  const signedQty = side === 'buy' ? qty : -qty
+  const valid = qty > 0 && px > 0
+  const requiredUsd = valid ? requiredMargin(existing, signedQty, px, leverage) : 0
+  const requiredInr = requiredUsd * USD_INR
+  const resulting = valid ? applyLeveredFill(existing, signedQty, px, leverage) : null
+  const liq = resulting ? liquidationPrice(resulting) : null
+  const priceColor = side === 'buy' ? UP : DOWN
 
   return (
-    <div className="flex flex-col gap-2.5 px-5 py-3">
-      <div className="grid grid-cols-2 gap-2">
-        {(['Long', 'Short'] as const).map((s) => {
-          const on = side === s
-          const active =
-            s === 'Long'
-              ? 'border-up/50 bg-up/10 text-up'
-              : 'border-destructive/50 bg-destructive/10 text-destructive'
-          return (
-            <button
-              key={s}
-              onClick={() => setSide(s)}
-              className={`rounded-lg border py-2 text-sm font-medium transition-colors ${
-                on ? active : 'border-white/10 bg-white/[0.02] text-muted hover:bg-white/[0.04]'
-              }`}
-            >
-              {s}
-            </button>
-          )
-        })}
-      </div>
+    <Panel title="Order Window" right={<span className="font-mono text-[11px] text-[#E8C46A]">{ticker}</span>} delay={0.06}>
+      <div className="relative flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-4 py-3">
+        {!roundActive && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/80 backdrop-blur-[1px]">
+            <span className="rounded-full border border-white/10 px-4 py-1.5 text-[12px] text-subtle">Waiting for next round…</span>
+          </div>
+        )}
 
-      <div className="flex items-center gap-2">
-        <label className="flex-1">
-          <span className="mb-1 block text-[10px] uppercase tracking-[0.16em] text-subtle">Quantity</span>
-          <input
-            type="number"
-            min={1}
-            value={qty}
-            onChange={(e) => setQty(Math.max(1, Number(e.target.value) || 0))}
-            className={`${INPUT} font-mono tabular-nums`}
-            style={{ paddingTop: 8, paddingBottom: 8 }}
-          />
-        </label>
-      </div>
-
-      <div>
-        <span className="mb-1 block text-[10px] uppercase tracking-[0.16em] text-subtle">Leverage</span>
-        <div className="flex gap-1.5">
-          {LEVERAGES.map((lv) => {
-            const on = lv === leverage
+        {/* Buy/Sell — Buy tints the price green, Sell red */}
+        <div className="grid grid-cols-2 gap-2">
+          {(['buy', 'sell'] as const).map((s) => {
+            const on = side === s
+            const cls = s === 'buy' ? 'border-up/50 bg-up/10 text-up' : 'border-destructive/50 bg-destructive/10 text-destructive'
             return (
-              <button
-                key={lv}
-                onClick={() => setLeverage(lv)}
-                className={`flex-1 rounded-full border py-1.5 font-mono text-xs tabular-nums transition-colors ${
-                  on ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'
-                }`}
-              >
-                {lv}x
+              <button key={s} onClick={() => setSide(s)}
+                className={`rounded-lg border py-2 text-sm font-medium uppercase transition-colors ${on ? cls : 'border-white/10 bg-white/[0.02] text-muted hover:bg-white/[0.04]'}`}>
+                {s}
               </button>
             )
           })}
         </div>
+
+        {/* Limit / Market */}
+        <div className="flex gap-1.5">
+          {(['limit', 'market'] as const).map((t) => (
+            <button key={t} onClick={() => setType(t)}
+              className={`flex-1 rounded-full border py-1.5 text-[11px] uppercase tracking-wide transition-colors ${type === t ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
+              {t}
+            </button>
+          ))}
+        </div>
+
+        <label className="block">
+          <span className="mb-1 block text-[10px] uppercase tracking-[0.16em] text-subtle">Quantity</span>
+          <input type="number" min={1} value={qty} onChange={(e) => setQty(Math.max(1, Math.floor(Number(e.target.value) || 0)))}
+            className={`${INPUT} font-mono tabular-nums`} style={{ paddingTop: 8, paddingBottom: 8 }} />
+        </label>
+
+        <label className="block">
+          <span className="mb-1 block text-[10px] uppercase tracking-[0.16em] text-subtle">Price {type === 'market' && <span className="text-subtle">(market — uses LTP)</span>}</span>
+          <input type="number" step="0.01" disabled={type === 'market'}
+            value={type === 'market' ? Number(ltp.toFixed(2)) : price}
+            onChange={(e) => { edited.current = true; setPrice(Number(e.target.value) || 0) }}
+            className={`${INPUT} font-mono tabular-nums disabled:opacity-50`} style={{ paddingTop: 8, paddingBottom: 8, color: priceColor }} />
+        </label>
+
+        <div>
+          <span className="mb-1 block text-[10px] uppercase tracking-[0.16em] text-subtle">Leverage</span>
+          <div className="flex gap-1.5">
+            {LEVERAGES.map((lv) => (
+              <button key={lv} onClick={() => setLeverage(lv)}
+                className={`flex-1 rounded-full border py-1.5 font-mono text-xs tabular-nums transition-colors ${lv === leverage ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
+                {lv}x
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <dl className="flex flex-col gap-1 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 text-xs">
+          <Row label="Margin Required" value={inr(requiredInr)} />
+          <Row label="Est. Liquidation" value={liq === null ? '—' : usd(liq)} tone={side === 'buy' ? 'destructive' : 'up'} />
+        </dl>
+
+        <button
+          disabled={!roundActive || !valid}
+          onClick={() => onConfirmPlace({ side, type, qty, price: px, leverage, requiredInr, liq })}
+          className="group relative rounded-full p-px transition-transform duration-300 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
+          style={{ background: GOLD.gradient, backgroundSize: '250% 250%' }}>
+          <span className="relative flex items-center justify-center rounded-full bg-[rgba(8,7,6,0.96)] px-6 py-2.5 text-sm font-medium text-bright transition-colors duration-300 group-hover:bg-[rgba(20,17,14,0.88)]">
+            Place {side.toUpperCase()} Order
+          </span>
+        </button>
+
+        {/* Working (resting) orders — cancel with confirm */}
+        {myOrders.length > 0 && (
+          <div className="mt-1">
+            <div className="mb-1 text-[10px] uppercase tracking-[0.16em] text-subtle">Working Orders</div>
+            <div className="flex flex-col gap-1">
+              {myOrders.map((o) => (
+                <div key={o.orderId} className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-[11px]">
+                  <span className={`font-medium uppercase ${o.side === 'buy' ? 'text-up' : 'text-destructive'}`}>{o.side}</span>
+                  <span className="font-mono tabular-nums text-muted">{o.remainingQty}/{o.qty} @ {usd(o.price)}</span>
+                  <span className="font-mono text-[10px] text-subtle">{o.leverage}x</span>
+                  <button onClick={() => onCancel(o)} className="ml-auto text-subtle transition-colors hover:text-destructive" aria-label="Cancel order">✕</button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
-
-      <dl className="flex flex-col gap-1 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 text-xs">
-        <Row label="Order Value" value={usd(orderValueUsd)} />
-        <Row label="Margin Required" value={inr(marginInr)} />
-        <Row label="Est. Liquidation" value={usd(liq)} tone={side === 'Long' ? 'destructive' : 'up'} />
-      </dl>
-
-      <button
-        onClick={place}
-        className="group relative rounded-full p-px transition-transform duration-300 active:scale-[0.99]"
-        style={{ background: GOLD.gradient, backgroundSize: '250% 250%' }}
-      >
-        <span className="relative flex items-center justify-center rounded-full bg-[rgba(8,7,6,0.96)] px-6 py-2.5 text-sm font-medium text-bright transition-colors duration-300 group-hover:bg-[rgba(20,17,14,0.88)]">
-          {placed ? 'Order Placed ✓' : `Place ${side} Order`}
-        </span>
-      </button>
-    </div>
+    </Panel>
   )
 }
 
@@ -307,293 +333,189 @@ function Row({ label, value, tone }: { label: string; value: string; tone?: 'up'
   return (
     <div className="flex items-center justify-between">
       <dt className="text-subtle">{label}</dt>
-      <dd className={`font-mono tabular-nums ${tone === 'up' ? 'text-up' : tone === 'destructive' ? 'text-destructive' : 'text-foreground'}`}>
-        {value}
-      </dd>
+      <dd className={`font-mono tabular-nums ${tone === 'up' ? 'text-up' : tone === 'destructive' ? 'text-destructive' : 'text-foreground'}`}>{value}</dd>
     </div>
   )
 }
 
-function StockView({
-  stock,
-  history,
-  elapsed,
-  fired,
-}: {
-  stock: DisplayStock
-  history: ReturnType<typeof useSimulation>['history']
-  elapsed: number
-  fired: FiredNews[]
-}) {
-  const [tf, setTf] = useState<TF>('5m')
-  const windowS = TIMEFRAMES.find((t) => t.k === tf)!.s
-  const series = history.filter((p) => p.t >= elapsed - windowS).map((p) => ({ t: p.t, price: p[stock.ticker] }))
-  const up = stock.pct >= 0
-  const lineColor = up ? UP : DOWN
-  const relevant = fired.filter((fn) => newsAffects(fn.item, stock.ticker, stock.sector))
-
-  const status = stock.reacting
-    ? { text: 'Reaction window — frozen, act now', cls: 'text-amber-300' }
-    : stock.moving
-      ? { text: 'Pricing in news — live move', cls: up ? 'text-up' : 'text-destructive' }
-      : { text: 'Static — no active news', cls: 'text-subtle' }
-
-  const glow = stock.reacting
-    ? 'rgba(251,191,36,0.35)'
-    : stock.moving
-      ? up
-        ? 'rgba(34,197,94,0.30)'
-        : 'rgba(212,24,61,0.30)'
-      : null
-
+// ---------------------------------------------------------------------------
+// Left 3 — screener (placeholder fundamentals)
+// ---------------------------------------------------------------------------
+function Screener({ row }: { row: InstrumentRow | undefined }) {
+  const metrics = [
+    { k: 'Market Cap', v: '—' },
+    { k: 'P/E (TTM)', v: '—' },
+    { k: 'EPS', v: '—' },
+    { k: 'Div. Yield', v: '—' },
+    { k: '52W Range', v: '—' },
+    { k: 'Beta', v: '—' },
+  ]
   return (
-    <motion.section
-      initial={MOTION.card.initial}
-      animate={MOTION.card.animate}
-      transition={{ duration: 0.5, delay: 0.06, ease: EASE }}
-      className={`${CARD} min-h-0`}
-      style={{
-        boxShadow: glow ? `${CARD_SHADOW}, 0 0 46px -10px ${glow}` : CARD_SHADOW,
-        borderTopColor: 'rgba(232,196,106,0.5)',
-        borderTopWidth: 2,
-      }}
-    >
-      {/* Header: ticker + big price */}
-      <header className="flex shrink-0 items-start justify-between gap-4 border-b border-white/[0.06] px-5 py-3.5">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="font-mono text-2xl font-semibold text-bright">{stock.ticker}</span>
-            {stock.reacting ? <PulseDot color={AMBER} /> : stock.moving ? <PulseDot color={lineColor} /> : null}
-          </div>
-          <div className="mt-0.5 text-[11px] text-subtle">
-            {stock.name} · {stock.sector}
-          </div>
-          <div className={`mt-1 text-[11px] ${status.cls}`}>{status.text}</div>
-        </div>
-        <div className="text-right">
-          <Flash value={stock.price} className="font-mono text-4xl font-semibold tabular-nums text-bright">
-            {usd(stock.price)}
-          </Flash>
-          <div className={`mt-1 font-mono text-sm tabular-nums ${up ? 'text-up' : 'text-destructive'}`}>{pct(stock.pct)}</div>
-        </div>
-      </header>
-
-      {/* Timeframe toggle */}
-      <div className="flex shrink-0 items-center gap-1 border-b border-white/[0.06] px-5 py-2">
-        {TIMEFRAMES.map((t) => {
-          const on = t.k === tf
-          return (
-            <button
-              key={t.k}
-              onClick={() => setTf(t.k)}
-              className={`rounded-md px-2.5 py-1 font-mono text-[11px] transition-colors ${
-                on ? 'bg-white/[0.08] text-bright' : 'text-subtle hover:text-muted'
-              }`}
-            >
-              {t.k}
-            </button>
-          )
-        })}
-      </div>
-
-      {/* Scrollable body: chart (the visual anchor) + order ticket + headlines */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
-      <div className="h-[42vh] min-h-[280px] shrink-0 p-2">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={series} margin={{ top: 10, right: 12, bottom: 2, left: -4 }}>
-            <defs>
-              <linearGradient id="areaFill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={lineColor} stopOpacity={0.22} />
-                <stop offset="100%" stopColor={lineColor} stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-            <XAxis
-              dataKey="t"
-              tickFormatter={clock}
-              stroke="#71717a"
-              tick={{ fontSize: 10, fontFamily: 'monospace' }}
-              tickLine={false}
-              axisLine={{ stroke: 'rgba(255,255,255,0.08)' }}
-              minTickGap={44}
-            />
-            <YAxis
-              dataKey="price"
-              domain={['auto', 'auto']}
-              tickFormatter={usdAxis}
-              orientation="right"
-              stroke="#71717a"
-              tick={{ fontSize: 10, fontFamily: 'monospace' }}
-              tickLine={false}
-              axisLine={false}
-              width={56}
-            />
-            <Tooltip content={<PriceTooltip />} />
-            <Area
-              type="monotone"
-              dataKey="price"
-              stroke={lineColor}
-              strokeWidth={2}
-              fill="url(#areaFill)"
-              dot={false}
-              isAnimationActive={false}
-            />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
-
-      {/* Order ticket for this stock */}
-      <div className="shrink-0 border-t border-white/[0.06]">
-        <div className="flex items-center justify-between px-5 pt-3">
-          <h3 className="text-[11px] uppercase tracking-[0.18em] text-subtle">Order Ticket</h3>
-          <span className="font-mono text-[11px] text-[#E8C46A]">{stock.ticker}</span>
-        </div>
-        <OrderTicket price={stock.price} />
-      </div>
-
-      {/* Relevant news for this stock */}
-      <div className="shrink-0 border-t border-white/[0.06]">
-        <div className="px-5 pb-1 pt-3 text-[11px] uppercase tracking-[0.18em] text-subtle">Headlines · {stock.ticker}</div>
-        <div className="px-3 pb-3">
-          {relevant.length === 0 ? (
-            <div className="px-2 py-3 text-[11px] text-subtle">No headlines affecting {stock.ticker} yet.</div>
-          ) : (
-            relevant.map((fn) => {
-              const d = stockTargetDelta(fn.item, stock.ticker, stock.sector)
-              return (
-                <div key={fn.item.id} className="mb-1.5 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <PhaseBadge fired={fn} />
-                    <span className={`font-mono text-[11px] tabular-nums ${d >= 0 ? 'text-up' : 'text-destructive'}`}>
-                      {pct(d * 100)}
-                    </span>
-                  </div>
-                  <div className="mt-1 text-[12px] leading-snug text-zinc-200">{fn.item.headline}</div>
+    <Panel title="Main Share Reports (Screener)" delay={0.12}>
+      <div className="min-h-0 flex-1 overflow-y-auto p-4">
+        {row ? (
+          <>
+            <div className="flex items-baseline gap-2">
+              <span className="font-mono text-lg font-semibold text-bright">{row.ticker}</span>
+              <span className="text-[11px] text-subtle">{row.name} · {row.sector}</span>
+            </div>
+            <div className="mt-3 grid grid-cols-2 gap-px overflow-hidden rounded-lg bg-white/[0.06]">
+              {metrics.map((m) => (
+                <div key={m.k} className="bg-background/60 px-3 py-2">
+                  <div className="text-[9px] uppercase tracking-[0.14em] text-subtle">{m.k}</div>
+                  <div className="mt-0.5 font-mono text-[13px] tabular-nums text-muted">{m.v}</div>
                 </div>
-              )
-            })
-          )}
-        </div>
-      </div>
-      </div>
-    </motion.section>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Right — account, positions, news
-// ---------------------------------------------------------------------------
-
-function AccountSummary({ positions, priceOf }: { positions: Position[]; priceOf: (t: string) => number }) {
-  const totalPnlUsd = positions.reduce((a, p) => a + positionPnlUsd(p, priceOf(p.ticker)), 0)
-  const totalPnlInr = totalPnlUsd * USD_INR
-  const marginUsedInr = positions.reduce((a, p) => a + marginUsedUsd(p), 0) * USD_INR
-  const equity = STARTING_CASH_INR + totalPnlInr
-  const available = equity - marginUsedInr
-
-  return (
-    <Panel title="Account · INR" delay={0.06} layout="auto">
-      <div className="grid grid-cols-2 gap-px bg-white/[0.06]">
-        <Tile label="Equity" value={<Flash value={equity}>{inr(equity)}</Flash>} big />
-        <Tile label="Available Margin" value={<Flash value={available}>{inr(available)}</Flash>} />
-        <Tile label="Margin Used" value={<Flash value={marginUsedInr}>{inr(marginUsedInr)}</Flash>} />
-        <Tile
-          label="Total P&L"
-          value={<Flash value={totalPnlInr}>{inrSigned(totalPnlInr)}</Flash>}
-          tone={totalPnlInr >= 0 ? 'up' : 'destructive'}
-          big
-        />
+              ))}
+            </div>
+            <p className="mt-3 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-[10px] leading-relaxed text-amber-300/80">
+              Illustrative placeholder — real fundamentals are not wired yet and these figures are not final.
+            </p>
+          </>
+        ) : (
+          <div className="py-6 text-center text-xs text-subtle">Select an instrument.</div>
+        )}
       </div>
     </Panel>
   )
 }
 
-function Tile({ label, value, tone, big }: { label: string; value: ReactNode; tone?: 'up' | 'destructive'; big?: boolean }) {
+// ---------------------------------------------------------------------------
+// Right 1 — price chart
+// ---------------------------------------------------------------------------
+function PriceChart({ snap, ticker, ltp, tf, onTf }: {
+  snap: Snapshot | null
+  ticker: string
+  ltp: number
+  tf: TF
+  onTf: (t: TF) => void
+}) {
+  const data = (snap?.prices ?? []).map((p) => ({ t: p.t, price: p.price }))
   return (
-    <div className="bg-background/60 px-4 py-3">
-      <div className="text-[10px] uppercase tracking-[0.16em] text-subtle">{label}</div>
-      <div
-        className={`mt-1 font-mono tabular-nums ${big ? 'text-lg' : 'text-[15px]'} ${
-          tone === 'up' ? 'text-up' : tone === 'destructive' ? 'text-destructive' : 'text-bright'
-        }`}
-      >
-        {value}
+    <Panel
+      title={`Chart · ${ticker}`}
+      delay={0}
+      right={
+        <div className="flex items-center gap-2">
+          <span className="font-mono text-[13px] tabular-nums text-bright">{usd(ltp)}</span>
+          <div className="flex gap-1">
+            {TIMEFRAMES.map((t) => (
+              <button key={t.k} onClick={() => onTf(t.k)}
+                className={`rounded-md px-2 py-0.5 font-mono text-[10px] transition-colors ${tf === t.k ? 'bg-white/[0.08] text-bright' : 'text-subtle hover:text-muted'}`}>
+                {t.k}
+              </button>
+            ))}
+          </div>
+        </div>
+      }
+    >
+      <div className="min-h-0 flex-1 p-2">
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={data} margin={{ top: 10, right: 12, bottom: 2, left: -4 }}>
+            <defs>
+              <linearGradient id="termFill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={GOLD.solid} stopOpacity={0.22} />
+                <stop offset="100%" stopColor={GOLD.solid} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+            <XAxis dataKey="t" tickFormatter={clockHMS} stroke="#71717a" tick={{ fontSize: 10, fontFamily: 'monospace' }} tickLine={false} axisLine={{ stroke: 'rgba(255,255,255,0.08)' }} minTickGap={60} />
+            <YAxis dataKey="price" domain={['auto', 'auto']} tickFormatter={(v) => usd(v)} orientation="right" stroke="#71717a" tick={{ fontSize: 10, fontFamily: 'monospace' }} tickLine={false} axisLine={false} width={64} />
+            <Tooltip
+              contentStyle={{ background: '#0a0a0a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, fontSize: 11 }}
+              labelFormatter={(l) => clockHMS(Number(l))} formatter={(value) => [usd(Number(value)), 'Price']} />
+            <Area type="monotone" dataKey="price" stroke={GOLD.solid} strokeWidth={2} fill="url(#termFill)" dot={false} isAnimationActive={false} />
+          </AreaChart>
+        </ResponsiveContainer>
       </div>
+    </Panel>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Right 2 — market depth (+ market-maker resting-order list)
+// ---------------------------------------------------------------------------
+function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
+  const depth = snap?.depth
+  const asks = [...(depth?.asks ?? [])].sort((a, b) => b.price - a.price) // highest ask on top
+  const bids = [...(depth?.bids ?? [])].sort((a, b) => b.price - a.price) // best bid on top
+  const maxQty = Math.max(1, ...asks.map((l) => l.qty), ...bids.map((l) => l.qty))
+  const resting = depth?.restingOrders
+
+  return (
+    <Panel title="Market Depth" delay={0.06} right={role === 'market_maker' ? <span className="text-[9px] uppercase tracking-wider text-[#E8C46A]">MM · full book</span> : undefined}>
+      <div className="min-h-0 flex-1 overflow-y-auto p-2 text-[11px]">
+        <div className="flex flex-col gap-0.5">
+          {asks.length === 0 && bids.length === 0 && <div className="py-4 text-center text-subtle">No resting orders.</div>}
+          {asks.map((l) => <DepthRow key={`a${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} tone="ask" />)}
+          {(asks.length > 0 || bids.length > 0) && (
+            <div className="my-1 flex items-center justify-between border-y border-white/[0.06] px-2 py-0.5 text-[9px] uppercase tracking-wider text-subtle">
+              <span>Bid</span><span>Ask</span>
+            </div>
+          )}
+          {bids.map((l) => <DepthRow key={`b${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} tone="bid" />)}
+        </div>
+
+        {role === 'market_maker' && resting && (
+          <div className="mt-3 border-t border-white/[0.06] pt-2">
+            <div className="mb-1 text-[9px] uppercase tracking-[0.16em] text-subtle">Resting Orders ({resting.length})</div>
+            <div className="flex flex-col gap-0.5">
+              {resting.map((o) => (
+                <div key={o.orderId} className="flex items-center gap-2 font-mono tabular-nums">
+                  <span className={`w-9 ${o.side === 'buy' ? 'text-up' : 'text-destructive'}`}>{o.side === 'buy' ? 'BUY' : 'SELL'}</span>
+                  <span className="w-16 text-right text-foreground">{usd(o.price)}</span>
+                  <span className="w-12 text-right text-muted">{o.remainingQty}</span>
+                  <span className="w-8 text-right text-subtle">{o.leverage}x</span>
+                  <span className="flex-1 truncate text-right text-[9px] text-subtle">{o.accountId.slice(0, 8)}…</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </Panel>
+  )
+}
+
+function DepthRow({ price, qty, maxQty, tone }: { price: number; qty: number; maxQty: number; tone: 'bid' | 'ask' }) {
+  const color = tone === 'bid' ? UP : DOWN
+  return (
+    <div className="relative flex items-center justify-between rounded px-2 py-0.5 font-mono tabular-nums">
+      <span className="absolute inset-y-0 right-0 rounded" style={{ width: `${(qty / maxQty) * 100}%`, background: tone === 'bid' ? 'rgba(34,197,94,0.10)' : 'rgba(212,24,61,0.10)' }} />
+      <span className="relative" style={{ color }}>{usd(price)}</span>
+      <span className="relative text-muted">{qty}</span>
     </div>
   )
 }
 
-function PositionsTable({
-  positions,
-  priceOf,
-  onClose,
-}: {
-  positions: Position[]
-  priceOf: (t: string) => number
-  onClose: (id: string) => void
-}) {
+// ---------------------------------------------------------------------------
+// Right 3 — Times & Sales
+// ---------------------------------------------------------------------------
+function TimesAndSales({ snap, ticker }: { snap: Snapshot | null; ticker: string }) {
+  const trades = snap?.trades ?? [] // newest first
   return (
-    <Panel
-      title="Positions"
-      right={<span className="font-mono text-[10px] text-subtle">{positions.length}</span>}
-      delay={0.12}
-      layout="auto"
-    >
-      <div className="flex min-h-0 flex-col gap-1 p-2">
-        <div className="flex items-center gap-2 px-3 pb-1 text-[9px] uppercase tracking-wider text-subtle">
-          <span className="w-[58px]">Instr</span>
-          <span className="w-[40px] text-right">Sz×L</span>
-          <span className="w-[54px] text-right">Entry</span>
-          <span className="flex-1 text-right">P&L</span>
-          <span className="w-[80px] text-right">Liq.</span>
-          <span className="w-4" />
+    <Panel title="Times & Sales" delay={0.12} right={<span className="font-mono text-[10px] text-subtle">{trades.length}</span>}>
+      <div className="min-h-0 flex-1 overflow-y-auto p-2 text-[11px]">
+        <div className="mb-1 flex items-center gap-2 px-2 text-[9px] uppercase tracking-wider text-subtle">
+          <span className="w-20">Time</span><span className="w-14">Script</span>
+          <span className="flex-1 text-right">P&L (Δ)</span><span className="w-12 text-right">Qty</span><span className="w-12 text-right">Side</span>
         </div>
-
-        {positions.length === 0 ? (
-          <div className="px-3 py-6 text-center text-xs text-subtle">No open positions.</div>
+        {trades.length === 0 ? (
+          <div className="py-4 text-center text-subtle">No prints yet.</div>
         ) : (
-          positions.map((p) => {
-            const price = priceOf(p.ticker)
-            const pnlInr = positionPnlUsd(p, price) * USD_INR
-            const liq = liquidationPrice(p.entryPrice, p.leverage, p.side)
-            const health = liquidationHealth(p, price)
-            const long = p.side === 'Long'
-            const dotCls = health > 0.5 ? 'bg-up/60' : health > 0.25 ? 'bg-amber-400' : 'bg-destructive'
-            const liqCls = health > 0.5 ? 'text-subtle' : health > 0.25 ? 'text-amber-400' : 'text-destructive'
+          trades.map((t, i) => {
+            const prev = trades[i + 1] // next older
+            const delta = prev ? t.price - prev.price : 0
             return (
-              <div
-                key={p.id}
-                className={`${LIST_ROW} text-[11px]`}
-                style={{ gap: 8, paddingLeft: 12, paddingRight: 12, paddingTop: 8, paddingBottom: 8 }}
-              >
-                <span className="w-[58px]">
-                  <span className="block font-mono font-semibold text-bright">{p.ticker}</span>
-                  <span className={`text-[9px] font-medium ${long ? 'text-up' : 'text-destructive'}`}>{p.side}</span>
+              <div key={t.id} className="flex items-center gap-2 px-2 py-0.5 font-mono tabular-nums">
+                <span className="w-20 text-subtle">{clockHMS(t.t)}</span>
+                <span className="w-14 text-foreground">{ticker}</span>
+                <span className={`flex-1 text-right ${delta > 0 ? 'text-up' : delta < 0 ? 'text-destructive' : 'text-subtle'}`}>
+                  {delta === 0 ? usd(t.price) : `${delta > 0 ? '+' : '−'}${usd(Math.abs(delta))}`}
                 </span>
-                <span className="w-[40px] text-right font-mono tabular-nums text-muted">
-                  {p.size}×{p.leverage}
+                <span className="w-12 text-right text-muted">{t.qty}</span>
+                <span className={`w-12 text-right font-semibold ${t.side === 'buy' ? 'text-up' : t.side === 'sell' ? 'text-destructive' : 'text-subtle'}`}>
+                  {t.side ? t.side.toUpperCase() : '—'}
                 </span>
-                <span className="w-[54px] text-right font-mono tabular-nums text-muted">{usd(p.entryPrice)}</span>
-                <Flash
-                  value={pnlInr}
-                  className={`flex-1 text-right font-mono tabular-nums ${pnlInr >= 0 ? 'text-up' : 'text-destructive'}`}
-                >
-                  {inrSigned(pnlInr)}
-                </Flash>
-                <span className="flex w-[80px] items-center justify-end gap-1">
-                  <span
-                    className={`h-1.5 w-1.5 rounded-full ${dotCls} ${health <= 0.25 ? 'animate-pulse' : ''}`}
-                    title={`Liquidation health ${(health * 100).toFixed(0)}%`}
-                  />
-                  <span className={`font-mono tabular-nums ${liqCls}`}>{usd(liq)}</span>
-                </span>
-                <button
-                  onClick={() => onClose(p.id)}
-                  aria-label={`Close ${p.ticker}`}
-                  className="w-4 text-center text-subtle transition-colors hover:text-destructive"
-                >
-                  ✕
-                </button>
               </div>
             )
           })
@@ -603,138 +525,245 @@ function PositionsTable({
   )
 }
 
-function ReactionBanner({ fired }: { fired: FiredNews }) {
-  const remaining = Math.ceil(NEWS_WINDOW_SECONDS - fired.secondsSinceFire)
+// ---------------------------------------------------------------------------
+// Popups
+// ---------------------------------------------------------------------------
+function Overlay({ children, onClose }: { children: ReactNode; onClose?: () => void }) {
   return (
-    <div className="rounded-lg border border-amber-400/40 bg-amber-400/10 p-3">
-      <div className="flex items-center gap-2 text-amber-300">
-        <PulseDot color={AMBER} />
-        <span className="text-[11px] font-semibold uppercase tracking-wide">
-          {primaryLabels(fired.item).join(', ')} news — price frozen, act now
-        </span>
-      </div>
-      <div className="mt-1 font-mono text-2xl font-semibold tabular-nums text-amber-200">{clock(remaining)}</div>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-6 backdrop-blur-sm" onClick={onClose}>
+      <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, ease: EASE }}
+        className={`${CARD} w-full max-w-sm p-6`} style={{ boxShadow: CARD_SHADOW }} onClick={(e) => e.stopPropagation()}>
+        {children}
+      </motion.div>
     </div>
   )
 }
 
-function NewsCard({ fired, dim }: { fired: FiredNews; dim: boolean }) {
+function ConfirmDialog({ title, lines, confirmLabel, tone, onConfirm, onCancel }: {
+  title: string
+  lines: { k: string; v: string; tone?: 'up' | 'destructive' }[]
+  confirmLabel: string
+  tone: 'up' | 'destructive'
+  onConfirm: () => void
+  onCancel: () => void
+}) {
   return (
-    <article
-      className={`rounded-lg border px-3 py-2.5 transition-opacity ${
-        dim ? 'border-white/[0.05] bg-white/[0.015] opacity-70' : 'border-white/[0.09] bg-white/[0.035]'
-      }`}
-    >
-      <div className="mb-1.5 flex items-start justify-between gap-2">
-        <div className="flex flex-wrap gap-1">
-          {impactChips(fired.item).map((c) => (
-            <span
-              key={c.label}
-              className={`rounded border px-1.5 py-0.5 font-mono text-[9px] tabular-nums ${
-                c.v >= 0 ? 'border-up/30 text-up' : 'border-destructive/30 text-destructive'
-              }`}
-            >
-              {c.label} {pct(c.v * 100)}
-            </span>
-          ))}
-        </div>
-        <span className="shrink-0 font-mono text-[9px] text-subtle">T+{clock(fired.secondsSinceFire)}</span>
+    <Overlay onClose={onCancel}>
+      <h3 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>{title}</h3>
+      <dl className="mt-4 flex flex-col gap-1.5 text-[13px]">
+        {lines.map((l) => (
+          <div key={l.k} className="flex items-center justify-between">
+            <dt className="text-subtle">{l.k}</dt>
+            <dd className={`font-mono tabular-nums ${l.tone === 'up' ? 'text-up' : l.tone === 'destructive' ? 'text-destructive' : 'text-foreground'}`}>{l.v}</dd>
+          </div>
+        ))}
+      </dl>
+      <div className="mt-6 flex gap-2">
+        <button onClick={onCancel} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Cancel</button>
+        <button onClick={onConfirm}
+          className={`flex-1 rounded-full py-2.5 text-sm font-medium text-bright transition-colors ${tone === 'up' ? 'bg-up/20 hover:bg-up/30' : 'bg-destructive/20 hover:bg-destructive/30'}`}>
+          {confirmLabel}
+        </button>
       </div>
-      <h3 className="text-[13px] font-semibold leading-snug text-zinc-100">{fired.item.headline}</h3>
-      <p className="mt-1 text-[11px] leading-relaxed text-zinc-400">{fired.item.body}</p>
-      <div className="mt-2">
-        <PhaseBadge fired={fired} />
-      </div>
-    </article>
+    </Overlay>
   )
 }
 
-function NewsFeed({ fired, next, reaction }: Pick<ReturnType<typeof useSimulation>, 'fired' | 'next' | 'reaction'>) {
+interface Toast { id: number; ok: boolean; title: string; detail?: string }
+function Toasts({ toasts }: { toasts: Toast[] }) {
   return (
-    <Panel title="News Feed" delay={0.18} layout="grow" style={{ minHeight: 240 }}>
-      <div className="shrink-0 border-b border-white/[0.06] p-3">
-        {reaction ? (
-          <ReactionBanner fired={reaction} />
-        ) : next ? (
-          <div className="flex items-center justify-between text-[11px]">
-            <span className="text-subtle">Next headline in</span>
-            <span className="font-mono tabular-nums text-[#E8C46A]">{clock(next.countdown)}</span>
-          </div>
-        ) : (
-          <div className="text-[11px] text-subtle">No further headlines scheduled.</div>
-        )}
-      </div>
-
-      <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-3">
-        {fired.length === 0 ? (
-          <div className="px-1 py-4 text-center text-xs text-subtle">Awaiting the first headline…</div>
-        ) : (
-          fired.map((fn, i) => <NewsCard key={fn.item.id} fired={fn} dim={i > 0} />)
-        )}
-      </div>
-    </Panel>
+    <div className="fixed bottom-20 right-5 z-50 flex flex-col gap-2">
+      {toasts.map((t) => (
+        <motion.div key={t.id} initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0 }}
+          className={`${CARD} min-w-[240px] max-w-xs p-3`}
+          style={{ boxShadow: CARD_SHADOW, borderColor: t.ok ? 'rgba(34,197,94,0.35)' : 'rgba(212,24,61,0.35)' }}>
+          <div className={`text-[12px] font-semibold ${t.ok ? 'text-up' : 'text-destructive'}`}>{t.title}</div>
+          {t.detail && <div className="mt-0.5 text-[11px] text-muted">{t.detail}</div>}
+        </motion.div>
+      ))}
+    </div>
   )
 }
 
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
-
 function Terminal() {
-  const frame = useSimulation()
+  const navigate = useNavigate()
+  const [boot, setBoot] = useState<Bootstrap | null>(null)
+  const [snap, setSnap] = useState<Snapshot | null>(null)
   const [selected, setSelected] = useState('')
-  const [positions, setPositions] = useState<Position[]>(() => SEED_POSITIONS.map((p) => ({ ...p })))
+  const [tf, setTf] = useState<TF>('5min')
+  const [pending, setPending] = useState<PendingOrder | null>(null)
+  const [cancelling, setCancelling] = useState<MyOrder | null>(null)
+  const [toasts, setToasts] = useState<Toast[]>([])
+  const [announcement, setAnnouncement] = useState<Notification | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const seenAnn = useRef<Set<string> | null>(null)
+  const toastSeq = useRef(0)
 
-  // Default to the first instrument until the user picks one.
-  const activeTicker = selected || frame.stocks[0]?.ticker || ''
-  const activeStock = frame.stocks.find((s) => s.ticker === activeTicker)
-  const priceOf = (t: string) => frame.stocks.find((s) => s.ticker === t)?.price ?? 0
+  const windowSec = TIMEFRAMES.find((t) => t.k === tf)!.s
+
+  const pushToast = useCallback((ok: boolean, title: string, detail?: string) => {
+    const id = ++toastSeq.current
+    setToasts((prev) => [...prev, { id, ok, title, detail }])
+    window.setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4500)
+  }, [])
+
+  // Auth + bootstrap.
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      const { data } = await supabase.auth.getSession()
+      if (!data.session) { navigate('/login', { replace: true }); return }
+      try {
+        const b = await api.bootstrap()
+        if (!alive) return
+        setBoot(b)
+        setSelected(b.instruments[0]?.ticker ?? '')
+      } catch {
+        // Authenticated but the engine API is unreachable — show a clear message
+        // rather than bouncing back to /login (which looks like a failed login).
+        if (alive) setError('Could not reach the trading server. Make sure the API is running (npm run api), then retry.')
+      }
+    })()
+    return () => { alive = false }
+  }, [navigate])
+
+  // Poll the snapshot for the selected instrument + timeframe window.
+  useEffect(() => {
+    if (!boot || !selected) return
+    let alive = true
+    const tick = async () => {
+      try {
+        const s = await api.snapshot(selected, windowSec)
+        if (alive) setSnap(s)
+      } catch { /* transient — next tick retries */ }
+    }
+    tick()
+    const id = window.setInterval(tick, 1000)
+    return () => { alive = false; window.clearInterval(id) }
+  }, [boot, selected, windowSec])
+
+  // Announcement popups: seed seen-set on first load, pop only genuinely new ones.
+  useEffect(() => {
+    if (!snap) return
+    const anns = snap.notifications.filter((n) => n.kind === 'announcement')
+    if (seenAnn.current === null) { seenAnn.current = new Set(anns.map((a) => a.id)); return }
+    const fresh = anns.find((a) => !seenAnn.current!.has(a.id))
+    if (fresh) { seenAnn.current.add(fresh.id); setAnnouncement(fresh) }
+  }, [snap])
+
+  const rows = snap?.instruments ?? []
+  const row = rows.find((r) => r.ticker === selected)
+  const roundActive = !!snap?.round.active
+
+  async function doPlace(o: PendingOrder) {
+    setPending(null)
+    try {
+      const res = await api.placeOrder({ ticker: selected, side: o.side, type: o.type, price: o.type === 'limit' ? o.price : undefined, qty: o.qty, leverage: o.leverage })
+      if (!res.accepted) { pushToast(false, 'Order rejected', res.reason); return }
+      const filled = (res.trades ?? []).reduce((a, t) => a + t.qty, 0)
+      if (filled === 0) pushToast(true, 'Order resting', `${o.qty} @ ${usd(o.price)} on the book`)
+      else if (filled < o.qty) pushToast(true, 'Partial fill', `${filled}/${o.qty} filled`)
+      else pushToast(true, 'Order filled', `${filled} @ avg ${usd(o.price)}`)
+    } catch { pushToast(false, 'Order failed', 'Network / server error') }
+  }
+
+  async function doCancel(o: MyOrder) {
+    setCancelling(null)
+    try {
+      const res = await api.cancelOrder(o.orderId)
+      pushToast(res.cancelled, res.cancelled ? 'Order cancelled' : 'Cancel failed', res.cancelled ? undefined : 'Order not found or not yours')
+    } catch { pushToast(false, 'Cancel failed', 'Network / server error') }
+  }
+
+  if (error) {
+    return (
+      <div className="flex h-screen flex-col items-center justify-center gap-4 bg-background px-6 text-center">
+        <div className={`${CARD} max-w-sm p-8`} style={{ boxShadow: CARD_SHADOW }}>
+          <h1 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.5rem' }}>Trading server unavailable</h1>
+          <p className="mt-3 text-sm text-muted">{error}</p>
+          <div className="mt-6 flex gap-2">
+            <button onClick={() => window.location.reload()} className="flex-1 rounded-full py-2.5 text-sm font-medium text-bright" style={{ background: GOLD.solid, color: '#0a0a0a' }}>Retry</button>
+            <button onClick={async () => { await supabase.auth.signOut(); navigate('/login', { replace: true }) }} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Sign out</button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (!boot) {
+    return <div className="flex h-screen items-center justify-center bg-background text-subtle">Loading terminal…</div>
+  }
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-      {/* Top bar */}
-      <header className="flex shrink-0 items-center justify-between border-b border-white/[0.07] px-5 py-2.5">
-        <div className="flex items-baseline gap-3">
-          <span className="text-lg text-bright" style={EDITORIAL_SERIF}>
-            MochaTrade
-          </span>
-          <span className="text-[11px] text-subtle">IIM Bangalore Trading Competition</span>
+      <RoundBar snap={snap} username={boot.username} role={boot.role} onSignOut={async () => { await supabase.auth.signOut(); navigate('/login', { replace: true }) }} />
+
+      <div className="grid min-h-0 flex-1 grid-cols-2 gap-4 p-4">
+        {/* LEFT column: instruments / order / screener */}
+        <div className="grid min-h-0 grid-rows-[minmax(0,1.1fr)_minmax(0,1.4fr)_minmax(0,0.9fr)] gap-4">
+          <InstrumentList rows={rows} selected={selected} onSelect={setSelected} />
+          <OrderWindow ticker={selected} row={row} roundActive={roundActive}
+            onConfirmPlace={setPending} myOrders={snap?.myOrders ?? []} onCancel={setCancelling} />
+          <Screener row={row} />
         </div>
-        <div className="flex items-center gap-5 font-mono text-[11px] text-muted">
-          <span className="hidden sm:inline">SEEDED MARKET · LIVE ENGINE SIM</span>
-          <span className="flex items-center gap-1.5">
-            <PulseDot color={UP} />
-            LIVE
-          </span>
-          <span className="tabular-nums text-foreground">{clock(frame.elapsed)}</span>
-        </div>
-      </header>
 
-      {/* 3-column layout */}
-      <div className="grid min-h-0 flex-1 grid-cols-[272px_1fr_368px] gap-4 p-4">
-        {/* Left */}
-        <InstrumentList stocks={frame.stocks} selected={activeTicker} onSelect={setSelected} />
-
-        {/* Center */}
-        {activeStock ? (
-          <StockView stock={activeStock} history={frame.history} elapsed={frame.elapsed} fired={frame.fired} />
-        ) : (
-          <div className={`${CARD} items-center justify-center`} style={{ boxShadow: CARD_SHADOW }}>
-            <span className="text-sm text-subtle">Select a stock to begin.</span>
-          </div>
-        )}
-
-        {/* Right — panels size to content; the column scrolls if the viewport is short */}
-        <div className="flex min-h-0 flex-col gap-3 overflow-y-auto">
-          <AccountSummary positions={positions} priceOf={priceOf} />
-          <PositionsTable
-            positions={positions}
-            priceOf={priceOf}
-            onClose={(id) => setPositions((prev) => prev.filter((p) => p.id !== id))}
-          />
-          <NewsFeed fired={frame.fired} next={frame.next} reaction={frame.reaction} />
+        {/* RIGHT column: chart / depth / times & sales */}
+        <div className="grid min-h-0 grid-rows-[minmax(0,1.3fr)_minmax(0,1.1fr)_minmax(0,1fr)] gap-4">
+          <PriceChart snap={snap} ticker={selected} ltp={row?.ltp ?? 0} tf={tf} onTf={setTf} />
+          <DepthLadder snap={snap} role={boot.role} />
+          <TimesAndSales snap={snap} ticker={selected} />
         </div>
       </div>
+
+      <NotificationStrip notifications={snap?.notifications ?? []} />
+
+      {/* Popups */}
+      {pending && (
+        <ConfirmDialog
+          title="Confirm Order"
+          tone={pending.side === 'buy' ? 'up' : 'destructive'}
+          confirmLabel={`Confirm ${pending.side.toUpperCase()}`}
+          onCancel={() => setPending(null)}
+          onConfirm={() => doPlace(pending)}
+          lines={[
+            { k: 'Instrument', v: selected },
+            { k: 'Side', v: pending.side.toUpperCase(), tone: pending.side === 'buy' ? 'up' : 'destructive' },
+            { k: 'Type', v: pending.type.toUpperCase() },
+            { k: 'Quantity', v: String(pending.qty) },
+            { k: 'Price', v: pending.type === 'market' ? 'MARKET' : usd(pending.price) },
+            { k: 'Leverage', v: `${pending.leverage}x` },
+            { k: 'Margin Required', v: inr(pending.requiredInr) },
+            { k: 'Est. Liquidation', v: pending.liq === null ? '—' : usd(pending.liq) },
+          ]}
+        />
+      )}
+      {cancelling && (
+        <ConfirmDialog
+          title="Cancel Order?"
+          tone="destructive"
+          confirmLabel="Cancel Order"
+          onCancel={() => setCancelling(null)}
+          onConfirm={() => doCancel(cancelling)}
+          lines={[
+            { k: 'Instrument', v: selected },
+            { k: 'Side', v: cancelling.side.toUpperCase(), tone: cancelling.side === 'buy' ? 'up' : 'destructive' },
+            { k: 'Remaining', v: `${cancelling.remainingQty}/${cancelling.qty}` },
+            { k: 'Price', v: usd(cancelling.price) },
+          ]}
+        />
+      )}
+      {announcement && (
+        <Overlay onClose={() => setAnnouncement(null)}>
+          <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-[#E8C46A]">Announcement</div>
+          <h3 className="mt-2 text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.5rem' }}>{announcement.title}</h3>
+          {announcement.body && <p className="mt-2 text-sm text-muted">{announcement.body}</p>}
+          <button onClick={() => setAnnouncement(null)} className="mt-6 w-full rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Dismiss</button>
+        </Overlay>
+      )}
+      <Toasts toasts={toasts} />
     </div>
   )
 }

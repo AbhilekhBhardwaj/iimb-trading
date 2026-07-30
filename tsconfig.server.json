@@ -1,0 +1,17 @@
+{
+  "//": "Typecheck-only config for server/ and scripts/ (Node code). NOT referenced by the root tsconfig, so `tsc -b` (the app/browser build) is unaffected. Run: npx tsc -p tsconfig.server.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true
+  },
+  "include": ["server", "scripts"]
+}

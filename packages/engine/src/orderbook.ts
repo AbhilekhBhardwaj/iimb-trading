@@ -160,6 +160,24 @@ export class OrderBook {
   }
 
   /**
+   * Insert an already-resting order onto the book WITHOUT matching it. This is
+   * for rehydration/recovery: restoring active / partially-filled orders after a
+   * restart, preserving their remainingQty exactly (placeLimitOrder would reset
+   * remainingQty to qty and try to match). Callers must only restore orders that
+   * were genuinely resting — a consistent book never holds crossing orders, so
+   * skipping the match is correct. Time priority follows the order's timestamp.
+   */
+  restResting(order: Order): void {
+    if (order.type !== 'limit' || order.price === undefined) {
+      throw new Error('only resting limit orders can be restored')
+    }
+    if (order.remainingQty <= 0) throw new Error('cannot restore an order with no remaining quantity')
+    const side = order.side === 'buy' ? this.bids : this.asks
+    side.push(order)
+    side.sort(order.side === 'buy' ? bidCompare : askCompare)
+  }
+
+  /**
    * Aggregated depth ladder: quantity summed per price level, bids high→low,
    * asks low→high, excluding any level whose aggregated quantity is zero.
    */
@@ -257,6 +275,11 @@ export class MatchingEngine {
       if (book.cancelOrder(orderId)) return true
     }
     return false
+  }
+
+  /** Restore an already-resting order onto its instrument's book without matching. */
+  restResting(order: Order): void {
+    this.bookFor(order.instrument).restResting(order)
   }
 
   getDepth(instrument: string): Depth {

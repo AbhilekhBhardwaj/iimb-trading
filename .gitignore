@@ -13,6 +13,9 @@ dist-ssr
 *.local
 .env
 
+# Provisioned login credentials (real passwords) — NEVER commit
+scripts/output/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
