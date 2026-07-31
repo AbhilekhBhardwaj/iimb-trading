@@ -2,6 +2,7 @@ import { createBrowserRouter, redirect } from 'react-router'
 import Admin from './pages/Admin'
 import Health from './pages/Health'
 import Login from './pages/Login'
+import Portfolio from './pages/Portfolio'
 import Terminal from './pages/Terminal'
 
 export const router = createBrowserRouter([
@@ -20,6 +21,10 @@ export const router = createBrowserRouter([
   {
     path: '/terminal',
     element: <Terminal />,
+  },
+  {
+    path: '/portfolio',
+    element: <Portfolio />,
   },
   {
     path: '/admin',

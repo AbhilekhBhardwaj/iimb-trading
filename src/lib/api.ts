@@ -91,6 +91,7 @@ export interface TapeTrade {
 export interface PricePoint {
   t: number
   price: number
+  qty: number
 }
 
 export interface Notification {
@@ -107,7 +108,41 @@ export interface Bootstrap {
   username: string
   instruments: InstrumentMeta[]
   round: RoundStatus
+  rate: number
   serverTime: number
+}
+
+export interface InventoryRow {
+  index: number
+  ticker: string
+  name: string
+  ltp: number
+  qty: number | null
+  leverage: number | null
+  avgPrice: number | null
+  avgEntryInr: number | null
+  currentPriceInr: number | null
+  pnlM2mInr: number | null
+  portfolioValueInr: number | null
+  costBasisInr: number | null
+}
+
+export interface Portfolio {
+  rate: number
+  openingBalanceInr: number
+  realizedPnlUsd: number
+  realizedPnlInr: number
+  cashInr: number
+  inventory: InventoryRow[]
+  positionsValueInr: number
+  unrealizedPnlInr: number
+  totalPnlInr: number
+  totalPnlPct: number
+  totalPortfolioValueInr: number
+  xirr: number | null
+  leverageReq: number
+  openPositions: number
+  chargesInr: number
 }
 
 export interface Snapshot {
@@ -119,6 +154,7 @@ export interface Snapshot {
   trades: TapeTrade[]
   prices: PricePoint[]
   notifications: Notification[]
+  rate: number
   serverTime: number
 }
 
@@ -164,4 +200,5 @@ export const api = {
     get<Snapshot>(`/snapshot?ticker=${encodeURIComponent(ticker ?? '')}&priceWindowSec=${priceWindowSec}`),
   placeOrder: (input: PlaceOrderInput) => post<PlaceOrderResult>('/orders', input),
   cancelOrder: (orderId: string) => post<{ cancelled: boolean }>('/orders/cancel', { orderId }),
+  portfolio: () => get<Portfolio>('/portfolio'),
 }

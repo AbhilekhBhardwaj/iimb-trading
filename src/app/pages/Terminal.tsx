@@ -1,16 +1,24 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
-import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import {
+  CandlestickSeries,
+  ColorType,
+  createChart,
+  HistogramSeries,
+  type CandlestickData,
+  type HistogramData,
+  type IChartApi,
+  type ISeriesApi,
+  type UTCTimestamp,
+} from 'lightweight-charts'
 import { applyLeveredFill, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW, MOTION } from '../../lib/design-patterns'
 import { supabase } from '../../lib/supabase'
-import { USD_INR } from '../../lib/marketConfig'
 import {
   api,
   type Bootstrap,
   type InstrumentRow,
-  type MyOrder,
   type Notification,
   type OrderType,
   type Side,
@@ -19,7 +27,6 @@ import {
 
 const UP = '#22c55e'
 const DOWN = '#d4183d'
-const LEVERAGES = [1, 2, 5, 10, 20] as const
 const TIMEFRAMES = [
   { k: '1min', s: 60 },
   { k: '2min', s: 120 },
@@ -27,6 +34,9 @@ const TIMEFRAMES = [
   { k: '10min', s: 600 },
 ] as const
 type TF = (typeof TIMEFRAMES)[number]['k']
+/** Candles to span in the fetch window (interval × this). Keeps a real series in view. */
+const CANDLE_SPAN = 90
+const intervalOf = (tf: TF) => TIMEFRAMES.find((t) => t.k === tf)!.s
 
 // ---------------------------------------------------------------------------
 // Formatters
@@ -43,19 +53,28 @@ function mmss(totalSeconds: number): string {
 // ---------------------------------------------------------------------------
 // Shared shell bits
 // ---------------------------------------------------------------------------
-function Panel({ title, right, children, className = '', delay = 0 }: {
+function Panel({ title, right, children, className = '', delay = 0, fit = false }: {
   title?: string
   right?: ReactNode
   children: ReactNode
   className?: string
   delay?: number
+  /**
+   * When true the panel is sized to its CONTENT and carries NO overflow property
+   * — it can never clip or scroll. (The default CARD sets `h-full overflow-hidden`
+   * to fill a fixed grid cell; a `fit` panel must live in an `auto` grid row.)
+   */
+  fit?: boolean
 }) {
+  const shell = fit
+    ? 'group relative flex flex-col rounded-2xl border border-white/[0.08] bg-white/[0.03] transition-all duration-300 hover:border-amber-500/25 hover:bg-white/[0.05]'
+    : `${CARD} min-h-0`
   return (
     <motion.section
       initial={MOTION.card.initial}
       animate={MOTION.card.animate}
       transition={{ duration: 0.45, delay, ease: EASE }}
-      className={`${CARD} min-h-0 ${className}`}
+      className={`${shell} ${className}`}
       style={{ boxShadow: CARD_SHADOW }}
     >
       {title && (
@@ -108,6 +127,8 @@ function RoundBar({ snap, username, role, onSignOut }: {
         ) : (
           <span className="flex items-center gap-1.5 text-subtle"><PulseDot color="#71717a" />NO ACTIVE ROUND</span>
         )}
+        <span className="text-subtle">·</span>
+        <Link to="/portfolio" className="text-muted transition-colors hover:text-[#E8C46A]">Portfolio</Link>
         <span className="text-subtle">·</span>
         <span className="text-muted">{username} <span className="text-subtle">({role.replace('_', ' ')})</span></span>
         <button onClick={onSignOut} className="text-subtle transition-colors hover:text-destructive">sign out</button>
@@ -175,8 +196,8 @@ function InstrumentList({ rows, selected, onSelect }: {
             <button
               key={s.ticker}
               onClick={() => onSelect(s.ticker)}
-              className={`${LIST_ROW} relative mb-1 w-full text-left`}
-              style={{ gap: 8, paddingLeft: 14, paddingRight: 12, paddingTop: 7, paddingBottom: 7,
+              className={`${LIST_ROW} relative mb-0.5 w-full text-left`}
+              style={{ gap: 8, paddingLeft: 14, paddingRight: 12, paddingTop: 5, paddingBottom: 5,
                 ...(sel ? { borderColor: 'rgba(232,196,106,0.45)', background: 'rgba(255,255,255,0.055)' } : null) }}
             >
               {sel && <span className="absolute bottom-1.5 left-0 top-1.5 w-[3px] rounded-full" style={{ background: GOLD.solid }} />}
@@ -200,21 +221,25 @@ function InstrumentList({ rows, selected, onSelect }: {
 // ---------------------------------------------------------------------------
 // Left 2 — order window (+ working orders + confirm popup)
 // ---------------------------------------------------------------------------
-interface PendingOrder { side: Side; type: OrderType; qty: number; price: number; leverage: number; requiredInr: number; liq: number | null }
+interface PendingOrder { side: Side; type: OrderType; qty: number; price: number; leverage: number; requiredInr: number; liq: number | null; closes: boolean }
 
-function OrderWindow({ ticker, row, roundActive, onConfirmPlace, myOrders, onCancel }: {
+// A position-reducing order frees margin (requiredMargin < 0); never show that as
+// a negative "required" figure. A closing order leaves no position, hence no liq.
+const marginLabel = (requiredInr: number) => (requiredInr > 1 ? inr(requiredInr) : '— (frees margin)')
+const liqLabel = (closes: boolean, liq: number | null) => (closes ? 'Flat after close' : liq === null ? '—' : usd(liq))
+
+function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
   ticker: string
   row: InstrumentRow | undefined
   roundActive: boolean
+  rate: number
   onConfirmPlace: (o: PendingOrder) => void
-  myOrders: MyOrder[]
-  onCancel: (o: MyOrder) => void
 }) {
   const [side, setSide] = useState<Side>('buy')
   const [type, setType] = useState<OrderType>('limit')
   const [qty, setQty] = useState(10)
-  const [leverage, setLeverage] = useState(5)
   const [price, setPrice] = useState(0)
+  const leverage = 1 // leverage selector removed from the order window; default no-leverage
 
   const ltp = row?.ltp ?? 0
   // Keep the limit price synced to LTP until the user edits it.
@@ -228,22 +253,23 @@ function OrderWindow({ ticker, row, roundActive, onConfirmPlace, myOrders, onCan
     : { qty: 0, avgPrice: 0, leverage }
   const signedQty = side === 'buy' ? qty : -qty
   const valid = qty > 0 && px > 0
-  const requiredUsd = valid ? requiredMargin(existing, signedQty, px, leverage) : 0
-  const requiredInr = requiredUsd * USD_INR
+  // Still computed for the confirm popup (not shown in this panel).
+  const requiredInr = (valid ? requiredMargin(existing, signedQty, px, leverage) : 0) * rate
   const resulting = valid ? applyLeveredFill(existing, signedQty, px, leverage) : null
-  const liq = resulting ? liquidationPrice(resulting) : null
+  const closes = !!resulting && existing.qty !== 0 && resulting.qty === 0
+  const liq = resulting && resulting.qty !== 0 ? liquidationPrice(resulting) : null
   const priceColor = side === 'buy' ? UP : DOWN
 
   return (
-    <Panel title="Order Window" right={<span className="font-mono text-[11px] text-[#E8C46A]">{ticker}</span>} delay={0.06}>
-      <div className="relative flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto px-4 py-3">
-        {!roundActive && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/80 backdrop-blur-[1px]">
-            <span className="rounded-full border border-white/10 px-4 py-1.5 text-[12px] text-subtle">Waiting for next round…</span>
-          </div>
-        )}
+    <Panel title="Order Window" delay={0.06} fit>
+      <div className="flex flex-col gap-3 px-4 py-3">
+        {/* Selected Script */}
+        <div className="flex items-baseline justify-between">
+          <span className="text-[10px] uppercase tracking-[0.16em] text-subtle">Selected Script</span>
+          <span className="font-mono text-sm font-semibold text-[#E8C46A]">{ticker || '—'}</span>
+        </div>
 
-        {/* Buy/Sell — Buy tints the price green, Sell red */}
+        {/* Buy / Sell */}
         <div className="grid grid-cols-2 gap-2">
           {(['buy', 'sell'] as const).map((s) => {
             const on = side === s
@@ -257,84 +283,41 @@ function OrderWindow({ ticker, row, roundActive, onConfirmPlace, myOrders, onCan
           })}
         </div>
 
-        {/* Limit / Market */}
-        <div className="flex gap-1.5">
-          {(['limit', 'market'] as const).map((t) => (
-            <button key={t} onClick={() => setType(t)}
-              className={`flex-1 rounded-full border py-1.5 text-[11px] uppercase tracking-wide transition-colors ${type === t ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
-              {t}
-            </button>
-          ))}
-        </div>
-
-        <label className="block">
-          <span className="mb-1 block text-[10px] uppercase tracking-[0.16em] text-subtle">Quantity</span>
-          <input type="number" min={1} value={qty} onChange={(e) => setQty(Math.max(1, Math.floor(Number(e.target.value) || 0)))}
-            className={`${INPUT} font-mono tabular-nums`} style={{ paddingTop: 8, paddingBottom: 8 }} />
-        </label>
-
-        <label className="block">
-          <span className="mb-1 block text-[10px] uppercase tracking-[0.16em] text-subtle">Price {type === 'market' && <span className="text-subtle">(market — uses LTP)</span>}</span>
-          <input type="number" step="0.01" disabled={type === 'market'}
-            value={type === 'market' ? Number(ltp.toFixed(2)) : price}
-            onChange={(e) => { edited.current = true; setPrice(Number(e.target.value) || 0) }}
-            className={`${INPUT} font-mono tabular-nums disabled:opacity-50`} style={{ paddingTop: 8, paddingBottom: 8, color: priceColor }} />
-        </label>
-
-        <div>
-          <span className="mb-1 block text-[10px] uppercase tracking-[0.16em] text-subtle">Leverage</span>
-          <div className="flex gap-1.5">
-            {LEVERAGES.map((lv) => (
-              <button key={lv} onClick={() => setLeverage(lv)}
-                className={`flex-1 rounded-full border py-1.5 font-mono text-xs tabular-nums transition-colors ${lv === leverage ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
-                {lv}x
+        {/* Qty + Price side by side; Limit/Market stacked to their right */}
+        <div className="flex gap-2">
+          <label className="flex-1">
+            <span className="mb-0.5 block text-[10px] uppercase tracking-[0.16em] text-subtle">Qty</span>
+            <input type="number" min={1} value={qty} onChange={(e) => setQty(Math.max(1, Math.floor(Number(e.target.value) || 0)))}
+              className={`${INPUT} font-mono tabular-nums`} style={{ paddingTop: 6, paddingBottom: 6 }} />
+          </label>
+          <label className="flex-1">
+            <span className="mb-0.5 block text-[10px] uppercase tracking-[0.16em] text-subtle">Price</span>
+            <input type="number" step="0.01" disabled={type === 'market'}
+              value={type === 'market' ? Number(ltp.toFixed(2)) : price}
+              onChange={(e) => { edited.current = true; setPrice(Number(e.target.value) || 0) }}
+              className={`${INPUT} font-mono tabular-nums disabled:opacity-50`} style={{ paddingTop: 6, paddingBottom: 6, color: priceColor }} />
+          </label>
+          <div className="flex w-16 flex-col gap-1 self-stretch pt-[18px]">
+            {(['limit', 'market'] as const).map((t) => (
+              <button key={t} onClick={() => setType(t)}
+                className={`flex-1 rounded-md border text-[10px] uppercase tracking-wide transition-colors ${type === t ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
+                {t}
               </button>
             ))}
           </div>
         </div>
 
-        <dl className="flex flex-col gap-1 rounded-lg border border-white/[0.06] bg-white/[0.02] p-3 text-xs">
-          <Row label="Margin Required" value={inr(requiredInr)} />
-          <Row label="Est. Liquidation" value={liq === null ? '—' : usd(liq)} tone={side === 'buy' ? 'destructive' : 'up'} />
-        </dl>
-
+        {/* Minimal submit */}
         <button
           disabled={!roundActive || !valid}
-          onClick={() => onConfirmPlace({ side, type, qty, price: px, leverage, requiredInr, liq })}
-          className="group relative rounded-full p-px transition-transform duration-300 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
-          style={{ background: GOLD.gradient, backgroundSize: '250% 250%' }}>
-          <span className="relative flex items-center justify-center rounded-full bg-[rgba(8,7,6,0.96)] px-6 py-2.5 text-sm font-medium text-bright transition-colors duration-300 group-hover:bg-[rgba(20,17,14,0.88)]">
-            Place {side.toUpperCase()} Order
-          </span>
+          onClick={() => onConfirmPlace({ side, type, qty, price: px, leverage, requiredInr, liq, closes })}
+          className={`mt-1 rounded-lg border py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+            side === 'buy' ? 'border-up/40 bg-up/10 text-up hover:bg-up/20' : 'border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20'
+          }`}>
+          {roundActive ? `Place ${side.toUpperCase()} Order` : 'Waiting for round…'}
         </button>
-
-        {/* Working (resting) orders — cancel with confirm */}
-        {myOrders.length > 0 && (
-          <div className="mt-1">
-            <div className="mb-1 text-[10px] uppercase tracking-[0.16em] text-subtle">Working Orders</div>
-            <div className="flex flex-col gap-1">
-              {myOrders.map((o) => (
-                <div key={o.orderId} className="flex items-center gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-1.5 text-[11px]">
-                  <span className={`font-medium uppercase ${o.side === 'buy' ? 'text-up' : 'text-destructive'}`}>{o.side}</span>
-                  <span className="font-mono tabular-nums text-muted">{o.remainingQty}/{o.qty} @ {usd(o.price)}</span>
-                  <span className="font-mono text-[10px] text-subtle">{o.leverage}x</span>
-                  <button onClick={() => onCancel(o)} className="ml-auto text-subtle transition-colors hover:text-destructive" aria-label="Cancel order">✕</button>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </div>
     </Panel>
-  )
-}
-
-function Row({ label, value, tone }: { label: string; value: string; tone?: 'up' | 'destructive' }) {
-  return (
-    <div className="flex items-center justify-between">
-      <dt className="text-subtle">{label}</dt>
-      <dd className={`font-mono tabular-nums ${tone === 'up' ? 'text-up' : tone === 'destructive' ? 'text-destructive' : 'text-foreground'}`}>{value}</dd>
-    </div>
   )
 }
 
@@ -382,6 +365,38 @@ function Screener({ row }: { row: InstrumentRow | undefined }) {
 // ---------------------------------------------------------------------------
 // Right 1 — price chart
 // ---------------------------------------------------------------------------
+const VOL_UP = 'rgba(34,197,94,0.5)'
+const VOL_DOWN = 'rgba(212,24,61,0.5)'
+
+/** Aggregate raw trade points into OHLC candles + volume bars per interval. */
+function buildCandles(
+  points: { t: number; price: number; qty: number }[],
+  intervalSec: number,
+): { candles: CandlestickData[]; volumes: HistogramData[] } {
+  const byBucket = new Map<number, { o: number; h: number; l: number; c: number; v: number }>()
+  for (const p of points) {
+    const bucket = Math.floor(p.t / 1000 / intervalSec) * intervalSec // epoch seconds
+    const b = byBucket.get(bucket)
+    if (!b) byBucket.set(bucket, { o: p.price, h: p.price, l: p.price, c: p.price, v: p.qty })
+    else {
+      b.h = Math.max(b.h, p.price)
+      b.l = Math.min(b.l, p.price)
+      b.c = p.price // points arrive ascending, so the last write is the close
+      b.v += p.qty
+    }
+  }
+  const times = [...byBucket.keys()].sort((a, b) => a - b)
+  const candles = times.map((t) => {
+    const b = byBucket.get(t)!
+    return { time: t as UTCTimestamp, open: b.o, high: b.h, low: b.l, close: b.c }
+  })
+  const volumes = times.map((t) => {
+    const b = byBucket.get(t)!
+    return { time: t as UTCTimestamp, value: b.v, color: b.c >= b.o ? VOL_UP : VOL_DOWN }
+  })
+  return { candles, volumes }
+}
+
 function PriceChart({ snap, ticker, ltp, tf, onTf }: {
   snap: Snapshot | null
   ticker: string
@@ -389,7 +404,112 @@ function PriceChart({ snap, ticker, ltp, tf, onTf }: {
   tf: TF
   onTf: (t: TF) => void
 }) {
-  const data = (snap?.prices ?? []).map((p) => ({ t: p.t, price: p.price }))
+  const containerRef = useRef<HTMLDivElement>(null)
+  const chartRef = useRef<IChartApi | null>(null)
+  const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+  const volRef = useRef<ISeriesApi<'Histogram'> | null>(null)
+  const shapeRef = useRef('') // `${ticker}|${interval}` — a change forces a full setData
+  const lenRef = useRef(0)
+
+  // Create the chart once; autoSize keeps it filling the panel via ResizeObserver.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const chart = createChart(el, {
+      autoSize: true,
+      layout: {
+        background: { type: ColorType.Solid, color: 'rgba(0,0,0,0)' },
+        textColor: '#71717a',
+        fontFamily: 'ui-monospace, monospace',
+        fontSize: 10,
+        attributionLogo: false,
+      },
+      grid: {
+        vertLines: { color: 'rgba(255,255,255,0.05)' },
+        horzLines: { color: 'rgba(255,255,255,0.05)' },
+      },
+      rightPriceScale: { borderColor: 'rgba(255,255,255,0.08)' },
+      // Fixed bar width: each candle is a constant ~8px regardless of how many
+      // exist, so a single candle is a THIN candle, never a full-width block.
+      // No fitContent() anywhere — that's what stretched one bar across the chart.
+      timeScale: {
+        borderColor: 'rgba(255,255,255,0.08)',
+        timeVisible: true,
+        secondsVisible: false,
+        barSpacing: 12,
+        minBarSpacing: 2,
+        maxBarSpacing: 24, // a lone candle can never stretch into a giant block
+        rightOffset: 2,
+      },
+      crosshair: {
+        vertLine: { color: 'rgba(232,196,106,0.5)', labelBackgroundColor: '#B87D30' },
+        horzLine: { color: 'rgba(232,196,106,0.5)', labelBackgroundColor: '#B87D30' },
+      },
+    })
+    const candle = chart.addSeries(CandlestickSeries, {
+      upColor: UP, downColor: DOWN,
+      borderUpColor: UP, borderDownColor: DOWN,
+      wickUpColor: UP, wickDownColor: DOWN,
+    })
+    candle.priceScale().applyOptions({ scaleMargins: { top: 0.1, bottom: 0.4 } })
+    const vol = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: 'volume' },
+      priceScaleId: '',
+      lastValueVisible: false, // no volume value ("30") floating on the price axis
+      priceLineVisible: false,
+    })
+    vol.priceScale().applyOptions({ scaleMargins: { top: 0.75, bottom: 0 } })
+
+    chartRef.current = chart
+    candleRef.current = candle
+    volRef.current = vol
+    return () => { chart.remove(); chartRef.current = candleRef.current = volRef.current = null }
+  }, [])
+
+  const intervalSec = intervalOf(tf)
+  useEffect(() => {
+    const chart = chartRef.current
+    const c = candleRef.current
+    const v = volRef.current
+    if (!chart || !c || !v) return
+    const { candles, volumes } = buildCandles(snap?.prices ?? [], intervalSec)
+    const shape = `${ticker}|${intervalSec}`
+
+    // Full reset on a ticker/timeframe change or a non-incremental change (first
+    // load, or the trailing window added/dropped more than one bucket). Otherwise
+    // update just the latest bar so intra-bucket ~1s polls don't refit the view.
+    const prevLen = lenRef.current
+    const grewByOne = candles.length === prevLen + 1
+    const sameLen = candles.length === prevLen
+    const structural = shape !== shapeRef.current || !(sameLen || grewByOne)
+    if (structural) {
+      c.setData(candles)
+      v.setData(volumes)
+    } else if (candles.length > 0) {
+      c.update(candles[candles.length - 1])
+      v.update(volumes[volumes.length - 1])
+    }
+    shapeRef.current = shape
+    lenRef.current = candles.length
+
+    // Auto-fit the visible time range to the data — only on a structural change
+    // or a brand-new candle (not every intra-bucket tick). With little history,
+    // center the candles at a capped width so they fill a reasonable portion with
+    // margin on BOTH sides (never pinned to the right of an empty canvas); once
+    // there are enough candles to fill the width, fit them edge-to-edge.
+    if (candles.length > 0 && (structural || grewByOne)) {
+      const width = containerRef.current?.clientWidth || 600
+      const barsAtMaxWidth = width / 24 // 24px = maxBarSpacing
+      const ts = chart.timeScale()
+      if (candles.length >= barsAtMaxWidth - 2) {
+        ts.fitContent()
+      } else {
+        const pad = (barsAtMaxWidth - candles.length) / 2
+        ts.setVisibleLogicalRange({ from: -pad, to: candles.length - 1 + pad })
+      }
+    }
+  }, [snap?.prices, ticker, intervalSec])
+
   return (
     <Panel
       title={`Chart · ${ticker}`}
@@ -408,25 +528,7 @@ function PriceChart({ snap, ticker, ltp, tf, onTf }: {
         </div>
       }
     >
-      <div className="min-h-0 flex-1 p-2">
-        <ResponsiveContainer width="100%" height="100%">
-          <AreaChart data={data} margin={{ top: 10, right: 12, bottom: 2, left: -4 }}>
-            <defs>
-              <linearGradient id="termFill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={GOLD.solid} stopOpacity={0.22} />
-                <stop offset="100%" stopColor={GOLD.solid} stopOpacity={0} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-            <XAxis dataKey="t" tickFormatter={clockHMS} stroke="#71717a" tick={{ fontSize: 10, fontFamily: 'monospace' }} tickLine={false} axisLine={{ stroke: 'rgba(255,255,255,0.08)' }} minTickGap={60} />
-            <YAxis dataKey="price" domain={['auto', 'auto']} tickFormatter={(v) => usd(v)} orientation="right" stroke="#71717a" tick={{ fontSize: 10, fontFamily: 'monospace' }} tickLine={false} axisLine={false} width={64} />
-            <Tooltip
-              contentStyle={{ background: '#0a0a0a', border: '1px solid rgba(255,255,255,0.1)', borderRadius: 8, fontSize: 11 }}
-              labelFormatter={(l) => clockHMS(Number(l))} formatter={(value) => [usd(Number(value)), 'Price']} />
-            <Area type="monotone" dataKey="price" stroke={GOLD.solid} strokeWidth={2} fill="url(#termFill)" dot={false} isAnimationActive={false} />
-          </AreaChart>
-        </ResponsiveContainer>
-      </div>
+      <div ref={containerRef} className="min-h-0 w-full flex-1" />
     </Panel>
   )
 }
@@ -434,31 +536,61 @@ function PriceChart({ snap, ticker, ltp, tf, onTf }: {
 // ---------------------------------------------------------------------------
 // Right 2 — market depth (+ market-maker resting-order list)
 // ---------------------------------------------------------------------------
+const DEPTH_LEVELS = 6 // per side — enough to read the book without a scrollbar
+
 function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
   const depth = snap?.depth
-  const asks = [...(depth?.asks ?? [])].sort((a, b) => b.price - a.price) // highest ask on top
-  const bids = [...(depth?.bids ?? [])].sort((a, b) => b.price - a.price) // best bid on top
+  // Best levels nearest the centre: asks ascending (best/lowest first), bids
+  // descending (best/highest first). Zero-qty levels are already excluded upstream.
+  const asks = [...(depth?.asks ?? [])].sort((a, b) => a.price - b.price).slice(0, DEPTH_LEVELS)
+  const bids = [...(depth?.bids ?? [])].sort((a, b) => b.price - a.price).slice(0, DEPTH_LEVELS)
   const maxQty = Math.max(1, ...asks.map((l) => l.qty), ...bids.map((l) => l.qty))
-  const resting = depth?.restingOrders
+  const spread = asks[0] && bids[0] ? asks[0].price - bids[0].price : null
+  const resting = role === 'market_maker' ? depth?.restingOrders : undefined
+  const empty = asks.length === 0 && bids.length === 0
 
   return (
-    <Panel title="Market Depth" delay={0.06} right={role === 'market_maker' ? <span className="text-[9px] uppercase tracking-wider text-[#E8C46A]">MM · full book</span> : undefined}>
-      <div className="min-h-0 flex-1 overflow-y-auto p-2 text-[11px]">
-        <div className="flex flex-col gap-0.5">
-          {asks.length === 0 && bids.length === 0 && <div className="py-4 text-center text-subtle">No resting orders.</div>}
-          {asks.map((l) => <DepthRow key={`a${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} tone="ask" />)}
-          {(asks.length > 0 || bids.length > 0) && (
-            <div className="my-1 flex items-center justify-between border-y border-white/[0.06] px-2 py-0.5 text-[9px] uppercase tracking-wider text-subtle">
-              <span>Bid</span><span>Ask</span>
-            </div>
-          )}
-          {bids.map((l) => <DepthRow key={`b${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} tone="bid" />)}
+    <Panel
+      title="Market Depth"
+      delay={0.06}
+      right={role === 'market_maker' ? <span className="text-[9px] uppercase tracking-wider text-[#E8C46A]">MM · full book</span> : undefined}
+    >
+      <div className="flex min-h-0 flex-1 flex-col p-2 text-[11px]">
+        <div className="flex items-center justify-between px-2 pb-1 text-[9px] uppercase tracking-wider text-subtle">
+          <span>Price</span>
+          <span>Qty</span>
         </div>
 
-        {role === 'market_maker' && resting && (
-          <div className="mt-3 border-t border-white/[0.06] pt-2">
+        {empty ? (
+          <div className="flex flex-1 items-center justify-center text-subtle">No resting orders.</div>
+        ) : (
+          <div className="flex min-h-0 flex-1 flex-col justify-center">
+            {/* ASKS — best (lowest) sits at the bottom, nearest the spread */}
+            <div className="flex flex-col gap-px">
+              {[...asks].reverse().map((l) => (
+                <DepthRow key={`a${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} tone="ask" />
+              ))}
+            </div>
+
+            {/* Spread divider */}
+            <div className="my-1 flex items-center justify-between rounded border-y border-white/[0.06] bg-white/[0.02] px-2 py-1">
+              <span className="text-[9px] uppercase tracking-wider text-subtle">Spread</span>
+              <span className="font-mono text-[11px] tabular-nums text-muted">{spread === null ? '—' : usd(spread)}</span>
+            </div>
+
+            {/* BIDS — best (highest) sits at the top, nearest the spread */}
+            <div className="flex flex-col gap-px">
+              {bids.map((l) => (
+                <DepthRow key={`b${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} tone="bid" />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {resting && resting.length > 0 && (
+          <div className="mt-2 border-t border-white/[0.06] pt-2">
             <div className="mb-1 text-[9px] uppercase tracking-[0.16em] text-subtle">Resting Orders ({resting.length})</div>
-            <div className="flex flex-col gap-0.5">
+            <div className="flex max-h-20 flex-col gap-0.5 overflow-y-auto">
               {resting.map((o) => (
                 <div key={o.orderId} className="flex items-center gap-2 font-mono tabular-nums">
                   <span className={`w-9 ${o.side === 'buy' ? 'text-up' : 'text-destructive'}`}>{o.side === 'buy' ? 'BUY' : 'SELL'}</span>
@@ -478,11 +610,12 @@ function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
 
 function DepthRow({ price, qty, maxQty, tone }: { price: number; qty: number; maxQty: number; tone: 'bid' | 'ask' }) {
   const color = tone === 'bid' ? UP : DOWN
+  const bar = tone === 'bid' ? 'rgba(34,197,94,0.12)' : 'rgba(212,24,61,0.12)'
   return (
-    <div className="relative flex items-center justify-between rounded px-2 py-0.5 font-mono tabular-nums">
-      <span className="absolute inset-y-0 right-0 rounded" style={{ width: `${(qty / maxQty) * 100}%`, background: tone === 'bid' ? 'rgba(34,197,94,0.10)' : 'rgba(212,24,61,0.10)' }} />
-      <span className="relative" style={{ color }}>{usd(price)}</span>
-      <span className="relative text-muted">{qty}</span>
+    <div className="relative flex items-center justify-between rounded px-2 py-[3px] font-mono tabular-nums">
+      <span className="absolute inset-y-0 right-0 rounded" style={{ width: `${(qty / maxQty) * 100}%`, background: bar }} />
+      <span className="relative font-semibold" style={{ color }}>{usd(price)}</span>
+      <span className="relative text-foreground">{qty}</span>
     </div>
   )
 }
@@ -595,14 +728,13 @@ function Terminal() {
   const [selected, setSelected] = useState('')
   const [tf, setTf] = useState<TF>('5min')
   const [pending, setPending] = useState<PendingOrder | null>(null)
-  const [cancelling, setCancelling] = useState<MyOrder | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [announcement, setAnnouncement] = useState<Notification | null>(null)
   const [error, setError] = useState<string | null>(null)
   const seenAnn = useRef<Set<string> | null>(null)
   const toastSeq = useRef(0)
 
-  const windowSec = TIMEFRAMES.find((t) => t.k === tf)!.s
+  const windowSec = intervalOf(tf) * CANDLE_SPAN // fetch enough history for a full candle series
 
   const pushToast = useCallback((ok: boolean, title: string, detail?: string) => {
     const id = ++toastSeq.current
@@ -670,13 +802,6 @@ function Terminal() {
     } catch { pushToast(false, 'Order failed', 'Network / server error') }
   }
 
-  async function doCancel(o: MyOrder) {
-    setCancelling(null)
-    try {
-      const res = await api.cancelOrder(o.orderId)
-      pushToast(res.cancelled, res.cancelled ? 'Order cancelled' : 'Cancel failed', res.cancelled ? undefined : 'Order not found or not yours')
-    } catch { pushToast(false, 'Cancel failed', 'Network / server error') }
-  }
 
   if (error) {
     return (
@@ -703,15 +828,15 @@ function Terminal() {
 
       <div className="grid min-h-0 flex-1 grid-cols-2 gap-4 p-4">
         {/* LEFT column: instruments / order / screener */}
-        <div className="grid min-h-0 grid-rows-[minmax(0,1.1fr)_minmax(0,1.4fr)_minmax(0,0.9fr)] gap-4">
+        <div className="grid min-h-0 grid-rows-[minmax(0,1.45fr)_auto_minmax(0,0.8fr)] gap-4">
           <InstrumentList rows={rows} selected={selected} onSelect={setSelected} />
           <OrderWindow ticker={selected} row={row} roundActive={roundActive}
-            onConfirmPlace={setPending} myOrders={snap?.myOrders ?? []} onCancel={setCancelling} />
+            rate={snap?.rate ?? 83} onConfirmPlace={setPending} />
           <Screener row={row} />
         </div>
 
         {/* RIGHT column: chart / depth / times & sales */}
-        <div className="grid min-h-0 grid-rows-[minmax(0,1.3fr)_minmax(0,1.1fr)_minmax(0,1fr)] gap-4">
+        <div className="grid min-h-0 grid-rows-[minmax(0,1.45fr)_minmax(0,1.15fr)_minmax(0,0.8fr)] gap-4">
           <PriceChart snap={snap} ticker={selected} ltp={row?.ltp ?? 0} tf={tf} onTf={setTf} />
           <DepthLadder snap={snap} role={boot.role} />
           <TimesAndSales snap={snap} ticker={selected} />
@@ -735,23 +860,8 @@ function Terminal() {
             { k: 'Quantity', v: String(pending.qty) },
             { k: 'Price', v: pending.type === 'market' ? 'MARKET' : usd(pending.price) },
             { k: 'Leverage', v: `${pending.leverage}x` },
-            { k: 'Margin Required', v: inr(pending.requiredInr) },
-            { k: 'Est. Liquidation', v: pending.liq === null ? '—' : usd(pending.liq) },
-          ]}
-        />
-      )}
-      {cancelling && (
-        <ConfirmDialog
-          title="Cancel Order?"
-          tone="destructive"
-          confirmLabel="Cancel Order"
-          onCancel={() => setCancelling(null)}
-          onConfirm={() => doCancel(cancelling)}
-          lines={[
-            { k: 'Instrument', v: selected },
-            { k: 'Side', v: cancelling.side.toUpperCase(), tone: cancelling.side === 'buy' ? 'up' : 'destructive' },
-            { k: 'Remaining', v: `${cancelling.remainingQty}/${cancelling.qty}` },
-            { k: 'Price', v: usd(cancelling.price) },
+            { k: 'Margin Required', v: marginLabel(pending.requiredInr) },
+            { k: 'Est. Liquidation', v: liqLabel(pending.closes, pending.liq) },
           ]}
         />
       )}

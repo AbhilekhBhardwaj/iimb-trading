@@ -10,7 +10,9 @@ function ord(
   idSeq++
   return {
     id: o.id ?? `o${idSeq}`,
-    userId: o.userId ?? 'u1',
+    // Distinct account per order by default, so orders match normally; STP tests
+    // pass an explicit shared userId to exercise self-trade prevention.
+    userId: o.userId ?? `u${idSeq}`,
     instrument: o.instrument ?? 'AAPL',
     side: o.side,
     type: o.type ?? 'limit',
@@ -47,6 +49,70 @@ describe('OrderBook.restResting — recovery insertion (no matching)', () => {
     const done = ord({ side: 'buy', price: 100, qty: 5 })
     done.remainingQty = 0
     expect(() => book.restResting(done)).toThrow()
+  })
+})
+
+describe('OrderBook — self-trade prevention', () => {
+  it("skips an account's own resting order — no self-trade, both rest", () => {
+    const book = new OrderBook('AAPL')
+    book.placeLimitOrder(ord({ id: 'own-ask', userId: 'team01', side: 'sell', price: 100, qty: 10, timestamp: 1 }))
+    // Same account crosses its own ask — must NOT match.
+    const trades = book.placeLimitOrder(ord({ id: 'own-bid', userId: 'team01', side: 'buy', price: 100, qty: 10, timestamp: 2 }))
+
+    expect(trades).toEqual([])
+    // The taker rests; both same-account orders remain on the (crossed) book.
+    expect(book.getOrder('own-ask')?.remainingQty).toBe(10)
+    expect(book.getOrder('own-bid')?.remainingQty).toBe(10)
+    expect(book.getDepth()).toEqual({ bids: [{ price: 100, qty: 10 }], asks: [{ price: 100, qty: 10 }] })
+  })
+
+  it('skips own best-priced order and matches the next-best OTHER account', () => {
+    const book = new OrderBook('AAPL')
+    book.placeLimitOrder(ord({ id: 'own', userId: 'team01', side: 'sell', price: 100, qty: 10, timestamp: 1 })) // best ask, own
+    book.placeLimitOrder(ord({ id: 'other', userId: 'team02', side: 'sell', price: 101, qty: 10, timestamp: 2 }))
+
+    // team01 buy crosses both 100 and 101; must skip its own 100 and hit team02 @101.
+    const trades = book.placeLimitOrder(ord({ id: 'take', userId: 'team01', side: 'buy', price: 101, qty: 10, timestamp: 3 }))
+
+    expect(trades).toHaveLength(1)
+    expect(trades[0]).toMatchObject({ sellOrderId: 'other', buyOrderId: 'take', price: 101, qty: 10 })
+    expect(book.getOrder('own')?.remainingQty).toBe(10) // own order untouched, still resting
+    expect(book.getOrder('other')).toBeUndefined() // team02's order fully filled
+  })
+
+  it('fills against the other account, then rests the remainder past own liquidity', () => {
+    const book = new OrderBook('AAPL')
+    book.placeLimitOrder(ord({ id: 'own', userId: 'team01', side: 'sell', price: 100, qty: 10, timestamp: 1 }))
+    book.placeLimitOrder(ord({ id: 'other', userId: 'team02', side: 'sell', price: 100, qty: 4, timestamp: 2 }))
+
+    const trades = book.placeLimitOrder(ord({ id: 'take', userId: 'team01', side: 'buy', price: 100, qty: 10, timestamp: 3 }))
+    expect(trades).toHaveLength(1)
+    expect(trades[0]).toMatchObject({ sellOrderId: 'other', qty: 4 }) // only the other account's 4 fill
+    expect(book.getOrder('take')?.remainingQty).toBe(6) // remainder rests as a bid
+    expect(book.getOrder('own')?.remainingQty).toBe(10) // own ask still resting
+  })
+
+  it('a market order also skips own liquidity (no self-trade; unfilled discarded)', () => {
+    const book = new OrderBook('AAPL')
+    book.placeLimitOrder(ord({ id: 'own', userId: 'team01', side: 'sell', price: 100, qty: 10, timestamp: 1 }))
+    const onlyOwn = book.placeMarketOrder(ord({ userId: 'team01', side: 'buy', type: 'market', qty: 5, timestamp: 2 }))
+    expect(onlyOwn).toEqual([]) // nothing to match but its own order
+    expect(book.getOrder('own')?.remainingQty).toBe(10)
+
+    // Add another account's liquidity; the market order now fills against it.
+    book.placeLimitOrder(ord({ id: 'other', userId: 'team02', side: 'sell', price: 101, qty: 5, timestamp: 3 }))
+    const trades = book.placeMarketOrder(ord({ userId: 'team01', side: 'buy', type: 'market', qty: 5, timestamp: 4 }))
+    expect(trades).toHaveLength(1)
+    expect(trades[0]).toMatchObject({ sellOrderId: 'other', qty: 5 })
+  })
+
+  it('two different accounts still match normally', () => {
+    const book = new OrderBook('AAPL')
+    book.placeLimitOrder(ord({ id: 'a', userId: 'team01', side: 'sell', price: 100, qty: 10, timestamp: 1 }))
+    const trades = book.placeLimitOrder(ord({ id: 'b', userId: 'team02', side: 'buy', price: 100, qty: 10, timestamp: 2 }))
+    expect(trades).toHaveLength(1)
+    expect(trades[0]).toMatchObject({ buyOrderId: 'b', sellOrderId: 'a', price: 100, qty: 10 })
+    expect(book.getDepth()).toEqual({ bids: [], asks: [] })
   })
 })
 

@@ -189,26 +189,41 @@ export class OrderBook {
   }
 
   /**
-   * Core matcher. Consumes the front of the opposing book (already in best-first
-   * order) while the taker has quantity left and either (a) it's a market order,
-   * or (b) its limit price crosses the resting price. Each fill trades at the
-   * resting order's price and emits a Trade.
+   * Core matcher. Walks the opposing book (already in best-first order) while the
+   * taker has quantity left and either (a) it's a market order, or (b) its limit
+   * price crosses the resting price. Each fill trades at the resting order's price
+   * and emits a Trade.
+   *
+   * Self-trade prevention (STP): a resting order belonging to the SAME account as
+   * the taker is never matched — it is skipped (left untouched on the book) and
+   * the taker matches the next-best OTHER-account order instead. If the only
+   * crossing liquidity is the taker's own, nothing fills (the limit remainder
+   * then rests; a market remainder is discarded), so an account can never trade
+   * with itself.
    */
   private execute(taker: Order, isMarket: boolean): Trade[] {
     const trades: Trade[] = []
     const opposing = taker.side === 'buy' ? this.asks : this.bids
 
-    while (taker.remainingQty > 0 && opposing.length > 0) {
-      const resting = opposing[0]
-      // resting orders are always limit orders, so resting.price is defined.
-      const restingPrice = resting.price as number
-
-      if (!isMarket) {
-        const takerPrice = taker.price as number
-        const crosses = taker.side === 'buy' ? takerPrice >= restingPrice : takerPrice <= restingPrice
-        if (!crosses) break
+    while (taker.remainingQty > 0) {
+      // Find the best crossing resting order that is NOT the taker's own account.
+      let idx = -1
+      for (let i = 0; i < opposing.length; i++) {
+        const candidate = opposing[i]
+        if (!isMarket) {
+          const takerPrice = taker.price as number
+          const restingPrice = candidate.price as number
+          const crosses = taker.side === 'buy' ? takerPrice >= restingPrice : takerPrice <= restingPrice
+          if (!crosses) break // book is best-first; nothing past here crosses either
+        }
+        if (candidate.userId === taker.userId) continue // STP: skip own resting order
+        idx = i
+        break
       }
+      if (idx === -1) break // no eligible counterparty (only own orders, or no cross)
 
+      const resting = opposing[idx]
+      const restingPrice = resting.price as number
       const qty = Math.min(taker.remainingQty, resting.remainingQty)
       trades.push({
         id: `${this.instrument}-t${++this.tradeSeq}`,
@@ -225,7 +240,7 @@ export class OrderBook {
       resting.status = resting.remainingQty === 0 ? 'filled' : 'partially_filled'
       taker.status = taker.remainingQty === 0 ? 'filled' : 'partially_filled'
 
-      if (resting.remainingQty === 0) opposing.shift()
+      if (resting.remainingQty === 0) opposing.splice(idx, 1)
     }
     return trades
   }

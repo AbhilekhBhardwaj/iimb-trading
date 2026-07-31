@@ -16,6 +16,7 @@
 import { createEventConfig, RoundController } from '@iimb-trading/engine'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { startRateDrift, usdInr } from './rate'
 import { createAdminClient } from './supabaseAdmin'
 import { TradingService } from './tradingService'
 
@@ -127,8 +128,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       username: caller.username,
       instruments: service.instrumentCatalogue(),
       round: service.getRoundStatus(),
+      rate: usdInr(),
       serverTime: Date.now(),
     })
+  }
+
+  if (method === 'GET' && path === '/api/portfolio') {
+    return json(res, 200, await service.portfolio(caller.accountId))
   }
 
   if (method === 'GET' && path === '/api/snapshot') {
@@ -191,6 +197,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 // ---------------------------------------------------------------------------
 async function main(): Promise<void> {
   await service.loadInstruments()
+  startRateDrift() // live USD→INR rate (drift is API-server only; tests stay fixed)
   const recovery = await service.rehydrate()
   console.log(
     `TradingService ready. Recovery: ${recovery.roundsRestored} round(s), ` +

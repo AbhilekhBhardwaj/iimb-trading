@@ -32,6 +32,7 @@ import {
   liquidationPrice,
   positionMargin,
   requiredMargin,
+  xirr,
   type Depth,
   type LeveredPosition,
   type Order,
@@ -43,7 +44,8 @@ import {
 } from '@iimb-trading/engine'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { randomUUID } from 'node:crypto'
-import { MAINTENANCE_MARGIN_RATE, USD_INR } from './config'
+import { MAINTENANCE_MARGIN_RATE } from './config'
+import { usdInr } from './rate'
 
 type Severity = 'info' | 'warning' | 'error'
 const EPS = 1e-9
@@ -249,7 +251,7 @@ export class TradingService {
     const { data, error } = await this.db.from('profiles').select('id, realized_pnl').neq('realized_pnl', 0)
     if (error) throw error
     for (const row of data ?? []) {
-      this.realizedPnlUsd.set(row.id as string, Number(row.realized_pnl) / USD_INR)
+      this.realizedPnlUsd.set(row.id as string, Number(row.realized_pnl))
     }
     return (data ?? []).length
   }
@@ -365,8 +367,8 @@ export class TradingService {
     const availableUsd = await this.availableMarginUsd(input.accountId)
     if (requiredUsd > availableUsd + EPS) {
       return this.reject(input, 'insufficient_margin', {
-        requiredMarginInr: requiredUsd * USD_INR,
-        availableMarginInr: availableUsd * USD_INR,
+        requiredMarginInr: requiredUsd * usdInr(),
+        availableMarginInr: availableUsd * usdInr(),
         leverage,
       })
     }
@@ -469,8 +471,8 @@ export class TradingService {
     const startingCashInr = await this.startingCashInr(accountId)
     const positions = await this.positionViews(accountId)
     const marginUsedInr = positions.reduce((a, p) => a + p.marginUsedInr, 0)
-    const marginReservedInr = this.reservedMarginUsd(accountId) * USD_INR
-    const realizedPnlInr = (this.realizedPnlUsd.get(accountId) ?? 0) * USD_INR
+    const marginReservedInr = this.reservedMarginUsd(accountId) * usdInr()
+    const realizedPnlInr = (this.realizedPnlUsd.get(accountId) ?? 0) * usdInr()
     return {
       startingCashInr,
       realizedPnlInr,
@@ -483,7 +485,7 @@ export class TradingService {
 
   /** Margin (INR) currently locked up by an account's resting orders. */
   getReservedMarginInr(accountId: string): number {
-    return this.reservedMarginUsd(accountId) * USD_INR
+    return this.reservedMarginUsd(accountId) * usdInr()
   }
 
   /** Depth ladder for an instrument (proxy to the engine) — useful for recovery checks. */
@@ -594,25 +596,30 @@ export class TradingService {
     }))
   }
 
-  /** Price series (from trades) within a window; a flat baseline if untraded. */
-  async priceHistory(ticker: string, windowSeconds = 600): Promise<{ t: number; price: number }[]> {
+  /**
+   * Trade series (price + qty) within a window, for building candles + volume.
+   * Returns a flat baseline point (qty 0) when the instrument is untraded, so the
+   * chart can still render a starting candle.
+   */
+  async priceHistory(ticker: string, windowSeconds = 600): Promise<{ t: number; price: number; qty: number }[]> {
     const instrumentId = this.tickerToId.get(ticker)
     const baseline = this.ltp(ticker)
     const now = Date.now()
-    if (!instrumentId) return [{ t: now - windowSeconds * 1000, price: baseline }, { t: now, price: baseline }]
+    if (!instrumentId) return [{ t: now, price: baseline, qty: 0 }]
     const sinceIso = new Date(now - windowSeconds * 1000).toISOString()
     const { data, error } = await this.db
       .from('trades')
-      .select('price, created_at')
+      .select('price, qty, created_at')
       .eq('instrument_id', instrumentId)
       .gte('created_at', sinceIso)
       .order('created_at', { ascending: true })
     if (error) throw error
-    const points = (data ?? []).map((r) => ({ t: Date.parse(r.created_at as string), price: Number(r.price) }))
-    if (points.length === 0) {
-      return [{ t: now - windowSeconds * 1000, price: baseline }, { t: now, price: baseline }]
-    }
-    return points
+    const points = (data ?? []).map((r) => ({
+      t: Date.parse(r.created_at as string),
+      price: Number(r.price),
+      qty: Number(r.qty),
+    }))
+    return points.length === 0 ? [{ t: now, price: baseline, qty: 0 }] : points
   }
 
   /** Recent event-wide notifications for the strip + announcement popups. */
@@ -685,7 +692,108 @@ export class TradingService {
       trades,
       prices,
       notifications,
+      rate: usdInr(),
       serverTime: Date.now(),
+    }
+  }
+
+  /** Event start (earliest round start) in epoch ms, or null before any round. */
+  private async eventStartMs(): Promise<number | null> {
+    const { data, error } = await this.db
+      .from('rounds')
+      .select('started_at')
+      .not('started_at', 'is', null)
+      .order('started_at', { ascending: true })
+      .limit(1)
+      .maybeSingle()
+    if (error) throw error
+    return data?.started_at ? Date.parse(data.started_at as string) : null
+  }
+
+  /** Everything the Portfolio page needs. Cash figures in INR at the live rate. */
+  async portfolio(accountId: string): Promise<Record<string, unknown>> {
+    const rate = usdInr()
+    const openingBalanceInr = await this.startingCashInr(accountId)
+    const realizedPnlUsd = this.realizedPnlUsd.get(accountId) ?? 0
+    const realizedPnlInr = realizedPnlUsd * rate
+    const cashInr = openingBalanceInr + realizedPnlInr
+
+    const { data, error } = await this.db
+      .from('positions')
+      .select('instrument_id, qty, avg_price, leverage')
+      .eq('account_id', accountId)
+    if (error) throw error
+    const posByTicker = new Map(
+      (data ?? []).map((p) => [this.idToTicker.get(p.instrument_id as string) ?? '', p]),
+    )
+
+    let openPositions = 0
+    let levNotionalUsd = 0 // entry notional, for the weighted-average leverage
+    let levMarginUsd = 0
+    const inventory = [...this.instrumentMeta].map(([ticker, meta], i) => {
+      const p = posByTicker.get(ticker)
+      const ltp = this.lastPrice.get(ticker) ?? meta.referencePrice
+      const qty = p ? Number(p.qty) : 0
+      if (qty === 0) {
+        return {
+          index: i + 1, ticker, name: meta.name, ltp,
+          qty: null, leverage: null, avgPrice: null,
+          avgEntryInr: null, currentPriceInr: null,
+          pnlM2mInr: null, portfolioValueInr: null, costBasisInr: null,
+        }
+      }
+      openPositions++
+      const avgPrice = Number(p!.avg_price)
+      const leverage = Number(p!.leverage)
+      levNotionalUsd += Math.abs(qty) * avgPrice
+      levMarginUsd += (Math.abs(qty) * avgPrice) / leverage
+      return {
+        index: i + 1, ticker, name: meta.name, ltp,
+        qty, leverage, avgPrice,
+        avgEntryInr: avgPrice * rate, // prices converted server-side; the rate is never exposed to the UI
+        currentPriceInr: ltp * rate,
+        pnlM2mInr: qty * (ltp - avgPrice) * rate, // mark-to-market unrealized
+        portfolioValueInr: qty * ltp * rate,
+        costBasisInr: qty * avgPrice * rate,
+      }
+    })
+    // Effective portfolio leverage: total notional / total margin posted (1× flat).
+    const leverageReq = levMarginUsd > 0 ? levNotionalUsd / levMarginUsd : 1
+
+    const positionsValueInr = inventory.reduce((s, r) => s + (r.portfolioValueInr ?? 0), 0)
+    const unrealizedPnlInr = inventory.reduce((s, r) => s + (r.pnlM2mInr ?? 0), 0)
+    // Equity = cash + unrealized P&L (internally consistent: equals opening + total P&L).
+    const totalPortfolioValueInr = cashInr + unrealizedPnlInr
+    const totalPnlInr = realizedPnlInr + unrealizedPnlInr
+    const totalPnlPct = openingBalanceInr > 0 ? (totalPnlInr / openingBalanceInr) * 100 : 0
+
+    // XIRR: starting capital out at event start, current total value in as of now.
+    const t0 = await this.eventStartMs()
+    const xirrValue =
+      t0 === null
+        ? null
+        : xirr([
+            { amount: -openingBalanceInr, when: t0 },
+            { amount: totalPortfolioValueInr, when: Date.now() },
+          ])
+
+    return {
+      rate,
+      openingBalanceInr,
+      realizedPnlUsd,
+      realizedPnlInr,
+      cashInr,
+      inventory,
+      positionsValueInr,
+      unrealizedPnlInr,
+      totalPnlInr,
+      totalPnlPct,
+      totalPortfolioValueInr,
+      xirr: xirrValue,
+      // Effective portfolio leverage (weighted average of open positions; 1× flat).
+      leverageReq,
+      openPositions,
+      chargesInr: 0, // commission not applied yet (rounds may enable it later)
     }
   }
 
@@ -758,15 +866,15 @@ export class TradingService {
     )
     if (upErr) throw upErr
 
-    // Accumulate realized P&L (USD in memory) and persist it (INR) so buying
-    // power survives a restart. We write the absolute running total — this
-    // process is the single authoritative writer.
+    // Accumulate realized P&L and persist it in USD (the P&L is locked in USD;
+    // its INR value floats with the live rate at display time). Absolute running
+    // total — this process is the single authoritative writer.
     if (next.realizedPnl !== 0) {
       const totalUsd = (this.realizedPnlUsd.get(accountId) ?? 0) + next.realizedPnl
       this.realizedPnlUsd.set(accountId, totalUsd)
       const { error: pnlErr } = await this.db
         .from('profiles')
-        .update({ realized_pnl: totalUsd * USD_INR })
+        .update({ realized_pnl: totalUsd })
         .eq('id', accountId)
       if (pnlErr) throw pnlErr
     }
@@ -820,7 +928,7 @@ export class TradingService {
           qty,
           avgPrice,
           leverage,
-          marginUsedInr: positionMargin(qty, avgPrice, leverage) * USD_INR,
+          marginUsedInr: positionMargin(qty, avgPrice, leverage) * usdInr(),
           liquidationPrice: liquidationPrice({ qty, avgPrice, leverage }, MAINTENANCE_MARGIN_RATE),
         }
       })
@@ -829,7 +937,7 @@ export class TradingService {
 
   /** Available margin in USD: startingCash + realizedPnL − marginUsed − marginReserved. */
   private async availableMarginUsd(accountId: string): Promise<number> {
-    const startingUsd = (await this.startingCashInr(accountId)) / USD_INR
+    const startingUsd = (await this.startingCashInr(accountId)) / usdInr()
     const realizedUsd = this.realizedPnlUsd.get(accountId) ?? 0
     const { data, error } = await this.db
       .from('positions')
