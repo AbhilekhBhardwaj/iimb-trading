@@ -141,6 +141,21 @@ export class RoundController {
   getSchedule(): Round[] {
     return this.rounds.map(snapshot)
   }
+
+  /**
+   * Master-Terminal control: set commission on the ACTIVE round, or — when no
+   * round is active — the NEXT pending round. Returns a snapshot of the round
+   * changed, or null if there is neither an active nor a pending round.
+   */
+  setCommission(enabled: boolean): Round | null {
+    const target =
+      this.activeIndex !== null
+        ? this.rounds[this.activeIndex]
+        : this.rounds.find((r) => r.status === 'pending')
+    if (!target) return null
+    target.commissionEnabled = enabled
+    return snapshot(target)
+  }
 }
 
 function snapshot(round: Round): Round {

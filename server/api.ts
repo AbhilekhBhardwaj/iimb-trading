@@ -137,6 +137,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return json(res, 200, await service.portfolio(caller.accountId))
   }
 
+  if (method === 'GET' && path === '/api/round/schedule') {
+    return json(res, 200, { schedule: service.getSchedule() })
+  }
+
+  if (method === 'GET' && path === '/api/notifications') {
+    return json(res, 200, { notifications: await service.notifications(50) })
+  }
+
   if (method === 'GET' && path === '/api/snapshot') {
     const ticker = url.searchParams.get('ticker')
     const windowSec = Number(url.searchParams.get('priceWindowSec') ?? 600)
@@ -180,6 +188,16 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
     await service.endRound(nowSec())
     return json(res, 200, { round: service.getRoundStatus() })
+  }
+  if (method === 'POST' && path === '/api/round/commission') {
+    if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
+    const b = await readJson(req)
+    const changed = await service.setCommission(b.enabled === true)
+    return json(res, 200, { round: service.getRoundStatus(), changed })
+  }
+  if (method === 'GET' && path === '/api/admin/teams') {
+    if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
+    return json(res, 200, { teams: await service.teamsOverview() })
   }
   if (method === 'POST' && path === '/api/notifications') {
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })

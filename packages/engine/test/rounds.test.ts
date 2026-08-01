@@ -15,6 +15,39 @@ function threeRoundConfig(): EventConfig {
   ]
 }
 
+describe('RoundController — setCommission (Master control)', () => {
+  it('toggles commission on the active round when one is active', () => {
+    const rc = new RoundController(threeRoundConfig())
+    rc.startNextRound(0) // round 'a' active, commission false
+    const changed = rc.setCommission(true)
+    expect(changed?.id).toBe('a')
+    expect(changed?.commissionEnabled).toBe(true)
+    expect(rc.getCurrentRound()?.commissionEnabled).toBe(true)
+    expect(rc.isCommissionActive()).toBe(true)
+  })
+
+  it('targets the next pending round when none is active', () => {
+    const rc = new RoundController(threeRoundConfig())
+    // nothing active yet → affects the first pending round ('a')
+    const changed = rc.setCommission(true)
+    expect(changed?.id).toBe('a')
+    expect(rc.getSchedule()[0].commissionEnabled).toBe(true)
+    // after 'a' ends, the next pending ('b') is targeted
+    rc.startNextRound(0)
+    rc.endCurrentRound(10)
+    const next = rc.setCommission(false)
+    expect(next?.id).toBe('b')
+    expect(rc.getSchedule()[1].commissionEnabled).toBe(false)
+  })
+
+  it('returns null when there is neither an active nor a pending round', () => {
+    const rc = new RoundController([{ id: 'only', mode: 'silent', durationSeconds: 60, commissionEnabled: false }])
+    rc.startNextRound(0)
+    rc.endCurrentRound(60) // no pending left, none active
+    expect(rc.setCommission(true)).toBeNull()
+  })
+})
+
 describe('RoundController — activation order & single-active invariant', () => {
   it('activates rounds in order, one at a time; previous must end before next starts', () => {
     const rc = new RoundController(threeRoundConfig())

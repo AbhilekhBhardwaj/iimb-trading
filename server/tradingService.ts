@@ -333,6 +333,28 @@ export class TradingService {
     }
   }
 
+  /** Full ordered schedule (all rounds, statuses, modes, commission) for the admin. */
+  getSchedule(): Round[] {
+    return this.rounds.getSchedule()
+  }
+
+  /**
+   * Master control: set commission on the active round (or next pending if none
+   * active). Persists to the DB only for the active round (pending rounds have no
+   * row until started). NOTE: this flips/stores the flag and updates displays —
+   * commission is not yet charged against trade P&L (separate follow-up).
+   */
+  async setCommission(enabled: boolean): Promise<Round | null> {
+    const changed = this.rounds.setCommission(enabled)
+    if (!changed) return null
+    if (this.activeRoundId === changed.id) {
+      const { error } = await this.db.from('rounds').update({ commission_enabled: enabled }).eq('id', changed.id)
+      if (error) throw error
+    }
+    await this.log(null, 'commission_changed', 'info', { roundId: changed.id, enabled })
+    return changed
+  }
+
   // -------------------------------------------------------------------------
   // Orders
   // -------------------------------------------------------------------------
@@ -794,7 +816,108 @@ export class TradingService {
       leverageReq,
       openPositions,
       chargesInr: 0, // commission not applied yet (rounds may enable it later)
+      tradeHistory: await this.tradeHistory(accountId),
     }
+  }
+
+  /** Admin-only overview of every team: equity + total P&L (same equity math as the portfolio). */
+  async teamsOverview(): Promise<
+    { username: string; teamName: string | null; equityInr: number; totalPnlInr: number; totalPnlPct: number; openPositions: number }[]
+  > {
+    const rate = usdInr()
+    const { data: profs, error: pErr } = await this.db
+      .from('profiles')
+      .select('id, username, team_name, starting_cash, realized_pnl')
+      .eq('role', 'team')
+      .order('username')
+    if (pErr) throw pErr
+
+    const { data: allPos, error: posErr } = await this.db
+      .from('positions')
+      .select('account_id, instrument_id, qty, avg_price')
+    if (posErr) throw posErr
+    const byAccount = new Map<string, { instrument_id: string; qty: number; avg: number }[]>()
+    for (const p of allPos ?? []) {
+      const arr = byAccount.get(p.account_id as string) ?? []
+      arr.push({ instrument_id: p.instrument_id as string, qty: Number(p.qty), avg: Number(p.avg_price) })
+      byAccount.set(p.account_id as string, arr)
+    }
+
+    return (profs ?? []).map((pr) => {
+      const positions = byAccount.get(pr.id as string) ?? []
+      let unrealizedUsd = 0
+      let openPositions = 0
+      for (const pos of positions) {
+        if (pos.qty === 0) continue
+        openPositions++
+        const ticker = this.idToTicker.get(pos.instrument_id) ?? ''
+        const ltp = this.lastPrice.get(ticker) ?? 0
+        unrealizedUsd += pos.qty * (ltp - pos.avg)
+      }
+      const realizedUsd = this.realizedPnlUsd.get(pr.id as string) ?? Number(pr.realized_pnl)
+      const openingInr = Number(pr.starting_cash)
+      const totalPnlInr = (realizedUsd + unrealizedUsd) * rate
+      return {
+        username: pr.username as string,
+        teamName: (pr.team_name as string | null) ?? null,
+        equityInr: openingInr + totalPnlInr,
+        totalPnlInr,
+        totalPnlPct: openingInr > 0 ? (totalPnlInr / openingInr) * 100 : 0,
+        openPositions,
+      }
+    })
+  }
+
+  /**
+   * Per-trade realized P&L for an account, reconstructed from the `trades` table.
+   * We replay the account's fills in time order through the same position math the
+   * engine uses; every fill that closes/reduces/flips a position emits one closed-
+   * trade record (entry = avg before the fill, exit = fill price, realized = the
+   * amount locked in). Most recent first. Amounts in INR at the live rate.
+   */
+  async tradeHistory(
+    accountId: string,
+  ): Promise<{ ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; realizedPnlInr: number; closedAt: number }[]> {
+    const rate = usdInr()
+    const { data: myOrders, error: oErr } = await this.db.from('orders').select('id').eq('account_id', accountId)
+    if (oErr) throw oErr
+    const ids = (myOrders ?? []).map((o) => o.id as string)
+    if (ids.length === 0) return []
+    const idSet = new Set(ids)
+    const inList = `(${ids.join(',')})`
+
+    const { data: trades, error: tErr } = await this.db
+      .from('trades')
+      .select('price, qty, created_at, instrument_id, buy_order_id, sell_order_id')
+      .or(`buy_order_id.in.${inList},sell_order_id.in.${inList}`)
+      .order('created_at', { ascending: true })
+    if (tErr) throw tErr
+
+    const pos = new Map<string, { qty: number; avgPrice: number }>()
+    const history: { ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; realizedPnlInr: number; closedAt: number }[] = []
+    for (const t of trades ?? []) {
+      const isBuyer = idSet.has(t.buy_order_id as string)
+      const isSeller = idSet.has(t.sell_order_id as string)
+      if (isBuyer === isSeller) continue // both (self-trade) or neither → net zero for this account
+      const price = Number(t.price)
+      const signed = isBuyer ? Number(t.qty) : -Number(t.qty)
+      const ticker = this.idToTicker.get(t.instrument_id as string) ?? (t.instrument_id as string)
+      const cur = pos.get(ticker) ?? { qty: 0, avgPrice: 0 }
+      const next = applyLeveredFill({ qty: cur.qty, avgPrice: cur.avgPrice, leverage: 1 }, signed, price, 1)
+      if (next.realizedPnl !== 0) {
+        history.push({
+          ticker,
+          side: cur.qty > 0 ? 'long' : 'short', // the position that was closed/reduced
+          entryPriceInr: cur.avgPrice * rate,
+          exitPriceInr: price * rate,
+          qty: Math.min(Math.abs(signed), Math.abs(cur.qty)),
+          realizedPnlInr: next.realizedPnl * rate,
+          closedAt: Date.parse(t.created_at as string),
+        })
+      }
+      pos.set(ticker, { qty: next.qty, avgPrice: next.avgPrice })
+    }
+    return history.reverse() // most recent first
   }
 
   // -------------------------------------------------------------------------

@@ -9,6 +9,8 @@ const inrFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'IN
 const inr = (v: number) => inrFmt.format(v)
 const inrSigned = (v: number) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${inrFmt.format(Math.abs(v))}`
 const num = (v: number, d = 2) => v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })
+const dtLabel = (t: number) =>
+  new Date(t).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
 
 function fmtXirr(x: number | null): string {
   if (x === null || !Number.isFinite(x)) return '—'
@@ -95,9 +97,9 @@ function Portfolio() {
           </div>
         </section>
 
-        {/* MIDDLE — holdings */}
+        {/* SECTION 1 — Open Positions (live) */}
         <section className="mt-14">
-          <h2 className="mb-4 text-sm font-medium text-bright">Holdings</h2>
+          <h2 className="mb-4 text-sm font-medium text-bright">Open Positions</h2>
 
           {holdings.length === 0 ? (
             <p className="text-sm text-subtle">No open positions</p>
@@ -111,7 +113,7 @@ function Portfolio() {
                     <th className="px-3 py-3 text-right font-medium">Avg Entry</th>
                     <th className="px-3 py-3 text-right font-medium">Current</th>
                     <th className="px-3 py-3 text-right font-medium">Market Value</th>
-                    <th className="px-5 py-3 text-right font-medium">P&L</th>
+                    <th className="px-5 py-3 text-right font-medium">Unrealized P&L</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono tabular-nums">
@@ -119,7 +121,10 @@ function Portfolio() {
                     const long = r.qty! >= 0
                     return (
                       <tr key={r.ticker} className="border-b border-white/[0.04] last:border-0">
-                        <td className="px-5 py-3 text-left font-semibold text-bright">{r.ticker}</td>
+                        <td className="px-5 py-3 text-left">
+                          <span className="font-semibold text-bright">{r.ticker}</span>
+                          <span className={`ml-2 rounded px-1.5 py-0.5 text-[9px] font-medium uppercase ${long ? 'bg-up/10 text-up' : 'bg-destructive/10 text-destructive'}`}>{long ? 'Long' : 'Short'}</span>
+                        </td>
                         <td className={`px-3 py-3 text-right ${long ? 'text-up' : 'text-destructive'}`}>{r.qty}</td>
                         <td className="px-3 py-3 text-right text-muted">{inr(r.avgEntryInr!)}</td>
                         <td className="px-3 py-3 text-right text-foreground">{inr(r.currentPriceInr!)}</td>
@@ -128,6 +133,45 @@ function Portfolio() {
                       </tr>
                     )
                   })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        {/* SECTION 2 — Trade History (closed / reduced) */}
+        <section className="mt-12 border-t border-white/[0.06] pt-10">
+          <h2 className="mb-4 text-sm font-medium text-bright">Trade History</h2>
+
+          {data.tradeHistory.length === 0 ? (
+            <p className="text-sm text-subtle">No closed trades yet</p>
+          ) : (
+            <div className={`${CARD} overflow-hidden`} style={{ boxShadow: CARD_SHADOW }}>
+              <table className="w-full text-[13px]">
+                <thead>
+                  <tr className="border-b border-white/[0.08] text-[10px] uppercase tracking-wider text-subtle">
+                    <th className="px-5 py-3 text-left font-medium">Ticker</th>
+                    <th className="px-3 py-3 text-right font-medium">Entry</th>
+                    <th className="px-3 py-3 text-right font-medium">Exit</th>
+                    <th className="px-3 py-3 text-right font-medium">Qty</th>
+                    <th className="px-3 py-3 text-right font-medium">Realized P&L</th>
+                    <th className="px-5 py-3 text-right font-medium">Closed</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono tabular-nums">
+                  {data.tradeHistory.map((h, i) => (
+                    <tr key={`${h.ticker}-${h.closedAt}-${i}`} className="border-b border-white/[0.04] last:border-0">
+                      <td className="px-5 py-3 text-left">
+                        <span className="font-semibold text-bright">{h.ticker}</span>
+                        <span className={`ml-2 rounded px-1.5 py-0.5 text-[9px] font-medium uppercase ${h.side === 'long' ? 'bg-up/10 text-up' : 'bg-destructive/10 text-destructive'}`}>{h.side}</span>
+                      </td>
+                      <td className="px-3 py-3 text-right text-muted">{inr(h.entryPriceInr)}</td>
+                      <td className="px-3 py-3 text-right text-foreground">{inr(h.exitPriceInr)}</td>
+                      <td className="px-3 py-3 text-right text-muted">{h.qty}</td>
+                      <td className={`px-3 py-3 text-right ${toneClass(h.realizedPnlInr)}`}>{inrSigned(h.realizedPnlInr)}</td>
+                      <td className="px-5 py-3 text-right text-subtle">{dtLabel(h.closedAt)}</td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>

@@ -102,6 +102,26 @@ export interface Notification {
   t: number
 }
 
+export interface ScheduleRound {
+  id: string
+  index: number
+  mode: RoundMode
+  durationSeconds: number
+  commissionEnabled: boolean
+  status: 'pending' | 'active' | 'ended'
+  startedAt: number | null
+  endedAt: number | null
+}
+
+export interface TeamOverview {
+  username: string
+  teamName: string | null
+  equityInr: number
+  totalPnlInr: number
+  totalPnlPct: number
+  openPositions: number
+}
+
 export interface Bootstrap {
   accountId: string
   role: Role
@@ -127,6 +147,16 @@ export interface InventoryRow {
   costBasisInr: number | null
 }
 
+export interface TradeHistoryEntry {
+  ticker: string
+  side: 'long' | 'short'
+  entryPriceInr: number
+  exitPriceInr: number
+  qty: number
+  realizedPnlInr: number
+  closedAt: number
+}
+
 export interface Portfolio {
   rate: number
   openingBalanceInr: number
@@ -143,6 +173,7 @@ export interface Portfolio {
   leverageReq: number
   openPositions: number
   chargesInr: number
+  tradeHistory: TradeHistoryEntry[]
 }
 
 export interface Snapshot {
@@ -201,4 +232,14 @@ export const api = {
   placeOrder: (input: PlaceOrderInput) => post<PlaceOrderResult>('/orders', input),
   cancelOrder: (orderId: string) => post<{ cancelled: boolean }>('/orders/cancel', { orderId }),
   portfolio: () => get<Portfolio>('/portfolio'),
+
+  // Master Terminal
+  roundStart: () => post<{ round: RoundStatus }>('/round/start', {}),
+  roundEnd: () => post<{ round: RoundStatus }>('/round/end', {}),
+  setCommission: (enabled: boolean) => post<{ round: RoundStatus }>('/round/commission', { enabled }),
+  roundSchedule: () => get<{ schedule: ScheduleRound[] }>('/round/schedule'),
+  notificationsList: () => get<{ notifications: Notification[] }>('/notifications'),
+  pushNotification: (kind: Notification['kind'], title: string, body?: string) =>
+    post<{ ok: boolean }>('/notifications', { kind, title, body }),
+  adminTeams: () => get<{ teams: TeamOverview[] }>('/admin/teams'),
 }

@@ -536,12 +536,15 @@ function PriceChart({ snap, ticker, ltp, tf, onTf }: {
 // ---------------------------------------------------------------------------
 // Right 2 — market depth (+ market-maker resting-order list)
 // ---------------------------------------------------------------------------
-const DEPTH_LEVELS = 6 // per side — enough to read the book without a scrollbar
+const DEPTH_LEVELS = 30 // per side; the ladder scrolls within its panel to reveal depth
+
+/** Shared 3-column grid: bid-size | central price | ask-size. */
+const LADDER_COLS = 'grid grid-cols-[1fr_84px_1fr] items-center'
 
 function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
   const depth = snap?.depth
-  // Best levels nearest the centre: asks ascending (best/lowest first), bids
-  // descending (best/highest first). Zero-qty levels are already excluded upstream.
+  // Zero-qty levels are already excluded upstream. Asks ascending (best/lowest
+  // first); bids descending (best/highest first). Both sides nearest the spread.
   const asks = [...(depth?.asks ?? [])].sort((a, b) => a.price - b.price).slice(0, DEPTH_LEVELS)
   const bids = [...(depth?.bids ?? [])].sort((a, b) => b.price - a.price).slice(0, DEPTH_LEVELS)
   const maxQty = Math.max(1, ...asks.map((l) => l.qty), ...bids.map((l) => l.qty))
@@ -556,32 +559,34 @@ function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
       right={role === 'market_maker' ? <span className="text-[9px] uppercase tracking-wider text-[#E8C46A]">MM · full book</span> : undefined}
     >
       <div className="flex min-h-0 flex-1 flex-col p-2 text-[11px]">
-        <div className="flex items-center justify-between px-2 pb-1 text-[9px] uppercase tracking-wider text-subtle">
-          <span>Price</span>
-          <span>Qty</span>
+        <div className={`${LADDER_COLS} px-2 pb-1 text-[9px] uppercase tracking-wider text-subtle`}>
+          <span className="text-right">Bid Size</span>
+          <span className="text-center">Price</span>
+          <span className="text-left">Ask Size</span>
         </div>
 
         {empty ? (
           <div className="flex flex-1 items-center justify-center text-subtle">No resting orders.</div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col justify-center">
-            {/* ASKS — best (lowest) sits at the bottom, nearest the spread */}
+          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-1">
+            {/* ASKS above the spread — lowest (best) sits at the bottom, nearest the line */}
             <div className="flex flex-col gap-px">
               {[...asks].reverse().map((l) => (
-                <DepthRow key={`a${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} tone="ask" />
+                <LadderRow key={`a${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} side="ask" />
               ))}
             </div>
 
-            {/* Spread divider */}
-            <div className="my-1 flex items-center justify-between rounded border-y border-white/[0.06] bg-white/[0.02] px-2 py-1">
-              <span className="text-[9px] uppercase tracking-wider text-subtle">Spread</span>
-              <span className="font-mono text-[11px] tabular-nums text-muted">{spread === null ? '—' : usd(spread)}</span>
+            {/* Spread divider line */}
+            <div className="my-1.5 flex items-center gap-2 px-2">
+              <div className="h-px flex-1 bg-white/[0.12]" />
+              <span className="font-mono text-[10px] tabular-nums text-subtle">{spread === null ? '—' : usd(spread)}</span>
+              <div className="h-px flex-1 bg-white/[0.12]" />
             </div>
 
-            {/* BIDS — best (highest) sits at the top, nearest the spread */}
+            {/* BIDS below the spread — highest (best) sits at the top, nearest the line */}
             <div className="flex flex-col gap-px">
               {bids.map((l) => (
-                <DepthRow key={`b${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} tone="bid" />
+                <LadderRow key={`b${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} side="bid" />
               ))}
             </div>
           </div>
@@ -608,14 +613,34 @@ function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
   )
 }
 
-function DepthRow({ price, qty, maxQty, tone }: { price: number; qty: number; maxQty: number; tone: 'bid' | 'ask' }) {
-  const color = tone === 'bid' ? UP : DOWN
-  const bar = tone === 'bid' ? 'rgba(34,197,94,0.12)' : 'rgba(212,24,61,0.12)'
+/**
+ * One ladder level. Price is the central spine; quantity sits to the RIGHT of
+ * the price for asks and to the LEFT for bids, with a subtle depth bar growing
+ * outward from the centre (reddish for asks, greenish for bids).
+ */
+function LadderRow({ price, qty, maxQty, side }: { price: number; qty: number; maxQty: number; side: 'ask' | 'bid' }) {
+  const color = side === 'ask' ? DOWN : UP
+  const barBg = side === 'ask' ? 'rgba(212,24,61,0.12)' : 'rgba(34,197,94,0.12)'
+  const barWidth = `${(qty / maxQty) * 50}%`
   return (
-    <div className="relative flex items-center justify-between rounded px-2 py-[3px] font-mono tabular-nums">
-      <span className="absolute inset-y-0 right-0 rounded" style={{ width: `${(qty / maxQty) * 100}%`, background: bar }} />
-      <span className="relative font-semibold" style={{ color }}>{usd(price)}</span>
-      <span className="relative text-foreground">{qty}</span>
+    <div className={`${LADDER_COLS} relative rounded py-[3px] font-mono text-[11px] tabular-nums`}>
+      <span
+        className="absolute inset-y-0 rounded-sm"
+        style={side === 'ask' ? { left: '50%', width: barWidth, background: barBg } : { right: '50%', width: barWidth, background: barBg }}
+      />
+      {side === 'ask' ? (
+        <>
+          <span />
+          <span className="relative text-center font-semibold" style={{ color }}>{usd(price)}</span>
+          <span className="relative pl-3 text-left text-foreground">{qty}</span>
+        </>
+      ) : (
+        <>
+          <span className="relative pr-3 text-right text-foreground">{qty}</span>
+          <span className="relative text-center font-semibold" style={{ color }}>{usd(price)}</span>
+          <span />
+        </>
+      )}
     </div>
   )
 }
