@@ -11,6 +11,7 @@ import {
   type ScheduleRound,
   type TeamOverview,
 } from '../../lib/api'
+import { analytics } from '../../lib/analytics'
 
 const inrFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 })
 const inr = (v: number) => inrFmt.format(v)
@@ -95,6 +96,7 @@ function Admin() {
   }, [])
 
   useEffect(() => {
+    analytics.pageview('/admin')
     let alive = true
     let id: number | undefined
     ;(async () => {
@@ -137,12 +139,12 @@ function Admin() {
   const doStart = () => setPending({
     title: 'Start Next Round?', detail: 'Activates the next pending round. Teams will be able to trade immediately.',
     confirmLabel: 'Start Round', tone: 'up',
-    run: async () => { try { await api.roundStart(); await refresh(); toast(true, 'Round started') } catch { toast(false, 'Failed to start round') } },
+    run: async () => { try { const { round } = await api.roundStart(); analytics.capture('round_started', { roundId: round.id, index: round.index, mode: round.mode }); await refresh(); toast(true, 'Round started') } catch { toast(false, 'Failed to start round') } },
   })
   const doEnd = () => setPending({
     title: 'End Current Round?', detail: 'Ends the active round. Order entry will be disabled until the next round starts.',
     confirmLabel: 'End Round', tone: 'destructive',
-    run: async () => { try { await api.roundEnd(); await refresh(); toast(true, 'Round ended') } catch { toast(false, 'Failed to end round') } },
+    run: async () => { try { const { round } = await api.roundEnd(); analytics.capture('round_ended', { roundId: round.id, index: round.index }); await refresh(); toast(true, 'Round ended') } catch { toast(false, 'Failed to end round') } },
   })
   const doCommission = (enabled: boolean) => setPending({
     title: `Turn commission ${enabled ? 'ON' : 'OFF'}?`,
@@ -177,7 +179,7 @@ function Admin() {
         <div className="flex items-center gap-4 font-mono text-[11px]">
           <span className="text-muted">{boot.username}</span>
           <Link to="/terminal" className="text-subtle transition-colors hover:text-bright">Terminal</Link>
-          <button onClick={async () => { await supabase.auth.signOut(); navigate('/login', { replace: true }) }} className="text-subtle transition-colors hover:text-destructive">sign out</button>
+          <button onClick={async () => { await supabase.auth.signOut(); analytics.reset(); navigate('/login', { replace: true }) }} className="text-subtle transition-colors hover:text-destructive">sign out</button>
         </div>
       </header>
 

@@ -4,6 +4,7 @@ import { motion } from 'motion/react'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF } from '../../lib/design-patterns'
 import { supabase } from '../../lib/supabase'
 import { api, type Portfolio as PortfolioData } from '../../lib/api'
+import { analytics } from '../../lib/analytics'
 
 const inrFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 })
 const inr = (v: number) => inrFmt.format(v)
@@ -28,6 +29,7 @@ function Portfolio() {
   const bootRef = useRef(false)
 
   useEffect(() => {
+    analytics.pageview('/portfolio')
     let alive = true
     let id: number | undefined
     ;(async () => {
@@ -154,6 +156,7 @@ function Portfolio() {
                     <th className="px-3 py-3 text-right font-medium">Entry</th>
                     <th className="px-3 py-3 text-right font-medium">Exit</th>
                     <th className="px-3 py-3 text-right font-medium">Qty</th>
+                    <th className="px-3 py-3 text-right font-medium">Charges</th>
                     <th className="px-3 py-3 text-right font-medium">Realized P&L</th>
                     <th className="px-5 py-3 text-right font-medium">Closed</th>
                   </tr>
@@ -168,6 +171,7 @@ function Portfolio() {
                       <td className="px-3 py-3 text-right text-muted">{inr(h.entryPriceInr)}</td>
                       <td className="px-3 py-3 text-right text-foreground">{inr(h.exitPriceInr)}</td>
                       <td className="px-3 py-3 text-right text-muted">{h.qty}</td>
+                      <td className="px-3 py-3 text-right text-subtle">{h.commissionInr > 0 ? `−${inr(h.commissionInr)}` : '—'}</td>
                       <td className={`px-3 py-3 text-right ${toneClass(h.realizedPnlInr)}`}>{inrSigned(h.realizedPnlInr)}</td>
                       <td className="px-5 py-3 text-right text-subtle">{dtLabel(h.closedAt)}</td>
                     </tr>

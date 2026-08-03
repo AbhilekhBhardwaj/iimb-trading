@@ -99,6 +99,7 @@ export interface Notification {
   kind: 'announcement' | 'daily_news' | 'data'
   title: string
   body: string | null
+  roundId: string | null
   t: number
 }
 
@@ -153,7 +154,9 @@ export interface TradeHistoryEntry {
   entryPriceInr: number
   exitPriceInr: number
   qty: number
-  realizedPnlInr: number
+  grossPnlInr: number
+  commissionInr: number
+  realizedPnlInr: number // net = gross − commission
   closedAt: number
 }
 

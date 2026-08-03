@@ -15,6 +15,7 @@ import {
 import { applyLeveredFill, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW, MOTION } from '../../lib/design-patterns'
 import { supabase } from '../../lib/supabase'
+import { NotificationStrip } from '../components/NotificationStrip'
 import {
   api,
   type Bootstrap,
@@ -24,6 +25,7 @@ import {
   type Side,
   type Snapshot,
 } from '../../lib/api'
+import { analytics } from '../../lib/analytics'
 
 const UP = '#22c55e'
 const DOWN = '#d4183d'
@@ -130,6 +132,8 @@ function RoundBar({ snap, username, role, onSignOut }: {
         <span className="text-subtle">·</span>
         <Link to="/portfolio" className="text-muted transition-colors hover:text-[#E8C46A]">Portfolio</Link>
         <span className="text-subtle">·</span>
+        <Link to="/news" className="text-muted transition-colors hover:text-[#E8C46A]">News</Link>
+        <span className="text-subtle">·</span>
         <span className="text-muted">{username} <span className="text-subtle">({role.replace('_', ' ')})</span></span>
         <button onClick={onSignOut} className="text-subtle transition-colors hover:text-destructive">sign out</button>
       </div>
@@ -140,38 +144,6 @@ function RoundBar({ snap, username, role, onSignOut }: {
 // ---------------------------------------------------------------------------
 // Bottom — persistent notification strip
 // ---------------------------------------------------------------------------
-function NotificationStrip({ notifications }: { notifications: Notification[] }) {
-  const sections = [
-    { kind: 'announcement', label: 'Announcement', accent: 'text-[#E8C46A]' },
-    { kind: 'daily_news', label: 'Daily News', accent: 'text-zinc-200' },
-    { kind: 'data', label: 'Data', accent: 'text-up' },
-  ] as const
-  return (
-    <footer className="grid shrink-0 grid-cols-3 gap-px border-t border-white/[0.07] bg-white/[0.04]">
-      {sections.map((s) => {
-        const items = notifications.filter((n) => n.kind === s.kind) // already newest-first
-        return (
-          <div key={s.kind} className="min-w-0 bg-background px-4 py-2">
-            <div className={`text-[9px] font-semibold uppercase tracking-[0.16em] ${s.accent}`}>{s.label}</div>
-            <div className="mt-0.5 flex gap-3 overflow-x-auto whitespace-nowrap text-[11px] text-muted">
-              {items.length === 0 ? (
-                <span className="text-subtle">—</span>
-              ) : (
-                items.slice(0, 6).map((n) => (
-                  <span key={n.id} className="shrink-0">
-                    <span className="text-zinc-300">{n.title}</span>
-                    {n.body ? <span className="text-subtle"> · {n.body}</span> : null}
-                  </span>
-                ))
-              )}
-            </div>
-          </div>
-        )
-      })}
-    </footer>
-  )
-}
-
 // ---------------------------------------------------------------------------
 // Left 1 — instrument list
 // ---------------------------------------------------------------------------
@@ -769,6 +741,7 @@ function Terminal() {
 
   // Auth + bootstrap.
   useEffect(() => {
+    analytics.pageview('/terminal')
     let alive = true
     ;(async () => {
       const { data } = await supabase.auth.getSession()
@@ -817,10 +790,15 @@ function Terminal() {
 
   async function doPlace(o: PendingOrder) {
     setPending(null)
+    analytics.capture('order_placed', { ticker: selected, side: o.side, type: o.type, qty: o.qty, leverage: o.leverage })
     try {
       const res = await api.placeOrder({ ticker: selected, side: o.side, type: o.type, price: o.type === 'limit' ? o.price : undefined, qty: o.qty, leverage: o.leverage })
-      if (!res.accepted) { pushToast(false, 'Order rejected', res.reason); return }
+      if (!res.accepted) {
+        analytics.capture('order_rejected', { ticker: selected, side: o.side, type: o.type, qty: o.qty, reason: res.reason })
+        pushToast(false, 'Order rejected', res.reason); return
+      }
       const filled = (res.trades ?? []).reduce((a, t) => a + t.qty, 0)
+      if (filled > 0) analytics.capture('order_filled', { ticker: selected, side: o.side, type: o.type, qty: o.qty, filledQty: filled })
       if (filled === 0) pushToast(true, 'Order resting', `${o.qty} @ ${usd(o.price)} on the book`)
       else if (filled < o.qty) pushToast(true, 'Partial fill', `${filled}/${o.qty} filled`)
       else pushToast(true, 'Order filled', `${filled} @ avg ${usd(o.price)}`)
@@ -836,7 +814,7 @@ function Terminal() {
           <p className="mt-3 text-sm text-muted">{error}</p>
           <div className="mt-6 flex gap-2">
             <button onClick={() => window.location.reload()} className="flex-1 rounded-full py-2.5 text-sm font-medium text-bright" style={{ background: GOLD.solid, color: '#0a0a0a' }}>Retry</button>
-            <button onClick={async () => { await supabase.auth.signOut(); navigate('/login', { replace: true }) }} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Sign out</button>
+            <button onClick={async () => { await supabase.auth.signOut(); analytics.reset(); navigate('/login', { replace: true }) }} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Sign out</button>
           </div>
         </div>
       </div>
@@ -849,7 +827,7 @@ function Terminal() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-      <RoundBar snap={snap} username={boot.username} role={boot.role} onSignOut={async () => { await supabase.auth.signOut(); navigate('/login', { replace: true }) }} />
+      <RoundBar snap={snap} username={boot.username} role={boot.role} onSignOut={async () => { await supabase.auth.signOut(); analytics.reset(); navigate('/login', { replace: true }) }} />
 
       <div className="grid min-h-0 flex-1 grid-cols-2 gap-4 p-4">
         {/* LEFT column: instruments / order / screener */}

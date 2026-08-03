@@ -4,6 +4,7 @@ import { motion } from 'motion/react'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, MOTION } from '../../lib/design-patterns'
 import { supabase } from '../../lib/supabase'
 import { usernameToEmail, type AppRole } from '../../lib/accounts'
+import { analytics } from '../../lib/analytics'
 
 /** Where each role lands after a successful sign-in. */
 const ROLE_DESTINATION: Record<AppRole, string> = {
@@ -62,6 +63,9 @@ function Login() {
         setError(INVALID_MESSAGE)
         return
       }
+
+      analytics.identify(data.user.id, { role: profile.role })
+      analytics.capture('login', { role: profile.role })
 
       const destination = ROLE_DESTINATION[profile.role as AppRole] ?? '/terminal'
       navigate(destination, { replace: true })

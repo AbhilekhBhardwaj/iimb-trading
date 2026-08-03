@@ -44,7 +44,7 @@ import {
 } from '@iimb-trading/engine'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { randomUUID } from 'node:crypto'
-import { MAINTENANCE_MARGIN_RATE } from './config'
+import { COMMISSION_RATE, MAINTENANCE_MARGIN_RATE } from './config'
 import { usdInr } from './rate'
 
 type Severity = 'info' | 'warning' | 'error'
@@ -647,10 +647,10 @@ export class TradingService {
   /** Recent event-wide notifications for the strip + announcement popups. */
   async notifications(
     limit = 30,
-  ): Promise<{ id: string; kind: string; title: string; body: string | null; t: number }[]> {
+  ): Promise<{ id: string; kind: string; title: string; body: string | null; roundId: string | null; t: number }[]> {
     const { data, error } = await this.db
       .from('notifications')
-      .select('id, kind, title, body, created_at')
+      .select('id, kind, title, body, round_id, created_at')
       .order('created_at', { ascending: false })
       .limit(limit)
     if (error) throw error
@@ -659,6 +659,7 @@ export class TradingService {
       kind: r.kind as string,
       title: r.title as string,
       body: (r.body as string | null) ?? null,
+      roundId: (r.round_id as string | null) ?? null,
       t: Date.parse(r.created_at as string),
     }))
   }
@@ -687,7 +688,10 @@ export class TradingService {
 
   /** Publish an event-wide notification (Master Terminal / testing). */
   async publishNotification(kind: string, title: string, body?: string): Promise<void> {
-    const { error } = await this.db.from('notifications').insert({ kind, title, body: body ?? null })
+    // Tagged with the active round so the News page can archive Daily News per round.
+    const { error } = await this.db
+      .from('notifications')
+      .insert({ kind, title, body: body ?? null, round_id: this.activeRoundId })
     if (error) throw error
   }
 
@@ -877,7 +881,7 @@ export class TradingService {
    */
   async tradeHistory(
     accountId: string,
-  ): Promise<{ ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; realizedPnlInr: number; closedAt: number }[]> {
+  ): Promise<{ ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; grossPnlInr: number; commissionInr: number; realizedPnlInr: number; closedAt: number }[]> {
     const rate = usdInr()
     const { data: myOrders, error: oErr } = await this.db.from('orders').select('id').eq('account_id', accountId)
     if (oErr) throw oErr
@@ -886,15 +890,19 @@ export class TradingService {
     const idSet = new Set(ids)
     const inList = `(${ids.join(',')})`
 
+    // Which rounds had commission on — to reconstruct charges per closing fill.
+    const { data: roundRows } = await this.db.from('rounds').select('id, commission_enabled')
+    const commissionByRound = new Map((roundRows ?? []).map((r) => [r.id as string, r.commission_enabled as boolean]))
+
     const { data: trades, error: tErr } = await this.db
       .from('trades')
-      .select('price, qty, created_at, instrument_id, buy_order_id, sell_order_id')
+      .select('price, qty, created_at, instrument_id, round_id, buy_order_id, sell_order_id')
       .or(`buy_order_id.in.${inList},sell_order_id.in.${inList}`)
       .order('created_at', { ascending: true })
     if (tErr) throw tErr
 
     const pos = new Map<string, { qty: number; avgPrice: number }>()
-    const history: { ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; realizedPnlInr: number; closedAt: number }[] = []
+    const history: { ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; grossPnlInr: number; commissionInr: number; realizedPnlInr: number; closedAt: number }[] = []
     for (const t of trades ?? []) {
       const isBuyer = idSet.has(t.buy_order_id as string)
       const isSeller = idSet.has(t.sell_order_id as string)
@@ -905,13 +913,19 @@ export class TradingService {
       const cur = pos.get(ticker) ?? { qty: 0, avgPrice: 0 }
       const next = applyLeveredFill({ qty: cur.qty, avgPrice: cur.avgPrice, leverage: 1 }, signed, price, 1)
       if (next.realizedPnl !== 0) {
+        const closedQty = Math.min(Math.abs(signed), Math.abs(cur.qty))
+        // Commission on the closing portion of this fill, if that round charged it.
+        const commissionUsd = commissionByRound.get(t.round_id as string) ? COMMISSION_RATE * closedQty * price : 0
+        const gross = next.realizedPnl
         history.push({
           ticker,
           side: cur.qty > 0 ? 'long' : 'short', // the position that was closed/reduced
           entryPriceInr: cur.avgPrice * rate,
           exitPriceInr: price * rate,
-          qty: Math.min(Math.abs(signed), Math.abs(cur.qty)),
-          realizedPnlInr: next.realizedPnl * rate,
+          qty: closedQty,
+          grossPnlInr: gross * rate,
+          commissionInr: commissionUsd * rate,
+          realizedPnlInr: (gross - commissionUsd) * rate, // net: Sell − Charges
           closedAt: Date.parse(t.created_at as string),
         })
       }
@@ -949,21 +963,29 @@ export class TradingService {
     })
     if (tErr) throw tErr
 
+    // Commission: charged to BOTH sides as a % of notional (qty × price), but
+    // only while the active round has commission enabled. It's a cost, so it is
+    // deducted from each account's realized P&L at the time of the fill.
+    const commissionUsd = this.rounds.isCommissionActive() ? COMMISSION_RATE * trade.qty * trade.price : 0
+
     // Buyer gains qty, seller loses qty — each valued at the execution price and
     // using ITS OWN order's leverage (matters only when the fill opens/flips).
-    await this.applyPosition(buyer.userId, instrumentId, trade.qty, trade.price, this.orderLeverage.get(buyer.id) ?? 1)
-    await this.applyPosition(seller.userId, instrumentId, -trade.qty, trade.price, this.orderLeverage.get(seller.id) ?? 1)
+    await this.applyPosition(buyer.userId, instrumentId, trade.qty, trade.price, this.orderLeverage.get(buyer.id) ?? 1, commissionUsd)
+    await this.applyPosition(seller.userId, instrumentId, -trade.qty, trade.price, this.orderLeverage.get(seller.id) ?? 1, commissionUsd)
 
+    const ticker = this.idToTicker.get(instrumentId) ?? instrumentId
     // One order_matched event per side so each account sees its own fill.
-    const base = {
-      instrument: this.idToTicker.get(instrumentId) ?? instrumentId,
-      price: trade.price,
-      qty: trade.qty,
-      buyOrderId: trade.buyOrderId,
-      sellOrderId: trade.sellOrderId,
-    }
+    const base = { instrument: ticker, price: trade.price, qty: trade.qty, buyOrderId: trade.buyOrderId, sellOrderId: trade.sellOrderId }
     await this.log(buyer.userId, 'order_matched', 'info', { ...base, side: 'buy' })
     await this.log(seller.userId, 'order_matched', 'info', { ...base, side: 'sell' })
+
+    // Audit each side's commission.
+    if (commissionUsd > 0) {
+      const rate = usdInr()
+      const audit = { instrument: ticker, qty: trade.qty, price: trade.price, notional: trade.qty * trade.price, commissionRate: COMMISSION_RATE, commissionUsd, commissionInr: commissionUsd * rate }
+      await this.log(buyer.userId, 'commission_charged', 'info', { ...audit, side: 'buy' })
+      await this.log(seller.userId, 'commission_charged', 'info', { ...audit, side: 'sell' })
+    }
   }
 
   private async applyPosition(
@@ -972,6 +994,7 @@ export class TradingService {
     delta: number,
     price: number,
     fillLeverage: number,
+    commissionUsd = 0,
   ): Promise<void> {
     const current = await this.leveredPosition(accountId, instrumentId)
     const next = applyLeveredFill(current, delta, price, fillLeverage)
@@ -989,11 +1012,13 @@ export class TradingService {
     )
     if (upErr) throw upErr
 
-    // Accumulate realized P&L and persist it in USD (the P&L is locked in USD;
-    // its INR value floats with the live rate at display time). Absolute running
-    // total — this process is the single authoritative writer.
-    if (next.realizedPnl !== 0) {
-      const totalUsd = (this.realizedPnlUsd.get(accountId) ?? 0) + next.realizedPnl
+    // Realized P&L (USD, locked) net of commission: position P&L on this fill
+    // minus the commission charged for it. Commission alone moves realized even
+    // on an opening fill (position P&L 0). Absolute running total — this process
+    // is the single authoritative writer.
+    const netRealizedUsd = next.realizedPnl - commissionUsd
+    if (netRealizedUsd !== 0) {
+      const totalUsd = (this.realizedPnlUsd.get(accountId) ?? 0) + netRealizedUsd
       this.realizedPnlUsd.set(accountId, totalUsd)
       const { error: pnlErr } = await this.db
         .from('profiles')
