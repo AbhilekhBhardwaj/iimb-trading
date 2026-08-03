@@ -6,6 +6,10 @@ import News from './pages/News'
 import Portfolio from './pages/Portfolio'
 import Terminal from './pages/Terminal'
 
+// Eager imports on purpose: during the live event these pages must be fully
+// downloaded and ready the instant a team navigates, with ZERO chance of a
+// stuck "Loading…" from a lazy-chunk fetch failing on a network hiccup.
+// Load-time is deliberately traded for reliability.
 export const router = createBrowserRouter([
   {
     path: '/',

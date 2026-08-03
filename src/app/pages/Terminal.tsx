@@ -1,21 +1,13 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
-import {
-  CandlestickSeries,
-  ColorType,
-  createChart,
-  HistogramSeries,
-  type CandlestickData,
-  type HistogramData,
-  type IChartApi,
-  type ISeriesApi,
-  type UTCTimestamp,
-} from 'lightweight-charts'
 import { applyLeveredFill, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
-import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW, MOTION } from '../../lib/design-patterns'
+import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
+import { Panel } from '../components/Panel'
+import PriceChart from './PriceChart'
+import { CANDLE_SPAN, DOWN, intervalOf, type TF, UP, usd } from './terminalShared'
 import {
   api,
   type Bootstrap,
@@ -27,25 +19,18 @@ import {
 } from '../../lib/api'
 import { analytics } from '../../lib/analytics'
 
-const UP = '#22c55e'
-const DOWN = '#d4183d'
-const TIMEFRAMES = [
-  { k: '1min', s: 60 },
-  { k: '2min', s: 120 },
-  { k: '5min', s: 300 },
-  { k: '10min', s: 600 },
-] as const
-type TF = (typeof TIMEFRAMES)[number]['k']
-/** Candles to span in the fetch window (interval × this). Keeps a real series in view. */
-const CANDLE_SPAN = 90
-const intervalOf = (tf: TF) => TIMEFRAMES.find((t) => t.k === tf)!.s
+// PriceChart is imported EAGERLY (not React.lazy) — once a team is in /terminal
+// the chart must already be downloaded, never risking a failed lazy-chunk fetch
+// mid-event. It stays in its own module purely for readability.
+
+// UP/DOWN, usd, TF, TIMEFRAMES, intervalOf, CANDLE_SPAN now live in ./terminalShared
+// (shared with the lazy PriceChart chunk).
 
 // ---------------------------------------------------------------------------
 // Formatters
 // ---------------------------------------------------------------------------
 const inrFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 })
 const inr = (v: number) => inrFmt.format(v)
-const usd = (v: number) => `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 const clockHMS = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { hour12: false })
 function mmss(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds))
@@ -53,43 +38,9 @@ function mmss(totalSeconds: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Shared shell bits
+// Shared shell bits — Panel moved to ../components/Panel (shared with the lazy
+// PriceChart chunk so the chart never pulls Terminal into its bundle).
 // ---------------------------------------------------------------------------
-function Panel({ title, right, children, className = '', delay = 0, fit = false }: {
-  title?: string
-  right?: ReactNode
-  children: ReactNode
-  className?: string
-  delay?: number
-  /**
-   * When true the panel is sized to its CONTENT and carries NO overflow property
-   * — it can never clip or scroll. (The default CARD sets `h-full overflow-hidden`
-   * to fill a fixed grid cell; a `fit` panel must live in an `auto` grid row.)
-   */
-  fit?: boolean
-}) {
-  const shell = fit
-    ? 'group relative flex flex-col rounded-2xl border border-white/[0.08] bg-white/[0.03] transition-all duration-300 hover:border-amber-500/25 hover:bg-white/[0.05]'
-    : `${CARD} min-h-0`
-  return (
-    <motion.section
-      initial={MOTION.card.initial}
-      animate={MOTION.card.animate}
-      transition={{ duration: 0.45, delay, ease: EASE }}
-      className={`${shell} ${className}`}
-      style={{ boxShadow: CARD_SHADOW }}
-    >
-      {title && (
-        <header className="flex shrink-0 items-center justify-between border-b border-white/[0.06] px-4 py-2">
-          <h2 className="text-[11px] uppercase tracking-[0.18em] text-subtle">{title}</h2>
-          {right}
-        </header>
-      )}
-      {children}
-    </motion.section>
-  )
-}
-
 function PulseDot({ color }: { color: string }) {
   return (
     <span className="relative flex h-1.5 w-1.5">
@@ -102,10 +53,11 @@ function PulseDot({ color }: { color: string }) {
 // ---------------------------------------------------------------------------
 // Top — round status bar
 // ---------------------------------------------------------------------------
-function RoundBar({ snap, username, role, onSignOut }: {
+function RoundBar({ snap, username, role, live, onSignOut }: {
   snap: Snapshot | null
   username: string
   role: string
+  live: boolean
   onSignOut: () => void
 }) {
   const r = snap?.round
@@ -117,6 +69,13 @@ function RoundBar({ snap, username, role, onSignOut }: {
         <span className="text-[11px] text-subtle">IIM Bangalore Trading Competition</span>
       </div>
       <div className="flex items-center gap-5 font-mono text-[11px]">
+        {/* Connection heartbeat: amber "Reconnecting…" while snapshot polls are
+            failing. Last-known data stays on screen the whole time. */}
+        {!live && (
+          <span className="flex items-center gap-1.5 text-[#E8C46A]" title="Network hiccup — retrying automatically">
+            <PulseDot color="#E8C46A" />Reconnecting…
+          </span>
+        )}
         {active ? (
           <>
             <span className="flex items-center gap-1.5 text-up"><PulseDot color={UP} />ROUND {(r!.index ?? 0) + 1}</span>
@@ -337,173 +296,9 @@ function Screener({ row }: { row: InstrumentRow | undefined }) {
 // ---------------------------------------------------------------------------
 // Right 1 — price chart
 // ---------------------------------------------------------------------------
-const VOL_UP = 'rgba(34,197,94,0.5)'
-const VOL_DOWN = 'rgba(212,24,61,0.5)'
-
-/** Aggregate raw trade points into OHLC candles + volume bars per interval. */
-function buildCandles(
-  points: { t: number; price: number; qty: number }[],
-  intervalSec: number,
-): { candles: CandlestickData[]; volumes: HistogramData[] } {
-  const byBucket = new Map<number, { o: number; h: number; l: number; c: number; v: number }>()
-  for (const p of points) {
-    const bucket = Math.floor(p.t / 1000 / intervalSec) * intervalSec // epoch seconds
-    const b = byBucket.get(bucket)
-    if (!b) byBucket.set(bucket, { o: p.price, h: p.price, l: p.price, c: p.price, v: p.qty })
-    else {
-      b.h = Math.max(b.h, p.price)
-      b.l = Math.min(b.l, p.price)
-      b.c = p.price // points arrive ascending, so the last write is the close
-      b.v += p.qty
-    }
-  }
-  const times = [...byBucket.keys()].sort((a, b) => a - b)
-  const candles = times.map((t) => {
-    const b = byBucket.get(t)!
-    return { time: t as UTCTimestamp, open: b.o, high: b.h, low: b.l, close: b.c }
-  })
-  const volumes = times.map((t) => {
-    const b = byBucket.get(t)!
-    return { time: t as UTCTimestamp, value: b.v, color: b.c >= b.o ? VOL_UP : VOL_DOWN }
-  })
-  return { candles, volumes }
-}
-
-function PriceChart({ snap, ticker, ltp, tf, onTf }: {
-  snap: Snapshot | null
-  ticker: string
-  ltp: number
-  tf: TF
-  onTf: (t: TF) => void
-}) {
-  const containerRef = useRef<HTMLDivElement>(null)
-  const chartRef = useRef<IChartApi | null>(null)
-  const candleRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
-  const volRef = useRef<ISeriesApi<'Histogram'> | null>(null)
-  const shapeRef = useRef('') // `${ticker}|${interval}` — a change forces a full setData
-  const lenRef = useRef(0)
-
-  // Create the chart once; autoSize keeps it filling the panel via ResizeObserver.
-  useEffect(() => {
-    const el = containerRef.current
-    if (!el) return
-    const chart = createChart(el, {
-      autoSize: true,
-      layout: {
-        background: { type: ColorType.Solid, color: 'rgba(0,0,0,0)' },
-        textColor: '#71717a',
-        fontFamily: 'ui-monospace, monospace',
-        fontSize: 10,
-        attributionLogo: false,
-      },
-      grid: {
-        vertLines: { color: 'rgba(255,255,255,0.05)' },
-        horzLines: { color: 'rgba(255,255,255,0.05)' },
-      },
-      rightPriceScale: { borderColor: 'rgba(255,255,255,0.08)' },
-      // Fixed bar width: each candle is a constant ~8px regardless of how many
-      // exist, so a single candle is a THIN candle, never a full-width block.
-      // No fitContent() anywhere — that's what stretched one bar across the chart.
-      timeScale: {
-        borderColor: 'rgba(255,255,255,0.08)',
-        timeVisible: true,
-        secondsVisible: false,
-        barSpacing: 12,
-        minBarSpacing: 2,
-        maxBarSpacing: 24, // a lone candle can never stretch into a giant block
-        rightOffset: 2,
-      },
-      crosshair: {
-        vertLine: { color: 'rgba(232,196,106,0.5)', labelBackgroundColor: '#B87D30' },
-        horzLine: { color: 'rgba(232,196,106,0.5)', labelBackgroundColor: '#B87D30' },
-      },
-    })
-    const candle = chart.addSeries(CandlestickSeries, {
-      upColor: UP, downColor: DOWN,
-      borderUpColor: UP, borderDownColor: DOWN,
-      wickUpColor: UP, wickDownColor: DOWN,
-    })
-    candle.priceScale().applyOptions({ scaleMargins: { top: 0.1, bottom: 0.4 } })
-    const vol = chart.addSeries(HistogramSeries, {
-      priceFormat: { type: 'volume' },
-      priceScaleId: '',
-      lastValueVisible: false, // no volume value ("30") floating on the price axis
-      priceLineVisible: false,
-    })
-    vol.priceScale().applyOptions({ scaleMargins: { top: 0.75, bottom: 0 } })
-
-    chartRef.current = chart
-    candleRef.current = candle
-    volRef.current = vol
-    return () => { chart.remove(); chartRef.current = candleRef.current = volRef.current = null }
-  }, [])
-
-  const intervalSec = intervalOf(tf)
-  useEffect(() => {
-    const chart = chartRef.current
-    const c = candleRef.current
-    const v = volRef.current
-    if (!chart || !c || !v) return
-    const { candles, volumes } = buildCandles(snap?.prices ?? [], intervalSec)
-    const shape = `${ticker}|${intervalSec}`
-
-    // Full reset on a ticker/timeframe change or a non-incremental change (first
-    // load, or the trailing window added/dropped more than one bucket). Otherwise
-    // update just the latest bar so intra-bucket ~1s polls don't refit the view.
-    const prevLen = lenRef.current
-    const grewByOne = candles.length === prevLen + 1
-    const sameLen = candles.length === prevLen
-    const structural = shape !== shapeRef.current || !(sameLen || grewByOne)
-    if (structural) {
-      c.setData(candles)
-      v.setData(volumes)
-    } else if (candles.length > 0) {
-      c.update(candles[candles.length - 1])
-      v.update(volumes[volumes.length - 1])
-    }
-    shapeRef.current = shape
-    lenRef.current = candles.length
-
-    // Auto-fit the visible time range to the data — only on a structural change
-    // or a brand-new candle (not every intra-bucket tick). With little history,
-    // center the candles at a capped width so they fill a reasonable portion with
-    // margin on BOTH sides (never pinned to the right of an empty canvas); once
-    // there are enough candles to fill the width, fit them edge-to-edge.
-    if (candles.length > 0 && (structural || grewByOne)) {
-      const width = containerRef.current?.clientWidth || 600
-      const barsAtMaxWidth = width / 24 // 24px = maxBarSpacing
-      const ts = chart.timeScale()
-      if (candles.length >= barsAtMaxWidth - 2) {
-        ts.fitContent()
-      } else {
-        const pad = (barsAtMaxWidth - candles.length) / 2
-        ts.setVisibleLogicalRange({ from: -pad, to: candles.length - 1 + pad })
-      }
-    }
-  }, [snap?.prices, ticker, intervalSec])
-
-  return (
-    <Panel
-      title={`Chart · ${ticker}`}
-      delay={0}
-      right={
-        <div className="flex items-center gap-2">
-          <span className="font-mono text-[13px] tabular-nums text-bright">{usd(ltp)}</span>
-          <div className="flex gap-1">
-            {TIMEFRAMES.map((t) => (
-              <button key={t.k} onClick={() => onTf(t.k)}
-                className={`rounded-md px-2 py-0.5 font-mono text-[10px] transition-colors ${tf === t.k ? 'bg-white/[0.08] text-bright' : 'text-subtle hover:text-muted'}`}>
-                {t.k}
-              </button>
-            ))}
-          </div>
-        </div>
-      }
-    >
-      <div ref={containerRef} className="min-h-0 w-full flex-1" />
-    </Panel>
-  )
-}
+// PriceChart (and lightweight-charts + buildCandles) moved to ./PriceChart and
+// is loaded lazily via React.lazy above, so the charting library ships in its
+// own chunk and only downloads when /terminal renders.
 
 // ---------------------------------------------------------------------------
 // Right 2 — market depth (+ market-maker resting-order list)
@@ -728,6 +523,7 @@ function Terminal() {
   const [toasts, setToasts] = useState<Toast[]>([])
   const [announcement, setAnnouncement] = useState<Notification | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [live, setLive] = useState(true) // false → snapshot polling is failing; show "Reconnecting…"
   const seenAnn = useRef<Set<string> | null>(null)
   const toastSeq = useRef(0)
 
@@ -766,9 +562,16 @@ function Terminal() {
     let alive = true
     const tick = async () => {
       try {
+        // api.snapshot already retries transient blips internally; if it still
+        // throws, the connection is genuinely down for now.
         const s = await api.snapshot(selected, windowSec)
-        if (alive) setSnap(s)
-      } catch { /* transient — next tick retries */ }
+        if (alive) { setSnap(s); setLive(true) } // recovered / healthy
+      } catch {
+        // Keep the last-known snapshot on screen and flag "Reconnecting…"; the
+        // next tick (1s) retries. We never blank the terminal or bounce to an
+        // error screen mid-event over a transient hiccup.
+        if (alive) setLive(false)
+      }
     }
     tick()
     const id = window.setInterval(tick, 1000)
@@ -802,7 +605,13 @@ function Terminal() {
       if (filled === 0) pushToast(true, 'Order resting', `${o.qty} @ ${usd(o.price)} on the book`)
       else if (filled < o.qty) pushToast(true, 'Partial fill', `${filled}/${o.qty} filled`)
       else pushToast(true, 'Order filled', `${filled} @ avg ${usd(o.price)}`)
-    } catch { pushToast(false, 'Order failed', 'Network / server error') }
+    } catch {
+      // A POST is not auto-retried (it may have landed). Flag the connection and
+      // tell the user to check the book before resubmitting, so we never risk a
+      // duplicate order. The snapshot poll will clear "Reconnecting…" once back.
+      setLive(false)
+      pushToast(false, 'Network hiccup', 'Order not confirmed — check the book before retrying.')
+    }
   }
 
 
@@ -827,7 +636,7 @@ function Terminal() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-      <RoundBar snap={snap} username={boot.username} role={boot.role} onSignOut={async () => { await supabase.auth.signOut(); analytics.reset(); navigate('/login', { replace: true }) }} />
+      <RoundBar snap={snap} username={boot.username} role={boot.role} live={live} onSignOut={async () => { await supabase.auth.signOut(); analytics.reset(); navigate('/login', { replace: true }) }} />
 
       <div className="grid min-h-0 flex-1 grid-cols-2 gap-4 p-4">
         {/* LEFT column: instruments / order / screener */}

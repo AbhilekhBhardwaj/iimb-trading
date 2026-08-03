@@ -216,12 +216,40 @@ async function authHeaders(): Promise<Record<string, string>> {
   return token ? { authorization: `Bearer ${token}`, 'content-type': 'application/json' } : { 'content-type': 'application/json' }
 }
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`/api${path}`, { headers: await authHeaders() })
-  if (!res.ok) throw new Error(`GET ${path} → ${res.status}`)
-  return res.json() as Promise<T>
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * GET with a few quick retries on TRANSIENT failures — a dropped connection
+ * (fetch rejects) or a 5xx — so a brief mid-event network hiccup is absorbed
+ * before the caller (polling loop, portfolio, etc.) ever sees it. A 4xx is a
+ * real client/auth error and is surfaced immediately, not retried. Reads are
+ * idempotent, so retrying is always safe here.
+ */
+async function get<T>(path: string, tries = 3): Promise<T> {
+  let lastErr: unknown
+  for (let attempt = 0; attempt < tries; attempt++) {
+    let res: Response | null = null
+    try {
+      res = await fetch(`/api${path}`, { headers: await authHeaders() })
+    } catch (err) {
+      lastErr = err // network/connection error → transient, retry
+    }
+    if (res) {
+      if (res.ok) return (await res.json()) as T
+      if (res.status < 500) throw new Error(`GET ${path} → ${res.status}`) // 4xx: don't retry
+      lastErr = new Error(`GET ${path} → ${res.status}`) // 5xx: transient, retry
+    }
+    if (attempt < tries - 1) await sleep(200 * (attempt + 1)) // 200ms, then 400ms
+  }
+  throw lastErr
 }
 
+/**
+ * POST is deliberately single-shot and NEVER auto-retried: a failed write may
+ * have actually landed server-side (response lost in transit), so a blind retry
+ * risks a duplicate order. The caller surfaces the failure and lets the user
+ * decide, after seeing the refreshed book on the next snapshot poll.
+ */
 async function post<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(`/api${path}`, { method: 'POST', headers: await authHeaders(), body: JSON.stringify(body) })
   if (!res.ok) throw new Error(`POST ${path} → ${res.status}`)

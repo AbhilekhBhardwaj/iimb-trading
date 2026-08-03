@@ -1138,6 +1138,28 @@ export class TradingService {
     return { accepted: false, reason }
   }
 
+  /**
+   * Catch-all diagnostics sink for UNEXPECTED server exceptions (as opposed to
+   * expected, structured rejections like `order_rejected`). The API layer calls
+   * this from its top-level handler so any error bubbling out of the trading
+   * service is recorded in the same event_log feed the master already watches,
+   * BEFORE the request fails as an HTTP 500.
+   *
+   * Unlike `log()`, this NEVER throws: a logging failure must not mask the
+   * original error or crash the request handler, so a DB write failure here is
+   * swallowed to stderr. account_id is best-effort — null for pre-auth errors.
+   */
+  async logError(message: string, context: Record<string, unknown> = {}): Promise<void> {
+    const accountId = typeof context.accountId === 'string' ? context.accountId : null
+    const { error } = await this.db.from('event_log').insert({
+      account_id: accountId,
+      event_type: 'error',
+      payload: { message, ...context },
+      severity: 'error',
+    })
+    if (error) console.error('event_log error-logging failed:', error.message)
+  }
+
   private async log(
     accountId: string | null,
     eventType: string,

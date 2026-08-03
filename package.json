@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "start": "tsx server/api.ts",
     "lint": "oxlint",
     "preview": "vite preview",
     "test": "vitest run && npm test --workspace @iimb-trading/engine",

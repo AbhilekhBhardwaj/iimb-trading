@@ -26,6 +26,7 @@ function Portfolio() {
   const navigate = useNavigate()
   const [data, setData] = useState<PortfolioData | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [live, setLive] = useState(true) // false → polling is failing; show "Reconnecting…"
   const bootRef = useRef(false)
 
   useEffect(() => {
@@ -38,9 +39,14 @@ function Portfolio() {
       const tick = async () => {
         try {
           const p = await api.portfolio()
-          if (alive) { setData(p); setError(null); bootRef.current = true }
+          if (alive) { setData(p); setError(null); setLive(true); bootRef.current = true }
         } catch {
-          if (alive && !bootRef.current) setError('Could not reach the trading server (npm run api).')
+          // Before first successful load → show the error screen. After that, keep
+          // the last data on screen and just flag "Reconnecting…"; next tick retries.
+          if (alive) {
+            if (!bootRef.current) setError('Could not reach the trading server (npm run api).')
+            else setLive(false)
+          }
         }
       }
       await tick()
@@ -75,7 +81,14 @@ function Portfolio() {
           <Link to="/terminal" className="text-lg text-bright transition-colors hover:text-[#E8C46A]" style={EDITORIAL_SERIF}>MochaTrade</Link>
           <span className="text-[11px] uppercase tracking-[0.18em] text-subtle">Portfolio</span>
         </div>
-        <Link to="/terminal" className="font-mono text-[11px] text-muted transition-colors hover:text-bright">← Terminal</Link>
+        <div className="flex items-center gap-4">
+          {!live && (
+            <span className="flex items-center gap-1.5 font-mono text-[11px] text-[#E8C46A]" title="Network hiccup — retrying automatically">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[#E8C46A]" />Reconnecting…
+            </span>
+          )}
+          <Link to="/terminal" className="font-mono text-[11px] text-muted transition-colors hover:text-bright">← Terminal</Link>
+        </div>
       </header>
 
       <motion.main

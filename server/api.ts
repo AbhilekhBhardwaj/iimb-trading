@@ -16,11 +16,15 @@
 import { createEventConfig, RoundController } from '@iimb-trading/engine'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createReadStream, existsSync, statSync } from 'node:fs'
+import { extname, join, normalize, resolve } from 'node:path'
 import { startRateDrift, usdInr } from './rate'
 import { createAdminClient } from './supabaseAdmin'
 import { TradingService } from './tradingService'
 
-const PORT = Number(process.env.API_PORT ?? 8787)
+// API_PORT wins in local dev (Vite proxies /api → 8787); on Railway/PaaS the
+// platform injects PORT and there is no API_PORT, so we bind that instead.
+const PORT = Number(process.env.API_PORT ?? process.env.PORT ?? 8787)
 
 // createAdminClient() loads .env; do it first so the anon vars are available.
 const admin = createAdminClient()
@@ -106,6 +110,51 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 const nowSec = () => Math.floor(Date.now() / 1000)
 
 // ---------------------------------------------------------------------------
+// Static SPA serving (production single-service deploy).
+//
+// In local dev the Vite dev server serves the app and proxies /api here, so
+// none of this runs. In production (e.g. Railway) this same process serves the
+// built `dist/` for every non-/api route AND handles /api on ONE port — keeping
+// the frontend same-origin with the API (no CORS, no second service) and, more
+// importantly, guaranteeing the authoritative in-memory TradingService is a
+// single instance. Do NOT scale this service to >1 replica.
+// ---------------------------------------------------------------------------
+const DIST_DIR = resolve(process.cwd(), 'dist')
+const MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+  '.otf': 'font/otf',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8',
+}
+
+function sendFile(res: ServerResponse, filePath: string, status = 200): void {
+  res.writeHead(status, { 'content-type': MIME[extname(filePath).toLowerCase()] ?? 'application/octet-stream' })
+  createReadStream(filePath).pipe(res)
+}
+
+function serveStatic(res: ServerResponse, path: string): void {
+  if (!existsSync(DIST_DIR)) return json(res, 503, { error: 'frontend not built (run npm run build)' })
+  // Resolve inside dist and reject path traversal.
+  const rel = normalize(decodeURIComponent(path)).replace(/^([/\\]|\.\.[/\\])+/, '')
+  const candidate = join(DIST_DIR, rel)
+  if (!candidate.startsWith(DIST_DIR)) return json(res, 403, { error: 'forbidden' })
+  if (path !== '/' && existsSync(candidate) && statSync(candidate).isFile()) return sendFile(res, candidate)
+  // SPA fallback: client-side routes (/terminal, /portfolio, …) resolve to index.html.
+  const index = join(DIST_DIR, 'index.html')
+  if (existsSync(index)) return sendFile(res, index)
+  return json(res, 404, { error: 'not found' })
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -114,11 +163,21 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   const method = req.method ?? 'GET'
 
   if (method === 'OPTIONS') return json(res, 204, {})
+
+  // Everything outside /api is the built SPA (production single-service deploy).
+  if (!path.startsWith('/api')) return serveStatic(res, path)
+
   if (path === '/api/health') return json(res, 200, { ok: true })
 
-  const caller = await authenticate(req)
-  if (!caller) return json(res, 401, { error: 'unauthorized' })
-  const requireMaster = () => caller.role === 'master'
+  // Catch-all: any uncaught error from auth or the trading service is recorded
+  // to event_log (event_type 'error') BEFORE it becomes a 500, with whatever
+  // request/account context is available.
+  let callerCtx: Caller | null = null
+  try {
+    const caller = await authenticate(req)
+    if (!caller) return json(res, 401, { error: 'unauthorized' })
+    callerCtx = caller
+    const requireMaster = () => caller.role === 'master'
 
   // -- reads ---------------------------------------------------------------
   if (method === 'GET' && path === '/api/bootstrap') {
@@ -207,7 +266,19 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return json(res, 200, { ok: true })
   }
 
-  return json(res, 404, { error: 'not found' })
+    return json(res, 404, { error: 'not found' })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    const stack = err instanceof Error ? (err.stack ?? null) : null
+    await service.logError(message, {
+      path,
+      method,
+      accountId: callerCtx?.accountId ?? null,
+      role: callerCtx?.role ?? null,
+      stack,
+    })
+    throw err // rethrow so the outer createServer.catch returns the 500
+  }
 }
 
 // ---------------------------------------------------------------------------
