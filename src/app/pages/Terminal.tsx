@@ -157,7 +157,12 @@ interface PendingOrder { side: Side; type: OrderType; qty: number; price: number
 // A position-reducing order frees margin (requiredMargin < 0); never show that as
 // a negative "required" figure. A closing order leaves no position, hence no liq.
 const marginLabel = (requiredInr: number) => (requiredInr > 1 ? inr(requiredInr) : '— (frees margin)')
-const liqLabel = (closes: boolean, liq: number | null) => (closes ? 'Flat after close' : liq === null ? '—' : usd(liq))
+// liq === 0 is mathematically correct and unique to a fully-collateralized 1×
+// long (E·(1 − 1/1) = 0): it can only be liquidated if the stock itself hits $0.
+// Show that explicitly rather than a bare "$0.00" that reads like a bug. Every
+// other case (5×/10×/20× longs, and shorts at any leverage) has a real liq > 0.
+const liqLabel = (closes: boolean, liq: number | null) =>
+  closes ? 'Flat after close' : liq === null ? '—' : liq <= 0 ? 'N/A — fully collateralized' : usd(liq)
 
 function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
   ticker: string
@@ -168,22 +173,34 @@ function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
 }) {
   const [side, setSide] = useState<Side>('buy')
   const [type, setType] = useState<OrderType>('limit')
-  const [qty, setQty] = useState(10)
-  const [price, setPrice] = useState(0)
+  // Qty/Price are stored as raw strings so the field can be genuinely EMPTY
+  // while typing — we never coerce '' → 0/1 on a keystroke. Parsing/validation
+  // happens only at submit time.
+  const [qtyStr, setQtyStr] = useState('10')
+  const [priceStr, setPriceStr] = useState('')
+  const [alertMsg, setAlertMsg] = useState<string | null>(null)
   const leverage = 1 // leverage selector removed from the order window; default no-leverage
+
+  const qtyInputRef = useRef<HTMLInputElement>(null)
+  const priceInputRef = useRef<HTMLInputElement>(null)
+  const refocusRef = useRef<'qty' | 'price' | null>(null) // which field to refocus after the popup
 
   const ltp = row?.ltp ?? 0
   // Keep the limit price synced to LTP until the user edits it.
   const edited = useRef(false)
   useEffect(() => { edited.current = false }, [ticker])
-  useEffect(() => { if (!edited.current) setPrice(Number(ltp.toFixed(2))) }, [ltp])
+  useEffect(() => { if (!edited.current) setPriceStr(ltp > 0 ? ltp.toFixed(2) : '') }, [ltp])
 
-  const px = type === 'limit' ? price : ltp
+  // Parsed values. A blank/whitespace field parses to NaN (never 0), so "empty"
+  // is treated as not-yet-filled rather than a valid zero.
+  const qtyNum = qtyStr.trim() === '' ? NaN : Math.floor(Number(qtyStr))
+  const priceNum = priceStr.trim() === '' ? NaN : Number(priceStr)
+  const px = type === 'limit' ? priceNum : ltp
   const existing = row?.position
     ? { qty: row.position.qty, avgPrice: row.position.avgPrice, leverage: row.position.leverage }
     : { qty: 0, avgPrice: 0, leverage }
-  const signedQty = side === 'buy' ? qty : -qty
-  const valid = qty > 0 && px > 0
+  const signedQty = side === 'buy' ? qtyNum : -qtyNum
+  const valid = Number.isFinite(qtyNum) && qtyNum > 0 && Number.isFinite(px) && px > 0
   // Still computed for the confirm popup (not shown in this panel).
   const requiredInr = (valid ? requiredMargin(existing, signedQty, px, leverage) : 0) * rate
   const resulting = valid ? applyLeveredFill(existing, signedQty, px, leverage) : null
@@ -191,64 +208,114 @@ function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
   const liq = resulting && resulting.qty !== 0 ? liquidationPrice(resulting) : null
   const priceColor = side === 'buy' ? UP : DOWN
 
+  function submit() {
+    // Validate ONLY here (not on keystroke). Prefer the "blank" wording, naming
+    // whichever field(s) are actually empty.
+    const qtyBlank = qtyStr.trim() === ''
+    const priceBlank = type === 'limit' && priceStr.trim() === ''
+    if (qtyBlank || priceBlank) {
+      const which = qtyBlank && priceBlank ? 'Quantity and Price' : qtyBlank ? 'Quantity' : 'Price'
+      refocusRef.current = qtyBlank ? 'qty' : 'price'
+      setAlertMsg(`${which} can't be left blank.`)
+      return
+    }
+    // Non-blank but otherwise unusable (0, negative, NaN).
+    if (!Number.isFinite(qtyNum) || qtyNum <= 0) {
+      refocusRef.current = 'qty'
+      setAlertMsg('Quantity must be a number greater than 0.')
+      return
+    }
+    if (type === 'limit' && (!Number.isFinite(priceNum) || priceNum <= 0)) {
+      refocusRef.current = 'price'
+      setAlertMsg('Price must be a number greater than 0.')
+      return
+    }
+    onConfirmPlace({ side, type, qty: qtyNum, price: px, leverage, requiredInr, liq, closes })
+  }
+
+  function dismissAlert() {
+    const field = refocusRef.current
+    refocusRef.current = null
+    setAlertMsg(null)
+    // Return focus to the offending field once the modal has unmounted.
+    requestAnimationFrame(() => {
+      (field === 'price' ? priceInputRef : qtyInputRef).current?.focus()
+    })
+  }
+
   return (
-    <Panel title="Order Window" delay={0.06} fit>
-      <div className="flex flex-col gap-3 px-4 py-3">
-        {/* Selected Script */}
-        <div className="flex items-baseline justify-between">
-          <span className="text-[10px] uppercase tracking-[0.16em] text-subtle">Selected Script</span>
-          <span className="font-mono text-sm font-semibold text-[#E8C46A]">{ticker || '—'}</span>
-        </div>
-
-        {/* Buy / Sell */}
-        <div className="grid grid-cols-2 gap-2">
-          {(['buy', 'sell'] as const).map((s) => {
-            const on = side === s
-            const cls = s === 'buy' ? 'border-up/50 bg-up/10 text-up' : 'border-destructive/50 bg-destructive/10 text-destructive'
-            return (
-              <button key={s} onClick={() => setSide(s)}
-                className={`rounded-lg border py-2 text-sm font-medium uppercase transition-colors ${on ? cls : 'border-white/10 bg-white/[0.02] text-muted hover:bg-white/[0.04]'}`}>
-                {s}
-              </button>
-            )
-          })}
-        </div>
-
-        {/* Qty + Price side by side; Limit/Market stacked to their right */}
-        <div className="flex gap-2">
-          <label className="flex-1">
-            <span className="mb-0.5 block text-[10px] uppercase tracking-[0.16em] text-subtle">Qty</span>
-            <input type="number" min={1} value={qty} onChange={(e) => setQty(Math.max(1, Math.floor(Number(e.target.value) || 0)))}
-              className={`${INPUT} font-mono tabular-nums`} style={{ paddingTop: 6, paddingBottom: 6 }} />
-          </label>
-          <label className="flex-1">
-            <span className="mb-0.5 block text-[10px] uppercase tracking-[0.16em] text-subtle">Price</span>
-            <input type="number" step="0.01" disabled={type === 'market'}
-              value={type === 'market' ? Number(ltp.toFixed(2)) : price}
-              onChange={(e) => { edited.current = true; setPrice(Number(e.target.value) || 0) }}
-              className={`${INPUT} font-mono tabular-nums disabled:opacity-50`} style={{ paddingTop: 6, paddingBottom: 6, color: priceColor }} />
-          </label>
-          <div className="flex w-16 flex-col gap-1 self-stretch pt-[18px]">
-            {(['limit', 'market'] as const).map((t) => (
-              <button key={t} onClick={() => setType(t)}
-                className={`flex-1 rounded-md border text-[10px] uppercase tracking-wide transition-colors ${type === t ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
-                {t}
-              </button>
-            ))}
+    <>
+      <Panel title="Order Window" delay={0.06} fit>
+        <div className="flex flex-col gap-1 px-4 pt-1 pb-1.5">
+          {/* Selected Script */}
+          <div className="flex items-baseline justify-between">
+            <span className="text-[9px] uppercase tracking-[0.14em] text-subtle">Selected Script</span>
+            <span className="font-mono text-sm font-semibold text-[#E8C46A]">{ticker || '—'}</span>
           </div>
-        </div>
 
-        {/* Minimal submit */}
-        <button
-          disabled={!roundActive || !valid}
-          onClick={() => onConfirmPlace({ side, type, qty, price: px, leverage, requiredInr, liq, closes })}
-          className={`mt-1 rounded-lg border py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-            side === 'buy' ? 'border-up/40 bg-up/10 text-up hover:bg-up/20' : 'border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20'
-          }`}>
-          {roundActive ? `Place ${side.toUpperCase()} Order` : 'Waiting for round…'}
-        </button>
-      </div>
-    </Panel>
+          {/* Buy / Sell */}
+          <div className="grid grid-cols-2 gap-2">
+            {(['buy', 'sell'] as const).map((s) => {
+              const on = side === s
+              const cls = s === 'buy' ? 'border-up/50 bg-up/10 text-up' : 'border-destructive/50 bg-destructive/10 text-destructive'
+              return (
+                <button key={s} onClick={() => setSide(s)}
+                  className={`rounded-lg border py-1.5 text-sm font-medium uppercase transition-colors ${on ? cls : 'border-white/10 bg-white/[0.02] text-muted hover:bg-white/[0.04]'}`}>
+                  {s}
+                </button>
+              )
+            })}
+          </div>
+
+          {/* Qty + Price side by side; Limit/Market stacked to their right */}
+          <div className="flex gap-2">
+            <label className="flex-1">
+              <span className="mb-0.5 block text-[9px] uppercase tracking-[0.14em] text-subtle">Qty</span>
+              <input ref={qtyInputRef} type="number" min={1} value={qtyStr}
+                onChange={(e) => setQtyStr(e.target.value)}
+                className={`${INPUT} font-mono tabular-nums`} style={{ paddingTop: 4, paddingBottom: 4 }} />
+            </label>
+            <label className="flex-1">
+              <span className="mb-0.5 block text-[9px] uppercase tracking-[0.14em] text-subtle">Price</span>
+              <input ref={priceInputRef} type="number" step="0.01" disabled={type === 'market'}
+                value={type === 'market' ? (ltp > 0 ? ltp.toFixed(2) : '') : priceStr}
+                onChange={(e) => { edited.current = true; setPriceStr(e.target.value) }}
+                className={`${INPUT} font-mono tabular-nums disabled:opacity-50`} style={{ paddingTop: 4, paddingBottom: 4, color: priceColor }} />
+            </label>
+            <div className="flex w-16 flex-col gap-1 self-stretch pt-[15px]">
+              {(['limit', 'market'] as const).map((t) => (
+                <button key={t} onClick={() => setType(t)}
+                  className={`flex-1 rounded-md border text-[9px] uppercase tracking-wide transition-colors ${type === t ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
+                  {t}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Minimal submit — kept comfortably tall/tappable on purpose. Enabled
+              whenever a round is active so an empty field surfaces the popup. */}
+          <button
+            disabled={!roundActive}
+            onClick={submit}
+            className={`rounded-lg border py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+              side === 'buy' ? 'border-up/40 bg-up/10 text-up hover:bg-up/20' : 'border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20'
+            }`}>
+            {roundActive ? `Place ${side.toUpperCase()} Order` : 'Waiting for round…'}
+          </button>
+        </div>
+      </Panel>
+
+      {alertMsg && (
+        <Overlay onClose={dismissAlert}>
+          <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-destructive">Incomplete Order</div>
+          <h3 className="mt-2 text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>{alertMsg}</h3>
+          <button onClick={dismissAlert} autoFocus
+            className="mt-6 w-full rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">
+            OK
+          </button>
+        </Overlay>
+      )}
+    </>
   )
 }
 

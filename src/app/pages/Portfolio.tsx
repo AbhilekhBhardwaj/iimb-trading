@@ -17,7 +17,19 @@ function fmtXirr(x: number | null): string {
   if (x === null || !Number.isFinite(x)) return '—'
   const pct = x * 100
   if (Math.abs(pct) >= 1e6) return x > 0 ? '>+999,999%' : '<−999,999%'
-  return `${pct >= 0 ? '+' : '−'}${num(Math.abs(pct), 1)}%`
+  // Round to 1 dp FIRST, then choose the sign from the ROUNDED value. This kills
+  // the spurious "−0.0%": when equity equals the opening balance, Newton–Raphson
+  // returns a numerically-tiny negative (~−7e-9), which rounds to 0.0 but would
+  // otherwise keep its minus sign. A genuine zero now reads as a clean "0.0%".
+  const rounded = Math.round(pct * 10) / 10
+  if (rounded === 0) return '0.0%'
+  return `${rounded > 0 ? '+' : '−'}${num(Math.abs(rounded), 1)}%`
+}
+
+/** Neutral tone for a value that rounds to zero, so a clean 0.0% never shows red. */
+function xirrTone(x: number | null): string {
+  if (x === null || Math.round(x * 1000) / 1000 === 0) return 'text-subtle'
+  return toneClass(x)
 }
 
 const toneClass = (v: number) => (v > 0 ? 'text-up' : v < 0 ? 'text-destructive' : 'text-foreground')
@@ -198,7 +210,7 @@ function Portfolio() {
         {/* BOTTOM — quiet secondary line */}
         <section className="mt-14 flex flex-wrap items-baseline gap-x-8 gap-y-2 border-t border-white/[0.06] pt-5 text-[12px]">
           <span className="text-subtle">
-            XIRR <span className={`ml-1.5 font-mono tabular-nums ${data.xirr == null ? 'text-subtle' : toneClass(data.xirr)}`}>{fmtXirr(data.xirr)}</span>
+            XIRR <span className={`ml-1.5 font-mono tabular-nums ${xirrTone(data.xirr)}`}>{fmtXirr(data.xirr)}</span>
           </span>
           <span className="text-subtle">
             Realized P&L <span className={`ml-1.5 font-mono tabular-nums ${toneClass(data.realizedPnlInr)}`}>{inrSigned(data.realizedPnlInr)}</span>

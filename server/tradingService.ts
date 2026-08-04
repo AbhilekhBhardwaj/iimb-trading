@@ -174,6 +174,10 @@ export class TradingService {
     const roundsRestored = await this.restoreActiveRound()
     const { ordersRestored, accountsWithReservations } = await this.restoreOpenOrders()
     const accountsWithPnl = await this.restoreRealizedPnl()
+    // Restore each instrument's mark to its last traded price BEFORE the no-op
+    // check — a position can exist with zero realized P&L, and it must still be
+    // marked to the real last trade (not the reference seed) after a restart.
+    await this.restoreMarks()
 
     const result: RecoveryResult = {
       roundsRestored,
@@ -187,6 +191,33 @@ export class TradingService {
     }
     await this.log(null, 'server_recovered', 'warning', { ...result })
     return result
+  }
+
+  /**
+   * Restore each instrument's mark to its MOST RECENT traded price from the DB,
+   * so a restart marks open positions to the true last trade (matching the live
+   * process) instead of the static reference-price seed. Without this, a
+   * restart would silently re-value every open position against a stale seed
+   * price. Instruments that have never traded keep their reference-price seed.
+   */
+  private async restoreMarks(): Promise<number> {
+    const { data, error } = await this.db
+      .from('trades')
+      .select('instrument_id, price, created_at')
+      .order('created_at', { ascending: false })
+    if (error) throw error
+    const seen = new Set<string>()
+    let restored = 0
+    for (const row of data ?? []) {
+      const id = row.instrument_id as string
+      if (seen.has(id)) continue // first row per instrument = its most recent trade
+      seen.add(id)
+      const ticker = this.idToTicker.get(id)
+      if (!ticker) continue
+      this.lastPrice.set(ticker, Number(row.price))
+      restored++
+    }
+    return restored
   }
 
   private async restoreActiveRound(): Promise<number> {
@@ -739,16 +770,21 @@ export class TradingService {
   /** Everything the Portfolio page needs. Cash figures in INR at the live rate. */
   async portfolio(accountId: string): Promise<Record<string, unknown>> {
     const rate = usdInr()
-    const openingBalanceInr = await this.startingCashInr(accountId)
     const realizedPnlUsd = this.realizedPnlUsd.get(accountId) ?? 0
     const realizedPnlInr = realizedPnlUsd * rate
-    const cashInr = openingBalanceInr + realizedPnlInr
 
-    const { data, error } = await this.db
-      .from('positions')
-      .select('instrument_id, qty, avg_price, leverage')
-      .eq('account_id', accountId)
-    if (error) throw error
+    // These four reads are INDEPENDENT — run them concurrently. Each is a remote
+    // Supabase round-trip (~180ms); done serially they were this endpoint's
+    // dominant cost (~4× latency ≈ 0.75s). One round-trip's worth now.
+    const [openingBalanceInr, positionsRes, t0, tradeHistory] = await Promise.all([
+      this.startingCashInr(accountId),
+      this.db.from('positions').select('instrument_id, qty, avg_price, leverage').eq('account_id', accountId),
+      this.eventStartMs(),
+      this.tradeHistory(accountId),
+    ])
+    if (positionsRes.error) throw positionsRes.error
+    const data = positionsRes.data
+    const cashInr = openingBalanceInr + realizedPnlInr
     const posByTicker = new Map(
       (data ?? []).map((p) => [this.idToTicker.get(p.instrument_id as string) ?? '', p]),
     )
@@ -794,7 +830,7 @@ export class TradingService {
     const totalPnlPct = openingBalanceInr > 0 ? (totalPnlInr / openingBalanceInr) * 100 : 0
 
     // XIRR: starting capital out at event start, current total value in as of now.
-    const t0 = await this.eventStartMs()
+    // t0 was fetched concurrently above.
     const xirrValue =
       t0 === null
         ? null
@@ -820,7 +856,7 @@ export class TradingService {
       leverageReq,
       openPositions,
       chargesInr: 0, // commission not applied yet (rounds may enable it later)
-      tradeHistory: await this.tradeHistory(accountId),
+      tradeHistory, // fetched concurrently above
     }
   }
 
