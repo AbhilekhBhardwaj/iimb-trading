@@ -196,6 +196,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return json(res, 200, await service.portfolio(caller.accountId))
   }
 
+  // Leaderboard: open to every authenticated caller (teams, master, market maker).
+  if (method === 'GET' && path === '/api/leaderboard') {
+    return json(res, 200, { leaderboard: await service.leaderboard() })
+  }
+
   if (method === 'GET' && path === '/api/round/schedule') {
     return json(res, 200, { schedule: service.getSchedule() })
   }

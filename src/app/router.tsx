@@ -1,6 +1,7 @@
 import { createBrowserRouter, redirect } from 'react-router'
 import Admin from './pages/Admin'
 import Health from './pages/Health'
+import Leaderboard from './pages/Leaderboard'
 import Login from './pages/Login'
 import News from './pages/News'
 import Portfolio from './pages/Portfolio'
@@ -34,6 +35,10 @@ export const router = createBrowserRouter([
   {
     path: '/news',
     element: <News />,
+  },
+  {
+    path: '/leaderboard',
+    element: <Leaderboard />,
   },
   {
     path: '/admin',

@@ -91,6 +91,8 @@ function RoundBar({ snap, username, role, live, onSignOut }: {
         <span className="text-subtle">·</span>
         <Link to="/portfolio" className="text-muted transition-colors hover:text-[#E8C46A]">Portfolio</Link>
         <span className="text-subtle">·</span>
+        <Link to="/leaderboard" className="text-muted transition-colors hover:text-[#E8C46A]">Leaderboard</Link>
+        <span className="text-subtle">·</span>
         <Link to="/news" className="text-muted transition-colors hover:text-[#E8C46A]">News</Link>
         <span className="text-subtle">·</span>
         <span className="text-muted">{username} <span className="text-subtle">({role.replace('_', ' ')})</span></span>

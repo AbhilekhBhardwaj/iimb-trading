@@ -123,6 +123,15 @@ export interface TeamOverview {
   openPositions: number
 }
 
+export interface LeaderboardEntry {
+  rank: number
+  username: string
+  teamName: string | null
+  equityInr: number
+  totalPnlInr: number
+  totalPnlPct: number
+}
+
 export interface Bootstrap {
   accountId: string
   role: Role
@@ -263,6 +272,7 @@ export const api = {
   placeOrder: (input: PlaceOrderInput) => post<PlaceOrderResult>('/orders', input),
   cancelOrder: (orderId: string) => post<{ cancelled: boolean }>('/orders/cancel', { orderId }),
   portfolio: () => get<Portfolio>('/portfolio'),
+  leaderboard: () => get<{ leaderboard: LeaderboardEntry[] }>('/leaderboard'),
 
   // Master Terminal
   roundStart: () => post<{ round: RoundStatus }>('/round/start', {}),

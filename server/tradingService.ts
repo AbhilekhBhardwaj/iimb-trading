@@ -909,6 +909,28 @@ export class TradingService {
   }
 
   /**
+   * Public leaderboard: every TEAM ranked by equity (Total Portfolio Value),
+   * highest first. Reuses teamsOverview() so the equity math is defined exactly
+   * once (same as the portfolio page); master/market_maker are already excluded
+   * there via the role='team' filter. Ties break by username for a stable order.
+   */
+  async leaderboard(): Promise<
+    { rank: number; username: string; teamName: string | null; equityInr: number; totalPnlInr: number; totalPnlPct: number }[]
+  > {
+    const teams = await this.teamsOverview()
+    return teams
+      .sort((a, b) => b.equityInr - a.equityInr || a.username.localeCompare(b.username))
+      .map((t, i) => ({
+        rank: i + 1,
+        username: t.username,
+        teamName: t.teamName,
+        equityInr: t.equityInr,
+        totalPnlInr: t.totalPnlInr,
+        totalPnlPct: t.totalPnlPct,
+      }))
+  }
+
+  /**
    * Per-trade realized P&L for an account, reconstructed from the `trades` table.
    * We replay the account's fills in time order through the same position math the
    * engine uses; every fill that closes/reduces/flips a position emits one closed-
