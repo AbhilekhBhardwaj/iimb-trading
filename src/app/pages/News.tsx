@@ -165,47 +165,64 @@ function News() {
             )}
           </Panel>
 
-          {/* ── ARCHIVE (past rounds, browsable) ── */}
-          <Panel title="Archive · Newspaper" delay={0.05}>
-            <div className="flex flex-wrap gap-2">
-              {archiveList.length === 0 && <span className="text-sm text-subtle">No rounds yet.</span>}
-              {archiveList.map((r) => {
-                const ended = r.status === 'ended'
-                const sel = r.id === archiveId
-                return (
-                  <button
-                    key={r.id}
-                    disabled={!ended}
-                    onClick={() => setArchiveId(r.id)}
-                    title={ended ? r.id : 'Not yet unveiled'}
-                    className={`rounded-lg border px-3.5 py-1.5 font-mono text-[12px] transition-colors ${
-                      sel ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]'
-                        : ended ? 'border-white/10 text-muted hover:bg-white/[0.04]'
-                        : 'border-white/[0.06] text-subtle opacity-50'
-                    }`}
-                  >
-                    R{r.index + 1}{!ended && <span className="ml-1.5">🔒</span>}
-                  </button>
-                )
-              })}
-            </div>
+          {/* ── ARCHIVE (past rounds — scrollable list + detail; scales to many rounds) ── */}
+          <Panel title="Archive" delay={0.05}
+            right={<span className="font-mono text-[11px] text-subtle">{endedRounds.length} past round{endedRounds.length === 1 ? '' : 's'}</span>}>
+            {archiveList.length === 0 ? (
+              <p className="text-sm text-subtle">No rounds yet — finished rounds will appear here to browse.</p>
+            ) : (
+              <div className="grid gap-5 sm:grid-cols-[220px_1fr]">
+                {/* LEFT — vertical, SCROLLABLE round list. One row per round, so it
+                    stays clean whether there are 3 rounds or 13 (list scrolls, no
+                    wrapping pill grid). Past = clickable, upcoming = locked. */}
+                <div className="flex max-h-72 flex-col gap-1.5 overflow-y-auto pr-1">
+                  {archiveList.map((r) => {
+                    const ended = r.status === 'ended'
+                    const sel = r.id === archiveId
+                    const count = ended ? dailyNews(r.id).length : 0
+                    return (
+                      <button
+                        key={r.id}
+                        disabled={!ended}
+                        onClick={() => setArchiveId(r.id)}
+                        title={ended ? `View Round ${r.index + 1}` : 'Not yet unveiled'}
+                        className={`flex shrink-0 items-center justify-between rounded-lg border px-3 py-2 text-left transition-colors ${
+                          sel ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10'
+                            : ended ? 'border-white/10 hover:bg-white/[0.04]'
+                            : 'border-white/[0.06] opacity-50'
+                        }`}
+                      >
+                        <span className="flex min-w-0 flex-col">
+                          <span className={`font-mono text-[13px] ${sel ? 'text-[#E8C46A]' : ended ? 'text-foreground' : 'text-subtle'}`}>Round {r.index + 1}</span>
+                          <span className="truncate text-[10px] uppercase tracking-wide text-subtle">{r.mode.replace(/_/g, ' ')}</span>
+                        </span>
+                        {ended
+                          ? <span className="ml-2 shrink-0 font-mono text-[10px] text-subtle">{count} item{count === 1 ? '' : 's'}</span>
+                          : <span className="ml-2 shrink-0 text-[11px]">🔒</span>}
+                      </button>
+                    )
+                  })}
+                </div>
 
-            <div className="mt-4 border-t border-white/[0.06] pt-4">
-              {endedRounds.length === 0 ? (
-                <p className="text-sm text-subtle">No past rounds to browse yet — finished rounds appear here.</p>
-              ) : !archiveRound || archiveRound.status !== 'ended' ? (
-                <p className="text-sm text-subtle">Select a past round above to read its news.</p>
-              ) : (
-                <>
-                  <div className="mb-3 font-mono text-[11px] text-subtle">R{archiveRound.index + 1} · {archiveRound.mode.replace(/_/g, ' ')}</div>
-                  {archiveNews.length === 0 ? (
-                    <p className="text-sm text-subtle">No news was published for this round.</p>
+                {/* RIGHT — selected round's news */}
+                <div className="min-w-0 sm:border-l sm:border-white/[0.06] sm:pl-5">
+                  {endedRounds.length === 0 ? (
+                    <p className="text-sm text-subtle">No past rounds to browse yet — finished rounds appear here.</p>
+                  ) : !archiveRound || archiveRound.status !== 'ended' ? (
+                    <p className="text-sm text-subtle">Select a past round on the left to read its news.</p>
                   ) : (
-                    <NewsBullets items={archiveNews} />
+                    <>
+                      <div className="mb-3 font-mono text-[11px] text-subtle">Round {archiveRound.index + 1} · {archiveRound.mode.replace(/_/g, ' ')}</div>
+                      {archiveNews.length === 0 ? (
+                        <p className="text-sm text-subtle">No news was published for this round.</p>
+                      ) : (
+                        <NewsBullets items={archiveNews} />
+                      )}
+                    </>
                   )}
-                </>
-              )}
-            </div>
+                </div>
+              </div>
+            )}
           </Panel>
 
           {/* ── BROADER STATS (round-gated fundamentals) ── */}
