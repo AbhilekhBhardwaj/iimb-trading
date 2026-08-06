@@ -88,6 +88,13 @@ function RoundBar({ snap, username, role, live, onSignOut }: {
         ) : (
           <span className="flex items-center gap-1.5 text-subtle"><PulseDot color="#71717a" />NO ACTIVE ROUND</span>
         )}
+        {/* Pinned settlement rate. Quiet by design, but always visible: every
+            trade settles at this rate, so teams need to be able to see it. */}
+        {r && (
+          <span className="tabular-nums text-subtle" title="USD/INR settlement rate — fixed for this round">
+            USD/INR <span className="text-muted">{r.usdInrRate.toFixed(2)}</span>
+          </span>
+        )}
         <span className="text-subtle">·</span>
         <Link to="/portfolio" className="text-muted transition-colors hover:text-[#E8C46A]">Portfolio</Link>
         <span className="text-subtle">·</span>

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   createEventConfig,
+  DEFAULT_USD_INR_RATE,
   RoundController,
   type EventConfig,
   type RoundMode,
@@ -45,6 +46,100 @@ describe('RoundController — setCommission (Master control)', () => {
     rc.startNextRound(0)
     rc.endCurrentRound(60) // no pending left, none active
     expect(rc.setCommission(true)).toBeNull()
+  })
+})
+
+describe('RoundController — pinned USD/INR rate (decision 5)', () => {
+  it('defaults every round to the default rate and never moves it on its own', () => {
+    const rc = new RoundController(threeRoundConfig())
+    expect(rc.getSchedule().map((r) => r.usdInrRate)).toEqual([
+      DEFAULT_USD_INR_RATE,
+      DEFAULT_USD_INR_RATE,
+      DEFAULT_USD_INR_RATE,
+    ])
+
+    rc.startNextRound(0)
+    const before = rc.getUsdInrRate()
+    // Time passing must not drift the rate — it is pinned, not a market price.
+    rc.advanceTime(100)
+    rc.advanceTime(200)
+    expect(rc.getUsdInrRate()).toBe(before)
+  })
+
+  it('is null between rounds', () => {
+    const rc = new RoundController(threeRoundConfig())
+    expect(rc.getUsdInrRate()).toBeNull()
+    rc.startNextRound(0)
+    expect(rc.getUsdInrRate()).toBe(DEFAULT_USD_INR_RATE)
+    rc.endCurrentRound(10)
+    expect(rc.getUsdInrRate()).toBeNull()
+  })
+
+  it('honours a per-round rate from the config', () => {
+    const rc = new RoundController([
+      { id: 'a', mode: 'silent', durationSeconds: 60, commissionEnabled: false, usdInrRate: 90 },
+    ])
+    rc.startNextRound(0)
+    expect(rc.getUsdInrRate()).toBe(90)
+  })
+
+  it('setUsdInrRate targets the active round, else the next pending one', () => {
+    const rc = new RoundController(threeRoundConfig())
+
+    // No round active → targets the first pending.
+    expect(rc.setUsdInrRate(88)?.id).toBe('a')
+    expect(rc.getSchedule()[0].usdInrRate).toBe(88)
+
+    rc.startNextRound(0)
+    expect(rc.getUsdInrRate()).toBe(88)
+
+    // Active → targets the active round.
+    expect(rc.setUsdInrRate(91)?.id).toBe('a')
+    expect(rc.getUsdInrRate()).toBe(91)
+    expect(rc.getSchedule()[1].usdInrRate).toBe(DEFAULT_USD_INR_RATE) // untouched
+  })
+
+  it('a mid-round change applies from that point on, leaving other rounds alone', () => {
+    const rc = new RoundController(threeRoundConfig())
+    rc.startNextRound(0)
+    rc.setUsdInrRate(95)
+    rc.endCurrentRound(300)
+
+    // The ended round keeps the rate it was changed to; the next starts at default.
+    expect(rc.getSchedule()[0].usdInrRate).toBe(95)
+    rc.startNextRound(300)
+    expect(rc.getUsdInrRate()).toBe(DEFAULT_USD_INR_RATE)
+  })
+
+  it('rejects a non-positive or non-finite rate', () => {
+    const rc = new RoundController(threeRoundConfig())
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => rc.setUsdInrRate(bad)).toThrow(/positive number/)
+    }
+  })
+
+  it('rejects a non-positive rate in the constructor config', () => {
+    expect(
+      () => new RoundController([{ mode: 'silent', durationSeconds: 60, commissionEnabled: false, usdInrRate: 0 }]),
+    ).toThrow(/usdInrRate must be positive/)
+  })
+
+  it('returns null when there is neither an active nor a pending round', () => {
+    const rc = new RoundController([{ id: 'only', mode: 'silent', durationSeconds: 60, commissionEnabled: false }])
+    rc.startNextRound(0)
+    rc.endCurrentRound(60)
+    expect(rc.setUsdInrRate(90)).toBeNull()
+  })
+
+  it('createEventConfig pins every round, with per-round override', () => {
+    const config = createEventConfig(
+      [
+        { mode: 'only_data', commissionEnabled: false },
+        { mode: 'silent', commissionEnabled: true, usdInrRate: 92 },
+      ],
+      { mockRounds: 1, usdInrRate: 86 },
+    )
+    expect(config.map((r) => r.usdInrRate)).toEqual([86, 86, 92])
   })
 })
 

@@ -27,12 +27,13 @@
 import {
   MatchingEngine,
   RoundController,
-  applyLeveredFill,
+  applyCashFill,
+  effectiveEntryRate,
   isLiquidatable,
   liquidationPrice,
-  positionMargin,
-  requiredMargin,
+  postedMarginInr,
   xirr,
+  type CashPosition,
   type Depth,
   type LeveredPosition,
   type Order,
@@ -44,8 +45,7 @@ import {
 } from '@iimb-trading/engine'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { randomUUID } from 'node:crypto'
-import { COMMISSION_RATE, MAINTENANCE_MARGIN_RATE } from './config'
-import { usdInr } from './rate'
+import { COMMISSION_RATE, MAINTENANCE_MARGIN_RATE, USD_INR } from './config'
 
 type Severity = 'info' | 'warning' | 'error'
 const EPS = 1e-9
@@ -76,24 +76,32 @@ export interface PlaceOrderResult {
   trades?: Trade[]
 }
 
-/** A position enriched with its margin usage and liquidation price. */
+/** A position enriched with its INR cost basis, posted margin and liquidation price. */
 export interface PositionView {
   ticker: string
   qty: number
+  /** Average entry price in USD. */
   avgPrice: number
   leverage: number
+  /** Blended USD→INR rate the position was entered at. */
+  entryRateInr: number | null
+  /** Fixed INR cost basis (full notional). Never revalued while held. */
+  costBasisInr: number
+  /** Cash locked as margin: costBasis / leverage. */
   marginUsedInr: number
+  /** USD price at which the position liquidates — risk only, not a valuation. */
   liquidationPrice: number | null
 }
 
-/** An account's buying-power snapshot (cash figures in INR). */
+/** An account's buying-power snapshot (all figures in INR). */
 export interface AccountState {
   startingCashInr: number
   realizedPnlInr: number
+  /** Margin posted by open positions (Σ costBasis / leverage). */
   marginUsedInr: number
   /** Margin locked up by the account's resting (unfilled) orders. */
   marginReservedInr: number
-  /** startingCash + realizedPnL − marginUsed − marginReserved. Excludes unrealized P&L. */
+  /** startingCash + realizedPnL − marginUsed − marginReserved. No unrealized P&L exists. */
   availableMarginInr: number
   positions: PositionView[]
 }
@@ -111,8 +119,12 @@ export class TradingService {
   private readonly orders = new Map<string, Order>()
   /** orderId -> chosen leverage (the engine Order type doesn't carry leverage). */
   private readonly orderLeverage = new Map<string, number>()
-  /** accountId -> running realized P&L in USD (mirrors profiles.realized_pnl). */
-  private readonly realizedPnlUsd = new Map<string, number>()
+  /**
+   * accountId -> running realized P&L in INR (mirrors profiles.realized_pnl_inr).
+   * INR, not USD: realized P&L is the difference between two INR amounts struck
+   * at two different rates, so it has no single USD equivalent.
+   */
+  private readonly realizedPnlInr = new Map<string, number>()
   /** ticker -> instruments.id (uuid) and the reverse. */
   private tickerToId = new Map<string, string>()
   private idToTicker = new Map<string, string>()
@@ -268,6 +280,12 @@ export class TradingService {
         this.activeRoundId = active!.id as string
         this.roundStartedAtMs = Date.parse(active!.started_at as string)
         this.roundDurationSeconds = Number(active!.duration_seconds)
+        // Restore the PINNED rate — settlement depends on it, so a restart must
+        // not silently revert the round to the config default.
+        const persistedRate = Number(active!.usd_inr_rate)
+        if (Number.isFinite(persistedRate) && persistedRate > 0) {
+          this.rounds.setUsdInrRate(persistedRate)
+        }
         reconciled++
         break
       }
@@ -325,10 +343,13 @@ export class TradingService {
   }
 
   private async restoreRealizedPnl(): Promise<number> {
-    const { data, error } = await this.db.from('profiles').select('id, realized_pnl').neq('realized_pnl', 0)
+    const { data, error } = await this.db
+      .from('profiles')
+      .select('id, realized_pnl_inr')
+      .neq('realized_pnl_inr', 0)
     if (error) throw error
     for (const row of data ?? []) {
-      this.realizedPnlUsd.set(row.id as string, Number(row.realized_pnl))
+      this.realizedPnlInr.set(row.id as string, Number(row.realized_pnl_inr))
     }
     return (data ?? []).length
   }
@@ -379,6 +400,7 @@ export class TradingService {
         mode: round.mode,
         duration_seconds: round.durationSeconds,
         commission_enabled: round.commissionEnabled,
+        usd_inr_rate: round.usdInrRate,
         status: 'active',
         started_at: new Date().toISOString(),
         ended_at: null,
@@ -486,6 +508,42 @@ export class TradingService {
     return run
   }
 
+  /**
+   * The USD→INR rate settlement uses right now: the active round's pinned rate,
+   * falling back to the configured base between rounds (where nothing settles
+   * anyway, but reads still need a number to format with).
+   *
+   * This never drifts. Under cash settlement a rate move realizes real P&L on
+   * every close, so the rate only changes when the Master changes it.
+   */
+  rateInr(): number {
+    return this.rounds.getUsdInrRate() ?? USD_INR
+  }
+
+  /**
+   * Master control: pin a new USD→INR rate on the active round (or the next
+   * pending one), persisting it. Returns the round changed, or null if there is
+   * neither an active nor a pending round.
+   */
+  async setUsdInrRate(rate: number): Promise<Round | null> {
+    const changed = this.rounds.setUsdInrRate(rate)
+    if (!changed) return null
+    // Only an already-started round has a row to update.
+    if (changed.status !== 'pending') {
+      const { error } = await this.db
+        .from('rounds')
+        .update({ usd_inr_rate: changed.usdInrRate })
+        .eq('id', changed.id)
+      if (error) throw error
+    }
+    await this.log(null, 'usd_inr_rate_changed', 'info', {
+      roundId: changed.id,
+      index: changed.index,
+      usdInrRate: changed.usdInrRate,
+    })
+    return changed
+  }
+
   /** Remaining seconds in the active round (wall-clock from started_at + duration), or null. */
   getRoundRemainingSeconds(): number | null {
     if (this.activeRoundId === null || this.roundStartedAtMs === null) return null
@@ -500,6 +558,8 @@ export class TradingService {
     mode: RoundMode | null
     commissionEnabled: boolean
     remainingSeconds: number | null
+    /** USD→INR pinned for this round (or the base rate between rounds). */
+    usdInrRate: number
   } {
     const cur = this.activeRoundId === null ? null : this.rounds.getCurrentRound()
     return {
@@ -509,6 +569,7 @@ export class TradingService {
       mode: cur?.mode ?? null,
       commissionEnabled: cur?.commissionEnabled ?? false,
       remainingSeconds: this.getRoundRemainingSeconds(),
+      usdInrRate: this.rateInr(),
     }
   }
 
@@ -562,15 +623,22 @@ export class TradingService {
     if (valuationPrice === undefined || !(valuationPrice > 0)) {
       return this.reject(input, 'no_reference_price')
     }
-    const existing = await this.leveredPosition(input.accountId, instrumentId)
+    const rate = this.rateInr()
+    const existing = await this.cashPosition(input.accountId, instrumentId)
     const signedQty = input.side === 'buy' ? input.qty : -input.qty
-    const requiredUsd = requiredMargin(existing, signedQty, valuationPrice, leverage)
-    const availableUsd = await this.availableMarginUsd(input.accountId)
-    if (requiredUsd > availableUsd + EPS) {
+    // Cash this order needs is exactly the cash it would move, negated: margin
+    // posted less margin released less P&L realized. Opens/adds require cash;
+    // reduces and closes free it (a negative requirement), and a closing loss
+    // correctly still needs the cash to absorb it.
+    const projected = applyCashFill(existing, signedQty, valuationPrice, rate, leverage)
+    const requiredInr = -projected.cashFlowInr
+    const availableInr = await this.availableCashInr(input.accountId)
+    if (requiredInr > availableInr + EPS) {
       return this.reject(input, 'insufficient_margin', {
-        requiredMarginInr: requiredUsd * usdInr(),
-        availableMarginInr: availableUsd * usdInr(),
+        requiredMarginInr: requiredInr,
+        availableMarginInr: availableInr,
         leverage,
+        usdInrRate: rate,
       })
     }
 
@@ -667,13 +735,16 @@ export class TradingService {
   // Account / margin views
   // -------------------------------------------------------------------------
 
-  /** Buying-power snapshot for an account (cash figures in INR). */
+  /**
+   * Buying-power snapshot for an account, all in INR. There is no unrealized
+   * term: an open position contributes only the margin it has locked.
+   */
   async getAccountState(accountId: string): Promise<AccountState> {
     const startingCashInr = await this.startingCashInr(accountId)
     const positions = await this.positionViews(accountId)
     const marginUsedInr = positions.reduce((a, p) => a + p.marginUsedInr, 0)
-    const marginReservedInr = this.reservedMarginUsd(accountId) * usdInr()
-    const realizedPnlInr = (this.realizedPnlUsd.get(accountId) ?? 0) * usdInr()
+    const marginReservedInr = this.reservedMarginInr(accountId)
+    const realizedPnlInr = this.realizedPnlInr.get(accountId) ?? 0
     return {
       startingCashInr,
       realizedPnlInr,
@@ -686,7 +757,7 @@ export class TradingService {
 
   /** Margin (INR) currently locked up by an account's resting orders. */
   getReservedMarginInr(accountId: string): number {
-    return this.reservedMarginUsd(accountId) * usdInr()
+    return this.reservedMarginInr(accountId)
   }
 
   /** Depth ladder for an instrument (proxy to the engine) — useful for recovery checks. */
@@ -897,7 +968,7 @@ export class TradingService {
       trades,
       prices,
       notifications,
-      rate: usdInr(),
+      rate: this.rateInr(),
       serverTime: Date.now(),
     }
   }
@@ -915,33 +986,43 @@ export class TradingService {
     return data?.started_at ? Date.parse(data.started_at as string) : null
   }
 
-  /** Everything the Portfolio page needs. Cash figures in INR at the live rate. */
+  /**
+   * Everything the Portfolio page needs, in INR at the round's pinned rate.
+   *
+   * Under cash settlement an open position has NO live value: it shows its fixed
+   * cost basis and the rate it was entered at, and nothing about it changes until
+   * it is closed. So there is no unrealized P&L, no mark-to-market column and no
+   * position market value here — total P&L is realized P&L, full stop.
+   */
   async portfolio(accountId: string): Promise<Record<string, unknown>> {
-    const rate = usdInr()
-    const realizedPnlUsd = this.realizedPnlUsd.get(accountId) ?? 0
-    const realizedPnlInr = realizedPnlUsd * rate
+    const rate = this.rateInr()
+    const realizedPnlInr = this.realizedPnlInr.get(accountId) ?? 0
 
     // These four reads are INDEPENDENT — run them concurrently. Each is a remote
     // Supabase round-trip (~180ms); done serially they were this endpoint's
     // dominant cost (~4× latency ≈ 0.75s). One round-trip's worth now.
     const [openingBalanceInr, positionsRes, t0, tradeHistory] = await Promise.all([
       this.startingCashInr(accountId),
-      this.db.from('positions').select('instrument_id, qty, avg_price, leverage').eq('account_id', accountId),
+      this.db
+        .from('positions')
+        .select('instrument_id, qty, avg_price, leverage, notional_basis_inr')
+        .eq('account_id', accountId),
       this.eventStartMs(),
       this.tradeHistory(accountId),
     ])
     if (positionsRes.error) throw positionsRes.error
     const data = positionsRes.data
-    const cashInr = openingBalanceInr + realizedPnlInr
     const posByTicker = new Map(
       (data ?? []).map((p) => [this.idToTicker.get(p.instrument_id as string) ?? '', p]),
     )
 
     let openPositions = 0
-    let levNotionalUsd = 0 // entry notional, for the weighted-average leverage
-    let levMarginUsd = 0
+    let levNotionalInr = 0 // entry notional, for the weighted-average leverage
+    let levMarginInr = 0
     const inventory = [...this.instrumentMeta].map(([ticker, meta], i) => {
       const p = posByTicker.get(ticker)
+      // LTP is still shown: teams need the live price to trade. It is NOT used to
+      // value their holdings.
       const ltp = this.lastPrice.get(ticker) ?? meta.referencePrice
       const qty = p ? Number(p.qty) : 0
       if (qty === 0) {
@@ -949,33 +1030,46 @@ export class TradingService {
           index: i + 1, ticker, name: meta.name, ltp,
           qty: null, leverage: null, avgPrice: null,
           avgEntryInr: null, currentPriceInr: null,
-          pnlM2mInr: null, portfolioValueInr: null, costBasisInr: null,
+          entryRateInr: null, costBasisInr: null, marginUsedInr: null,
         }
       }
       openPositions++
-      const avgPrice = Number(p!.avg_price)
-      const leverage = Number(p!.leverage)
-      levNotionalUsd += Math.abs(qty) * avgPrice
-      levMarginUsd += (Math.abs(qty) * avgPrice) / leverage
+      const cash: CashPosition = {
+        qty,
+        avgPrice: Number(p!.avg_price),
+        notionalBasisInr: Number(p!.notional_basis_inr),
+        leverage: Number(p!.leverage),
+      }
+      const costBasisInr = Math.abs(cash.notionalBasisInr)
+      const marginUsedInr = postedMarginInr(cash)
+      levNotionalInr += costBasisInr
+      levMarginInr += marginUsedInr
       return {
         index: i + 1, ticker, name: meta.name, ltp,
-        qty, leverage, avgPrice,
-        avgEntryInr: avgPrice * rate, // prices converted server-side; the rate is never exposed to the UI
+        qty, leverage: cash.leverage, avgPrice: cash.avgPrice,
+        // Entry price converted at the rate the position was actually entered at,
+        // not today's — that is the whole point of a fixed basis.
+        avgEntryInr: cash.avgPrice * (effectiveEntryRate(cash) ?? rate),
         currentPriceInr: ltp * rate,
-        pnlM2mInr: qty * (ltp - avgPrice) * rate, // mark-to-market unrealized
-        portfolioValueInr: qty * ltp * rate,
-        costBasisInr: qty * avgPrice * rate,
+        entryRateInr: effectiveEntryRate(cash),
+        costBasisInr,
+        marginUsedInr,
       }
     })
     // Effective portfolio leverage: total notional / total margin posted (1× flat).
-    const leverageReq = levMarginUsd > 0 ? levNotionalUsd / levMarginUsd : 1
+    const leverageReq = levMarginInr > 0 ? levNotionalInr / levMarginInr : 1
 
-    const positionsValueInr = inventory.reduce((s, r) => s + (r.portfolioValueInr ?? 0), 0)
-    const unrealizedPnlInr = inventory.reduce((s, r) => s + (r.pnlM2mInr ?? 0), 0)
-    // Equity = cash + unrealized P&L (internally consistent: equals opening + total P&L).
-    const totalPortfolioValueInr = cashInr + unrealizedPnlInr
-    const totalPnlInr = realizedPnlInr + unrealizedPnlInr
+    const marginUsedInr = levMarginInr
+    const marginReservedInr = this.reservedMarginInr(accountId)
+    // Equity is opening capital plus realized P&L — nothing else can move it,
+    // because held positions are never revalued.
+    const totalPortfolioValueInr = openingBalanceInr + realizedPnlInr
+    const cashInr = totalPortfolioValueInr - marginUsedInr - marginReservedInr
+    const totalPnlInr = realizedPnlInr
     const totalPnlPct = openingBalanceInr > 0 ? (totalPnlInr / openingBalanceInr) * 100 : 0
+    // Commission actually charged, summed from the reconstructed history — this
+    // was previously stubbed to 0 while commission was really being deducted.
+    const chargesInr = tradeHistory.reduce((s, t) => s + t.commissionInr, 0)
 
     // XIRR: starting capital out at event start, current total value in as of now.
     // t0 was fetched concurrently above.
@@ -990,12 +1084,11 @@ export class TradingService {
     return {
       rate,
       openingBalanceInr,
-      realizedPnlUsd,
       realizedPnlInr,
       cashInr,
       inventory,
-      positionsValueInr,
-      unrealizedPnlInr,
+      marginUsedInr,
+      marginReservedInr,
       totalPnlInr,
       totalPnlPct,
       totalPortfolioValueInr,
@@ -1003,55 +1096,49 @@ export class TradingService {
       // Effective portfolio leverage (weighted average of open positions; 1× flat).
       leverageReq,
       openPositions,
-      chargesInr: 0, // commission not applied yet (rounds may enable it later)
+      chargesInr,
       tradeHistory, // fetched concurrently above
     }
   }
 
-  /** Admin-only overview of every team: equity + total P&L (same equity math as the portfolio). */
+  /**
+   * Admin-only overview of every team: equity + total P&L (same math as the
+   * portfolio page). Equity is opening capital plus REALIZED P&L only — held
+   * positions are never revalued, so an open position moves nothing until it is
+   * closed. `openPositions` is still reported so the Master can see who is
+   * carrying exposure.
+   */
   async teamsOverview(): Promise<
     { username: string; teamName: string | null; equityInr: number; totalPnlInr: number; totalPnlPct: number; openPositions: number }[]
   > {
-    const rate = usdInr()
     const { data: profs, error: pErr } = await this.db
       .from('profiles')
-      .select('id, username, team_name, starting_cash, realized_pnl')
+      .select('id, username, team_name, starting_cash, realized_pnl_inr')
       .eq('role', 'team')
       .order('username')
     if (pErr) throw pErr
 
     const { data: allPos, error: posErr } = await this.db
       .from('positions')
-      .select('account_id, instrument_id, qty, avg_price')
+      .select('account_id, qty')
     if (posErr) throw posErr
-    const byAccount = new Map<string, { instrument_id: string; qty: number; avg: number }[]>()
+    const openByAccount = new Map<string, number>()
     for (const p of allPos ?? []) {
-      const arr = byAccount.get(p.account_id as string) ?? []
-      arr.push({ instrument_id: p.instrument_id as string, qty: Number(p.qty), avg: Number(p.avg_price) })
-      byAccount.set(p.account_id as string, arr)
+      if (Number(p.qty) === 0) continue
+      const id = p.account_id as string
+      openByAccount.set(id, (openByAccount.get(id) ?? 0) + 1)
     }
 
     return (profs ?? []).map((pr) => {
-      const positions = byAccount.get(pr.id as string) ?? []
-      let unrealizedUsd = 0
-      let openPositions = 0
-      for (const pos of positions) {
-        if (pos.qty === 0) continue
-        openPositions++
-        const ticker = this.idToTicker.get(pos.instrument_id) ?? ''
-        const ltp = this.lastPrice.get(ticker) ?? 0
-        unrealizedUsd += pos.qty * (ltp - pos.avg)
-      }
-      const realizedUsd = this.realizedPnlUsd.get(pr.id as string) ?? Number(pr.realized_pnl)
+      const realizedInr = this.realizedPnlInr.get(pr.id as string) ?? Number(pr.realized_pnl_inr)
       const openingInr = Number(pr.starting_cash)
-      const totalPnlInr = (realizedUsd + unrealizedUsd) * rate
       return {
         username: pr.username as string,
         teamName: (pr.team_name as string | null) ?? null,
-        equityInr: openingInr + totalPnlInr,
-        totalPnlInr,
-        totalPnlPct: openingInr > 0 ? (totalPnlInr / openingInr) * 100 : 0,
-        openPositions,
+        equityInr: openingInr + realizedInr,
+        totalPnlInr: realizedInr,
+        totalPnlPct: openingInr > 0 ? (realizedInr / openingInr) * 100 : 0,
+        openPositions: openByAccount.get(pr.id as string) ?? 0,
       }
     })
   }
@@ -1080,34 +1167,42 @@ export class TradingService {
 
   /**
    * Per-trade realized P&L for an account, reconstructed from the `trades` table.
-   * We replay the account's fills in time order through the same position math the
-   * engine uses; every fill that closes/reduces/flips a position emits one closed-
-   * trade record (entry = avg before the fill, exit = fill price, realized = the
-   * amount locked in). Most recent first. Amounts in INR at the live rate.
+   * We replay the account's fills in time order through the SAME cash-settlement
+   * math the live path uses, each at the rate that fill actually settled at
+   * (`trades.usd_inr_rate`), so the reconstruction is exact rather than an
+   * approximation at today's rate. Every fill that closes/reduces/flips emits one
+   * closed-trade record. Most recent first, all amounts INR.
    */
   async tradeHistory(
     accountId: string,
   ): Promise<{ ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; grossPnlInr: number; commissionInr: number; realizedPnlInr: number; closedAt: number }[]> {
-    const rate = usdInr()
-    const { data: myOrders, error: oErr } = await this.db.from('orders').select('id').eq('account_id', accountId)
+    const { data: myOrders, error: oErr } = await this.db
+      .from('orders')
+      .select('id, leverage')
+      .eq('account_id', accountId)
     if (oErr) throw oErr
     const ids = (myOrders ?? []).map((o) => o.id as string)
     if (ids.length === 0) return []
     const idSet = new Set(ids)
+    const leverageByOrder = new Map((myOrders ?? []).map((o) => [o.id as string, Number(o.leverage)]))
     const inList = `(${ids.join(',')})`
 
-    // Which rounds had commission on — to reconstruct charges per closing fill.
-    const { data: roundRows } = await this.db.from('rounds').select('id, commission_enabled')
+    // Per-round commission flag and rate fallback, for trades that predate
+    // usd_inr_rate being recorded on the trade itself.
+    const { data: roundRows } = await this.db
+      .from('rounds')
+      .select('id, commission_enabled, usd_inr_rate')
     const commissionByRound = new Map((roundRows ?? []).map((r) => [r.id as string, r.commission_enabled as boolean]))
+    const rateByRound = new Map((roundRows ?? []).map((r) => [r.id as string, Number(r.usd_inr_rate)]))
 
     const { data: trades, error: tErr } = await this.db
       .from('trades')
-      .select('price, qty, created_at, instrument_id, round_id, buy_order_id, sell_order_id')
+      .select('price, qty, created_at, instrument_id, round_id, buy_order_id, sell_order_id, usd_inr_rate')
       .or(`buy_order_id.in.${inList},sell_order_id.in.${inList}`)
       .order('created_at', { ascending: true })
     if (tErr) throw tErr
 
-    const pos = new Map<string, { qty: number; avgPrice: number }>()
+    const pos = new Map<string, CashPosition>()
     const history: { ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; grossPnlInr: number; commissionInr: number; realizedPnlInr: number; closedAt: number }[] = []
     for (const t of trades ?? []) {
       const isBuyer = idSet.has(t.buy_order_id as string)
@@ -1116,26 +1211,44 @@ export class TradingService {
       const price = Number(t.price)
       const signed = isBuyer ? Number(t.qty) : -Number(t.qty)
       const ticker = this.idToTicker.get(t.instrument_id as string) ?? (t.instrument_id as string)
-      const cur = pos.get(ticker) ?? { qty: 0, avgPrice: 0 }
-      const next = applyLeveredFill({ qty: cur.qty, avgPrice: cur.avgPrice, leverage: 1 }, signed, price, 1)
-      if (next.realizedPnl !== 0) {
-        const closedQty = Math.min(Math.abs(signed), Math.abs(cur.qty))
-        // Commission on the closing portion of this fill, if that round charged it.
-        const commissionUsd = commissionByRound.get(t.round_id as string) ? COMMISSION_RATE * closedQty * price : 0
-        const gross = next.realizedPnl
+      const myOrderId = (isBuyer ? t.buy_order_id : t.sell_order_id) as string
+      const leverage = leverageByOrder.get(myOrderId) ?? 1
+      // The rate this fill settled at, with graceful fallbacks for pre-migration rows.
+      const fillRate =
+        t.usd_inr_rate !== null && t.usd_inr_rate !== undefined
+          ? Number(t.usd_inr_rate)
+          : (rateByRound.get(t.round_id as string) ?? USD_INR)
+
+      const cur = pos.get(ticker) ?? { qty: 0, avgPrice: 0, notionalBasisInr: 0, leverage }
+      const next = applyCashFill(cur, signed, price, fillRate, leverage)
+      if (next.realizedPnlInr !== 0) {
+        const closedQty = next.closedQty
+        // Commission on the closing portion of this fill, if that round charged
+        // it — computed on the same INR notional the live path uses.
+        const commissionInr = commissionByRound.get(t.round_id as string)
+          ? COMMISSION_RATE * closedQty * price * fillRate
+          : 0
+        const gross = next.realizedPnlInr
+        const perUnitBasisInr = cur.notionalBasisInr / cur.qty
         history.push({
           ticker,
           side: cur.qty > 0 ? 'long' : 'short', // the position that was closed/reduced
-          entryPriceInr: cur.avgPrice * rate,
-          exitPriceInr: price * rate,
+          // Entry in INR at the rate it was ENTERED at; exit at this fill's rate.
+          entryPriceInr: perUnitBasisInr,
+          exitPriceInr: price * fillRate,
           qty: closedQty,
-          grossPnlInr: gross * rate,
-          commissionInr: commissionUsd * rate,
-          realizedPnlInr: (gross - commissionUsd) * rate, // net: Sell − Charges
+          grossPnlInr: gross,
+          commissionInr,
+          realizedPnlInr: gross - commissionInr, // net: proceeds − basis − charges
           closedAt: Date.parse(t.created_at as string),
         })
       }
-      pos.set(ticker, { qty: next.qty, avgPrice: next.avgPrice })
+      pos.set(ticker, {
+        qty: next.qty,
+        avgPrice: next.avgPrice,
+        notionalBasisInr: next.notionalBasisInr,
+        leverage: next.leverage,
+      })
     }
     return history.reverse() // most recent first
   }
@@ -1157,6 +1270,10 @@ export class TradingService {
     // Track the last-trade price that feeds LTP / charts / market-order valuation.
     this.lastPrice.set(buyer.instrument, trade.price)
 
+    // The rate this fill settles at — pinned by the round, recorded on the trade
+    // so history stays reproducible even if the Master changes it later.
+    const rate = this.rateInr()
+
     // DB assigns the trade's own uuid pk; the engine trade id is not stored.
     const { error: tErr } = await this.db.from('trades').insert({
       buy_order_id: trade.buyOrderId,
@@ -1166,18 +1283,22 @@ export class TradingService {
       price: trade.price,
       qty: trade.qty,
       aggressor,
+      usd_inr_rate: rate,
     })
     if (tErr) throw tErr
 
-    // Commission: charged to BOTH sides as a % of notional (qty × price), but
-    // only while the active round has commission enabled. It's a cost, so it is
-    // deducted from each account's realized P&L at the time of the fill.
-    const commissionUsd = this.rounds.isCommissionActive() ? COMMISSION_RATE * trade.qty * trade.price : 0
+    // Commission: charged to BOTH sides as a % of notional, but only while the
+    // active round has commission enabled. A cost, so it is deducted from each
+    // account's realized P&L at the time of the fill. INR, like everything else
+    // that settles.
+    const commissionInr = this.rounds.isCommissionActive()
+      ? COMMISSION_RATE * trade.qty * trade.price * rate
+      : 0
 
     // Buyer gains qty, seller loses qty — each valued at the execution price and
     // using ITS OWN order's leverage (matters only when the fill opens/flips).
-    await this.applyPosition(buyer.userId, instrumentId, trade.qty, trade.price, this.orderLeverage.get(buyer.id) ?? 1, commissionUsd)
-    await this.applyPosition(seller.userId, instrumentId, -trade.qty, trade.price, this.orderLeverage.get(seller.id) ?? 1, commissionUsd)
+    await this.applyPosition(buyer.userId, instrumentId, trade.qty, trade.price, rate, this.orderLeverage.get(buyer.id) ?? 1, commissionInr)
+    await this.applyPosition(seller.userId, instrumentId, -trade.qty, trade.price, rate, this.orderLeverage.get(seller.id) ?? 1, commissionInr)
 
     const ticker = this.idToTicker.get(instrumentId) ?? instrumentId
     // One order_matched event per side so each account sees its own fill.
@@ -1186,24 +1307,32 @@ export class TradingService {
     await this.log(seller.userId, 'order_matched', 'info', { ...base, side: 'sell' })
 
     // Audit each side's commission.
-    if (commissionUsd > 0) {
-      const rate = usdInr()
-      const audit = { instrument: ticker, qty: trade.qty, price: trade.price, notional: trade.qty * trade.price, commissionRate: COMMISSION_RATE, commissionUsd, commissionInr: commissionUsd * rate }
+    if (commissionInr > 0) {
+      const audit = { instrument: ticker, qty: trade.qty, price: trade.price, notional: trade.qty * trade.price, commissionRate: COMMISSION_RATE, usdInrRate: rate, commissionInr }
       await this.log(buyer.userId, 'commission_charged', 'info', { ...audit, side: 'buy' })
       await this.log(seller.userId, 'commission_charged', 'info', { ...audit, side: 'sell' })
     }
   }
 
+  /**
+   * Settle one side of a fill under INR cash accounting: update the position's
+   * qty / entry price / INR basis, and move realized P&L by the amount this fill
+   * locked in, net of commission.
+   *
+   * `rate` is the USD→INR rate at THIS fill — baked into basis when opening or
+   * adding, and used to value the exit when reducing or closing.
+   */
   private async applyPosition(
     accountId: string,
     instrumentId: string,
     delta: number,
     price: number,
+    rate: number,
     fillLeverage: number,
-    commissionUsd = 0,
+    commissionInr = 0,
   ): Promise<void> {
-    const current = await this.leveredPosition(accountId, instrumentId)
-    const next = applyLeveredFill(current, delta, price, fillLeverage)
+    const current = await this.cashPosition(accountId, instrumentId)
+    const next = applyCashFill(current, delta, price, rate, fillLeverage)
 
     const { error: upErr } = await this.db.from('positions').upsert(
       {
@@ -1211,6 +1340,7 @@ export class TradingService {
         instrument_id: instrumentId,
         qty: next.qty,
         avg_price: next.avgPrice,
+        notional_basis_inr: next.notionalBasisInr,
         leverage: next.leverage,
         updated_at: new Date().toISOString(),
       },
@@ -1218,91 +1348,129 @@ export class TradingService {
     )
     if (upErr) throw upErr
 
-    // Realized P&L (USD, locked) net of commission: position P&L on this fill
-    // minus the commission charged for it. Commission alone moves realized even
-    // on an opening fill (position P&L 0). Absolute running total — this process
-    // is the single authoritative writer.
-    const netRealizedUsd = next.realizedPnl - commissionUsd
-    if (netRealizedUsd !== 0) {
-      const totalUsd = (this.realizedPnlUsd.get(accountId) ?? 0) + netRealizedUsd
-      this.realizedPnlUsd.set(accountId, totalUsd)
+    // Realized P&L (INR, locked) net of commission. Commission alone moves
+    // realized even on an opening fill (where position P&L is 0). Absolute
+    // running total — this process is the single authoritative writer.
+    const netRealizedInr = next.realizedPnlInr - commissionInr
+    if (netRealizedInr !== 0) {
+      const totalInr = (this.realizedPnlInr.get(accountId) ?? 0) + netRealizedInr
+      this.realizedPnlInr.set(accountId, totalInr)
       const { error: pnlErr } = await this.db
         .from('profiles')
-        .update({ realized_pnl: totalUsd })
+        .update({ realized_pnl_inr: totalInr })
         .eq('id', accountId)
       if (pnlErr) throw pnlErr
     }
   }
 
   /**
-   * Margin (USD) locked by an account's currently-resting orders. Derived live
+   * Margin (INR) locked by an account's currently-resting orders. Derived live
    * from the in-memory order objects (which the engine mutates), so it reflects
    * partial fills and cancellations immediately. Each resting order reserves
-   * remainingQty · price / leverage. `excludeOrderId` omits one order (unused at
-   * placement, since the new order isn't resting yet).
+   * remainingQty · price · rate / leverage — the cash it would post if it filled.
+   * `excludeOrderId` omits one order (unused at placement, since the new order
+   * isn't resting yet).
    */
-  private reservedMarginUsd(accountId: string, excludeOrderId?: string): number {
+  private reservedMarginInr(accountId: string, excludeOrderId?: string): number {
+    const rate = this.rateInr()
     let total = 0
     for (const o of this.orders.values()) {
       if (o.userId !== accountId || o.id === excludeOrderId) continue
       if (o.status !== 'active' && o.status !== 'partially_filled') continue
       if (o.price === undefined) continue // market orders never rest
-      total += (o.remainingQty * o.price) / (this.orderLeverage.get(o.id) ?? 1)
+      total += (o.remainingQty * o.price * rate) / (this.orderLeverage.get(o.id) ?? 1)
     }
     return total
   }
 
-  /** Current position (qty, avgPrice, leverage) for an account+instrument; flat if none. */
-  private async leveredPosition(accountId: string, instrumentId: string): Promise<LeveredPosition> {
+  /**
+   * Current cash-settled position for an account+instrument; flat if none.
+   * Carries the fixed INR basis alongside the USD entry price (the latter still
+   * feeds liquidation math, which stays a USD risk measure).
+   */
+  private async cashPosition(accountId: string, instrumentId: string): Promise<CashPosition> {
     const { data, error } = await this.db
       .from('positions')
-      .select('qty, avg_price, leverage')
+      .select('qty, avg_price, leverage, notional_basis_inr')
       .eq('account_id', accountId)
       .eq('instrument_id', instrumentId)
       .maybeSingle()
     if (error) throw error
     return data
-      ? { qty: Number(data.qty), avgPrice: Number(data.avg_price), leverage: Number(data.leverage) }
-      : { qty: 0, avgPrice: 0, leverage: 1 }
+      ? {
+          qty: Number(data.qty),
+          avgPrice: Number(data.avg_price),
+          notionalBasisInr: Number(data.notional_basis_inr),
+          leverage: Number(data.leverage),
+        }
+      : { qty: 0, avgPrice: 0, notionalBasisInr: 0, leverage: 1 }
+  }
+
+  /** The USD-only view of a position, for liquidation/risk math. */
+  private async leveredPosition(accountId: string, instrumentId: string): Promise<LeveredPosition> {
+    const p = await this.cashPosition(accountId, instrumentId)
+    return { qty: p.qty, avgPrice: p.avgPrice, leverage: p.leverage }
   }
 
   private async positionViews(accountId: string): Promise<PositionView[]> {
     const { data, error } = await this.db
       .from('positions')
-      .select('instrument_id, qty, avg_price, leverage')
+      .select('instrument_id, qty, avg_price, leverage, notional_basis_inr')
       .eq('account_id', accountId)
     if (error) throw error
     return (data ?? [])
       .map((p) => {
-        const qty = Number(p.qty)
-        const avgPrice = Number(p.avg_price)
-        const leverage = Number(p.leverage)
+        const cash: CashPosition = {
+          qty: Number(p.qty),
+          avgPrice: Number(p.avg_price),
+          notionalBasisInr: Number(p.notional_basis_inr),
+          leverage: Number(p.leverage),
+        }
         return {
           ticker: this.idToTicker.get(p.instrument_id as string) ?? (p.instrument_id as string),
-          qty,
-          avgPrice,
-          leverage,
-          marginUsedInr: positionMargin(qty, avgPrice, leverage) * usdInr(),
-          liquidationPrice: liquidationPrice({ qty, avgPrice, leverage }, MAINTENANCE_MARGIN_RATE),
+          qty: cash.qty,
+          avgPrice: cash.avgPrice,
+          leverage: cash.leverage,
+          entryRateInr: effectiveEntryRate(cash),
+          costBasisInr: Math.abs(cash.notionalBasisInr),
+          marginUsedInr: postedMarginInr(cash),
+          // Risk only — computed from the internal mark, never shown as P&L.
+          liquidationPrice: liquidationPrice(cash, MAINTENANCE_MARGIN_RATE),
         }
       })
       .filter((p) => p.qty !== 0)
   }
 
-  /** Available margin in USD: startingCash + realizedPnL − marginUsed − marginReserved. */
-  private async availableMarginUsd(accountId: string): Promise<number> {
-    const startingUsd = (await this.startingCashInr(accountId)) / usdInr()
-    const realizedUsd = this.realizedPnlUsd.get(accountId) ?? 0
+  /**
+   * Spendable INR: startingCash + realizedPnL − margin posted by open positions
+   * − margin reserved by resting orders. There is no unrealized term: a held
+   * position contributes only the cash it has locked up.
+   */
+  private async availableCashInr(accountId: string): Promise<number> {
+    const startingInr = await this.startingCashInr(accountId)
+    const realizedInr = this.realizedPnlInr.get(accountId) ?? 0
+    const marginUsedInr = await this.postedMarginTotalInr(accountId)
+    return startingInr + realizedInr - marginUsedInr - this.reservedMarginInr(accountId)
+  }
+
+  /** Total INR margin posted by an account's open positions. */
+  private async postedMarginTotalInr(accountId: string): Promise<number> {
     const { data, error } = await this.db
       .from('positions')
-      .select('qty, avg_price, leverage')
+      .select('qty, leverage, notional_basis_inr')
       .eq('account_id', accountId)
     if (error) throw error
-    const marginUsedUsd = (data ?? []).reduce(
-      (a, p) => a + positionMargin(Number(p.qty), Number(p.avg_price), Number(p.leverage)),
+    return (data ?? []).reduce(
+      (a, p) =>
+        a +
+        postedMarginInr({
+          qty: Number(p.qty),
+          avgPrice: 0, // unused by postedMarginInr
+          notionalBasisInr: Number(p.notional_basis_inr),
+          leverage: Number(p.leverage),
+        }),
       0,
     )
-    return startingUsd + realizedUsd - marginUsedUsd - this.reservedMarginUsd(accountId)
   }
 
   private async startingCashInr(accountId: string): Promise<number> {

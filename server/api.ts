@@ -18,7 +18,9 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createReadStream, existsSync, statSync } from 'node:fs'
 import { extname, join, normalize, resolve } from 'node:path'
-import { startRateDrift, usdInr } from './rate'
+// NOTE: server/rate.ts's startRateDrift() is deliberately NOT called. Under INR
+// cash settlement a rate move realizes real P&L on every close, so the rate is
+// pinned per round and only the Master changes it (POST /api/round/rate).
 import { createAdminClient } from './supabaseAdmin'
 import { TradingService } from './tradingService'
 
@@ -192,7 +194,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       username: caller.username,
       instruments: service.instrumentCatalogue(),
       round: service.getRoundStatus(),
-      rate: usdInr(),
+      rate: service.rateInr(),
       serverTime: Date.now(),
     })
   }
@@ -264,6 +266,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const changed = await service.setCommission(b.enabled === true)
     return json(res, 200, { round: service.getRoundStatus(), changed })
   }
+  // The USD→INR rate is set by hand and pinned for the round — it never drifts,
+  // because under INR cash settlement a rate move realizes real P&L on close.
+  if (method === 'POST' && path === '/api/round/rate') {
+    if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
+    const b = await readJson(req)
+    const rate = Number(b.usdInrRate ?? b.rate)
+    if (!Number.isFinite(rate) || rate <= 0) {
+      return json(res, 400, { error: 'usdInrRate must be a positive number' })
+    }
+    const changed = await service.setUsdInrRate(rate)
+    return json(res, 200, { round: service.getRoundStatus(), changed })
+  }
   if (method === 'GET' && path === '/api/admin/teams') {
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
     return json(res, 200, { teams: await service.teamsOverview() })
@@ -296,11 +310,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 // ---------------------------------------------------------------------------
 async function main(): Promise<void> {
   await service.loadInstruments()
-  startRateDrift() // live USD→INR rate (drift is API-server only; tests stay fixed)
   const recovery = await service.rehydrate()
   console.log(
     `TradingService ready. Recovery: ${recovery.roundsRestored} round(s), ` +
-      `${recovery.ordersRestored} order(s), ${recovery.accountsWithPnl} account(s) with P&L.`,
+      `${recovery.ordersRestored} order(s), ${recovery.accountsWithPnl} account(s) with P&L. ` +
+      `USD/INR pinned at ${service.rateInr()}.`,
   )
 
   // Companion to the per-request auto-end check in handle(): with every client

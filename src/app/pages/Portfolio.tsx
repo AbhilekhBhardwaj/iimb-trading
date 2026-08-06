@@ -124,9 +124,16 @@ function Portfolio() {
           </div>
         </section>
 
-        {/* SECTION 1 — Open Positions (live) */}
+        {/* SECTION 1 — Open Positions.
+            Positions are settled in INR at the rate they were entered at and are
+            NOT revalued while held, so there is deliberately no unrealized-P&L or
+            market-value column here: nothing about an open position changes until
+            it is closed. P&L appears in Trade History, on close. */}
         <section className="mt-14">
-          <h2 className="mb-4 text-sm font-medium text-bright">Open Positions</h2>
+          <h2 className="mb-1 text-sm font-medium text-bright">Open Positions</h2>
+          <p className="mb-4 text-[11px] text-subtle">
+            Cost basis is fixed at entry. P&amp;L is realised when you close — see Trade History.
+          </p>
 
           {holdings.length === 0 ? (
             <p className="text-sm text-subtle">No open positions</p>
@@ -137,10 +144,9 @@ function Portfolio() {
                   <tr className="border-b border-white/[0.08] text-[10px] uppercase tracking-wider text-subtle">
                     <th className="px-5 py-3 text-left font-medium">Ticker</th>
                     <th className="px-3 py-3 text-right font-medium">Qty</th>
-                    <th className="px-3 py-3 text-right font-medium">Avg Entry</th>
-                    <th className="px-3 py-3 text-right font-medium">Current</th>
-                    <th className="px-3 py-3 text-right font-medium">Market Value</th>
-                    <th className="px-5 py-3 text-right font-medium">Unrealized P&L</th>
+                    <th className="px-3 py-3 text-right font-medium">Entry Price</th>
+                    <th className="px-3 py-3 text-right font-medium">Entry Rate</th>
+                    <th className="px-5 py-3 text-right font-medium">Cost Basis</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono tabular-nums">
@@ -154,9 +160,10 @@ function Portfolio() {
                         </td>
                         <td className={`px-3 py-3 text-right ${long ? 'text-up' : 'text-destructive'}`}>{r.qty}</td>
                         <td className="px-3 py-3 text-right text-muted">{inr(r.avgEntryInr!)}</td>
-                        <td className="px-3 py-3 text-right text-foreground">{inr(r.currentPriceInr!)}</td>
-                        <td className="px-3 py-3 text-right text-foreground">{inr(r.portfolioValueInr!)}</td>
-                        <td className={`px-5 py-3 text-right ${toneClass(r.pnlM2mInr!)}`}>{inrSigned(r.pnlM2mInr!)}</td>
+                        <td className="px-3 py-3 text-right text-subtle">
+                          {r.entryRateInr === null ? '—' : `₹${num(r.entryRateInr, 2)}`}
+                        </td>
+                        <td className="px-5 py-3 text-right text-foreground">{inr(r.costBasisInr!)}</td>
                       </tr>
                     )
                   })}

@@ -17,6 +17,8 @@ export interface RoundStatus {
   mode: RoundMode | null
   commissionEnabled: boolean
   remainingSeconds: number | null
+  /** USD→INR pinned for this round. Set by the Master; never auto-drifts. */
+  usdInrRate: number
 }
 
 export interface InstrumentMeta {
@@ -31,7 +33,13 @@ export interface PositionView {
   qty: number
   avgPrice: number
   leverage: number
+  /** Blended USD→INR rate the position was entered at. */
+  entryRateInr: number | null
+  /** Fixed INR cost basis (full notional); never revalued while held. */
+  costBasisInr: number
+  /** Cash locked as margin: costBasis / leverage. */
   marginUsedInr: number
+  /** Risk measure only — not a valuation, and never shown as P&L. */
   liquidationPrice: number | null
 }
 
@@ -142,6 +150,12 @@ export interface Bootstrap {
   serverTime: number
 }
 
+/**
+ * One row of the instrument inventory. Under INR cash settlement an open
+ * position has NO live value: there is no mark-to-market P&L and no position
+ * market value. `ltp` / `currentPriceInr` are the live market price (teams need
+ * it to trade), NOT a valuation of the holding.
+ */
 export interface InventoryRow {
   index: number
   ticker: string
@@ -150,11 +164,15 @@ export interface InventoryRow {
   qty: number | null
   leverage: number | null
   avgPrice: number | null
+  /** Entry price in INR, converted at the rate the position was ENTERED at. */
   avgEntryInr: number | null
   currentPriceInr: number | null
-  pnlM2mInr: number | null
-  portfolioValueInr: number | null
+  /** Blended USD→INR rate the position was entered at. */
+  entryRateInr: number | null
+  /** Fixed INR cost basis (full notional). Never revalued while held. */
   costBasisInr: number | null
+  /** Cash locked as margin: costBasis / leverage. */
+  marginUsedInr: number | null
 }
 
 export interface TradeHistoryEntry {
@@ -170,20 +188,26 @@ export interface TradeHistoryEntry {
 }
 
 export interface Portfolio {
+  /** USD→INR pinned for the current round. */
   rate: number
   openingBalanceInr: number
-  realizedPnlUsd: number
   realizedPnlInr: number
+  /** Spendable INR: equity − margin posted − margin reserved. */
   cashInr: number
   inventory: InventoryRow[]
-  positionsValueInr: number
-  unrealizedPnlInr: number
+  /** Margin posted by open positions. */
+  marginUsedInr: number
+  /** Margin reserved by resting orders. */
+  marginReservedInr: number
+  /** Equals realizedPnlInr — held positions are never revalued. */
   totalPnlInr: number
   totalPnlPct: number
+  /** openingBalance + realizedPnl. Nothing else can move it. */
   totalPortfolioValueInr: number
   xirr: number | null
   leverageReq: number
   openPositions: number
+  /** Commission actually charged, summed from closed trades. */
   chargesInr: number
   tradeHistory: TradeHistoryEntry[]
 }

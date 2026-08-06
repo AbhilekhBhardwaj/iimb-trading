@@ -17,6 +17,18 @@
 export type RoundMode = 'data_and_news' | 'only_data' | 'silent'
 export type RoundStatus = 'pending' | 'active' | 'ended'
 
+/**
+ * Fallback USD→INR rate for a round whose config doesn't pin one.
+ *
+ * The rate is PINNED PER ROUND and only ever changes when the Master changes it
+ * (see `setUsdInrRate`). It deliberately does not drift: under INR cash
+ * settlement a rate move realizes real P&L on every close, so an auto-drifting
+ * rate would silently inject P&L from currency movement alone.
+ *
+ * Keep in sync with the server's USD_INR (server/config.ts).
+ */
+export const DEFAULT_USD_INR_RATE = 83
+
 export interface Round {
   id: string
   /** 0-based position in the event schedule. */
@@ -24,6 +36,8 @@ export interface Round {
   mode: RoundMode
   durationSeconds: number
   commissionEnabled: boolean
+  /** USD→INR rate in force for this round. Fixed unless the Master changes it. */
+  usdInrRate: number
   status: RoundStatus
   /** Event-clock second the round started; null until activated. */
   startedAt: number | null
@@ -36,6 +50,8 @@ export interface RoundDefinition {
   mode: RoundMode
   durationSeconds: number
   commissionEnabled: boolean
+  /** USD→INR rate for this round; defaults to DEFAULT_USD_INR_RATE. */
+  usdInrRate?: number
   /** Optional stable id; falls back to `round-<n>` by position. */
   id?: string
 }
@@ -53,12 +69,16 @@ export class RoundController {
       if (def.durationSeconds <= 0) {
         throw new Error(`round ${index} duration must be positive`)
       }
+      if (def.usdInrRate !== undefined && def.usdInrRate <= 0) {
+        throw new Error(`round ${index} usdInrRate must be positive`)
+      }
       return {
         id: def.id ?? `round-${index + 1}`,
         index,
         mode: def.mode,
         durationSeconds: def.durationSeconds,
         commissionEnabled: def.commissionEnabled,
+        usdInrRate: def.usdInrRate ?? DEFAULT_USD_INR_RATE,
         status: 'pending',
         startedAt: null,
         endedAt: null,
@@ -132,6 +152,15 @@ export class RoundController {
     return this.activeIndex === null ? false : this.rounds[this.activeIndex].commissionEnabled
   }
 
+  /**
+   * The USD→INR rate in force right now, or null between rounds. Constant for
+   * the whole round unless the Master changes it — settlement reads this, so it
+   * must never move on its own.
+   */
+  getUsdInrRate(): number | null {
+    return this.activeIndex === null ? null : this.rounds[this.activeIndex].usdInrRate
+  }
+
   /** The active round's mode, or null between rounds. */
   getMode(): RoundMode | null {
     return this.activeIndex === null ? null : this.rounds[this.activeIndex].mode
@@ -156,6 +185,29 @@ export class RoundController {
     target.commissionEnabled = enabled
     return snapshot(target)
   }
+
+  /**
+   * Master-Terminal control: set the USD→INR rate on the ACTIVE round, or — when
+   * no round is active — the NEXT pending round. Same targeting rule as
+   * setCommission. Returns a snapshot of the round changed, or null if there is
+   * neither an active nor a pending round.
+   *
+   * This is the ONLY way the rate ever moves. Changing it mid-round applies to
+   * every subsequent fill in that round; fills already settled keep the rate
+   * they were settled at, because their basis was fixed at the time.
+   */
+  setUsdInrRate(rate: number): Round | null {
+    if (!Number.isFinite(rate) || rate <= 0) {
+      throw new Error(`usdInrRate must be a positive number (got ${rate})`)
+    }
+    const target =
+      this.activeIndex !== null
+        ? this.rounds[this.activeIndex]
+        : this.rounds.find((r) => r.status === 'pending')
+    if (!target) return null
+    target.usdInrRate = rate
+    return snapshot(target)
+  }
 }
 
 function snapshot(round: Round): Round {
@@ -172,6 +224,8 @@ export interface RealRoundSpec {
   commissionEnabled: boolean
   /** Override the default real-round duration (seconds). */
   durationSeconds?: number
+  /** Override the event's default USD→INR rate for this round. */
+  usdInrRate?: number
 }
 
 export interface EventConfigOptions {
@@ -185,12 +239,18 @@ export interface EventConfigOptions {
   mockMode?: RoundMode
   /** Whether commission is on during mock rounds. Default false. */
   mockCommission?: boolean
+  /** USD→INR rate every round starts pinned at. Default DEFAULT_USD_INR_RATE. */
+  usdInrRate?: number
 }
 
 /**
  * Build a standard event schedule: a run of mock rounds (5 min, no commission
  * by default) followed by the given real rounds (10 min each unless overridden),
  * each with its own mode and commission per the Master Terminal's schedule.
+ *
+ * Every round starts pinned at `options.usdInrRate` (or the default), which a
+ * per-round `usdInrRate` on a RealRoundSpec can override. The Master can change
+ * any round's rate later via RoundController.setUsdInrRate.
  */
 export function createEventConfig(
   realRounds: readonly RealRoundSpec[],
@@ -202,6 +262,7 @@ export function createEventConfig(
     realDurationSeconds = 600,
     mockMode = 'data_and_news',
     mockCommission = false,
+    usdInrRate = DEFAULT_USD_INR_RATE,
   } = options
 
   const config: RoundDefinition[] = []
@@ -211,6 +272,7 @@ export function createEventConfig(
       mode: mockMode,
       durationSeconds: mockDurationSeconds,
       commissionEnabled: mockCommission,
+      usdInrRate,
     })
   }
   realRounds.forEach((spec, i) => {
@@ -219,6 +281,7 @@ export function createEventConfig(
       mode: spec.mode,
       durationSeconds: spec.durationSeconds ?? realDurationSeconds,
       commissionEnabled: spec.commissionEnabled,
+      usdInrRate: spec.usdInrRate ?? usdInrRate,
     })
   })
   return config
