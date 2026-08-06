@@ -129,6 +129,17 @@ export class TradingService {
   /** Wall-clock anchors for the active round's remaining-time countdown. */
   private roundStartedAtMs: number | null = null
   private roundDurationSeconds = 0
+  /** Event-clock second the active round started; its scheduled end is this + duration. */
+  private roundStartedAtSecond = 0
+  /**
+   * Serializes round transitions. A round end mutates the RoundController and
+   * then the DB across several awaits, and it can be triggered concurrently from
+   * many places (every polling request checks the elapsed duration, the 1s timer
+   * ticks, and the Master can click "end" at the same moment). Without this,
+   * two callers both observe an active round and the loser throws
+   * 'no active round to end'.
+   */
+  private roundOps: Promise<unknown> = Promise.resolve()
 
   constructor(
     private readonly db: SupabaseClient,
@@ -161,17 +172,19 @@ export class TradingService {
 
   /**
    * Restore in-memory state from the DB after a restart, BEFORE accepting orders:
-   *   - the 'active' round into RoundController (with correct remaining time),
+   *   - the full round history into RoundController: every 'ended' round burned
+   *     so it can never be replayed, and any 'active' round re-activated with
+   *     its correct remaining time,
    *   - all 'active'/'partially_filled' orders onto the engine's books (resting,
    *     no re-matching), which also rebuilds reserved-margin tracking,
    *   - each account's realized P&L into memory.
    * Logs 'server_recovered' (warning) with counts. No-op (and no log) if there
-   * is nothing to restore.
+   * is nothing to restore (i.e. a genuinely fresh event).
    */
   async rehydrate(): Promise<RecoveryResult> {
     if (this.tickerToId.size === 0) await this.loadInstruments()
 
-    const roundsRestored = await this.restoreActiveRound()
+    const roundsRestored = await this.restoreRounds()
     const { ordersRestored, accountsWithReservations } = await this.restoreOpenOrders()
     const accountsWithPnl = await this.restoreRealizedPnl()
     // Restore each instrument's mark to its last traded price BEFORE the no-op
@@ -220,30 +233,63 @@ export class TradingService {
     return restored
   }
 
-  private async restoreActiveRound(): Promise<number> {
+  /**
+   * Reconcile the RoundController with persisted round history.
+   *
+   * A fresh RoundController comes up with every round 'pending'. Restoring only
+   * the *active* round is not enough: once every round has ended, there is no
+   * active round to restore, the controller stays entirely 'pending', and the
+   * next `startRound()` serves up a round that already ran — overwriting its
+   * real history. So burn every round the DB records as 'ended' too, in
+   * schedule order, and re-activate an 'active' round with its true elapsed time.
+   *
+   * Returns the number of rounds reconciled (ended + active).
+   */
+  private async restoreRounds(): Promise<number> {
     const { data, error } = await this.db.from('rounds').select('*').order('index')
     if (error) throw error
-    const active = (data ?? []).find((r) => r.status === 'active')
-    if (!active) return 0
+    const rows = new Map((data ?? []).map((r) => [r.id as string, r]))
 
-    // Drive the injected controller to the active round: burn earlier rounds,
-    // then start the target at a negative offset so its remaining time equals
-    // duration − elapsed (with the service clock pinned at 0).
     const schedule = this.rounds.getSchedule()
-    const targetIdx = schedule.findIndex((r) => r.id === active.id)
-    if (targetIdx < 0) throw new Error(`active round ${active.id} not in RoundController config`)
+    const active = (data ?? []).find((r) => r.status === 'active')
+    const activeIdx = active ? schedule.findIndex((r) => r.id === active.id) : -1
+    if (active && activeIdx < 0) {
+      throw new Error(`active round ${active.id} not in RoundController config`)
+    }
 
-    for (let i = 0; i < targetIdx; i++) {
+    let reconciled = 0
+    for (let i = 0; i < schedule.length; i++) {
+      if (i === activeIdx) {
+        // Start the target at event-second 0 (the service clock is pinned there);
+        // remaining time comes from the persisted wall-clock start + duration.
+        this.rounds.startNextRound(0)
+        this.nowSeconds = 0
+        this.roundStartedAtSecond = 0
+        this.activeRoundId = active!.id as string
+        this.roundStartedAtMs = Date.parse(active!.started_at as string)
+        this.roundDurationSeconds = Number(active!.duration_seconds)
+        reconciled++
+        break
+      }
+
+      const isEnded = rows.get(schedule[i].id)?.status === 'ended'
+      if (!isEnded) {
+        // No finished row: this round has not run. With no active round beyond
+        // it there is nothing left to reconcile.
+        if (activeIdx < 0) break
+        // Otherwise there is a gap before the active round (usually the event
+        // config changed between deploys). Burn it so the controller can reach
+        // the active round, but say so loudly.
+        console.warn(
+          `rehydrate: no 'ended' row for ${schedule[i].id}; ` +
+            `burning it to reach active round ${active!.id}`,
+        )
+      }
       this.rounds.startNextRound(0)
       this.rounds.endCurrentRound(0)
+      if (isEnded) reconciled++
     }
-    this.rounds.startNextRound(0) // make it the active round for getMode() gating
-    this.nowSeconds = 0
-    this.activeRoundId = active.id as string
-    // Remaining time is computed from the wall-clock start + duration.
-    this.roundStartedAtMs = Date.parse(active.started_at as string)
-    this.roundDurationSeconds = Number(active.duration_seconds)
-    return 1
+    return reconciled
   }
 
   private async restoreOpenOrders(): Promise<{ ordersRestored: number; accountsWithReservations: number }> {
@@ -292,9 +338,37 @@ export class TradingService {
   // -------------------------------------------------------------------------
 
   async startRound(atSecond: number): Promise<Round> {
+    return this.serializeRoundOp(() => this.startRoundInner(atSecond))
+  }
+
+  private async startRoundInner(atSecond: number): Promise<Round> {
+    // Guard BEFORE mutating the controller: if the round we are about to start
+    // already has a row in the DB, the controller is out of sync with persisted
+    // history and the upsert below would silently overwrite that round's real
+    // started_at/ended_at. Peek at the next pending round rather than starting
+    // it first, so a refusal leaves the controller untouched.
+    const next = this.rounds.getSchedule().find((r) => r.status === 'pending')
+    if (next) {
+      const { data: existing, error: exErr } = await this.db
+        .from('rounds')
+        .select('status, started_at, ended_at')
+        .eq('id', next.id)
+        .maybeSingle()
+      if (exErr) throw exErr
+      if (existing && existing.status !== 'pending') {
+        throw new Error(
+          `refusing to start round ${next.id}: the database already has it as ` +
+            `'${existing.status}' (started_at=${existing.started_at}, ended_at=${existing.ended_at}). ` +
+            `Starting it would overwrite that round's history — rehydrate() must run ` +
+            `before round transitions are accepted.`,
+        )
+      }
+    }
+
     const round = this.rounds.startNextRound(atSecond)
     this.activeRoundId = round.id
     this.nowSeconds = atSecond
+    this.roundStartedAtSecond = atSecond
     this.roundStartedAtMs = Date.now()
     this.roundDurationSeconds = round.durationSeconds
 
@@ -321,9 +395,20 @@ export class TradingService {
     return round
   }
 
+  /** End the active round early (Master Terminal override). */
   async endRound(atSecond: number): Promise<Round> {
+    return this.serializeRoundOp(() => this.endRoundInner(atSecond, false))
+  }
+
+  private async endRoundInner(atSecond: number, auto: boolean): Promise<Round> {
     const round = this.rounds.endCurrentRound(atSecond)
     this.nowSeconds = atSecond
+
+    // Clear the book BEFORE closing the round out: a round is a self-contained
+    // trading session, so no order may rest into the next one, and the margin
+    // those orders reserve has to be released with them.
+    const cancelledOrderIds = await this.sweepRestingOrders()
+
     const { error } = await this.db
       .from('rounds')
       .update({ status: 'ended', ended_at: new Date().toISOString() })
@@ -334,8 +419,71 @@ export class TradingService {
       this.activeRoundId = null
       this.roundStartedAtMs = null
     }
-    await this.log(null, 'round_ended', 'info', { roundId: round.id, index: round.index })
+    await this.log(null, 'round_ended', 'info', {
+      roundId: round.id,
+      index: round.index,
+      auto,
+      ordersCancelled: cancelledOrderIds.length,
+    })
     return round
+  }
+
+  /**
+   * End the active round if its duration has fully elapsed on the wall clock.
+   * Returns the round that was ended, or null when nothing was due.
+   *
+   * The RoundController is a pure state machine with no clock of its own, so
+   * something has to drive it. This is that driver: cheap enough to call on
+   * every request (a no-op comparison when nothing is due) and also ticked by a
+   * timer in the API server, so a round closes on schedule whether or not the
+   * Master clicks "end" and whether or not anyone is still polling.
+   */
+  async maybeAutoEndRound(): Promise<Round | null> {
+    if (!this.isRoundElapsed()) return null // fast path, outside the lock
+    return this.serializeRoundOp(async () => {
+      // Re-check under the lock: a concurrent caller may have ended it already.
+      if (!this.isRoundElapsed()) return null
+      return this.endRoundInner(this.roundStartedAtSecond + this.roundDurationSeconds, true)
+    })
+  }
+
+  /** Whether an active round's full duration has elapsed on the wall clock. */
+  private isRoundElapsed(): boolean {
+    if (this.activeRoundId === null || this.roundStartedAtMs === null) return false
+    return Date.now() - this.roundStartedAtMs >= this.roundDurationSeconds * 1000
+  }
+
+  /**
+   * Cancel every order still resting on any book, persisting each as
+   * 'cancelled'. Returns the ids cancelled. Reserved margin is derived from
+   * these same in-memory order objects, so it is released as a side effect.
+   */
+  private async sweepRestingOrders(): Promise<string[]> {
+    const resting = [...this.orders.values()].filter(
+      (o) => o.status === 'active' || o.status === 'partially_filled',
+    )
+    const cancelled: string[] = []
+    for (const o of resting) {
+      // cancelOrder returns false for anything not actually on a book; mark
+      // those cancelled directly so the DB never shows them as still working.
+      if (!this.engine.cancelOrder(o.id)) o.status = 'cancelled'
+      await this.syncOrderState(o.id)
+      cancelled.push(o.id)
+    }
+    return cancelled
+  }
+
+  /**
+   * Run a round transition with exclusive access, queued behind any in-flight
+   * one. Failures don't poison the chain — later transitions still run.
+   */
+  private serializeRoundOp<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.roundOps.then(fn, fn)
+    this.roundOps = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return run
   }
 
   /** Remaining seconds in the active round (wall-clock from started_at + duration), or null. */

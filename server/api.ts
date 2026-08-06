@@ -174,6 +174,11 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
   // request/account context is available.
   let callerCtx: Caller | null = null
   try {
+    // Self-healing round timer: every request re-checks whether the active
+    // round's duration has elapsed and closes it if so, so the round ends on
+    // schedule even if the Master never clicks "end". No-op when nothing is due.
+    await service.maybeAutoEndRound()
+
     const caller = await authenticate(req)
     if (!caller) return json(res, 401, { error: 'unauthorized' })
     callerCtx = caller
@@ -297,6 +302,16 @@ async function main(): Promise<void> {
     `TradingService ready. Recovery: ${recovery.roundsRestored} round(s), ` +
       `${recovery.ordersRestored} order(s), ${recovery.accountsWithPnl} account(s) with P&L.`,
   )
+
+  // Companion to the per-request auto-end check in handle(): with every client
+  // disconnected there are no requests to piggyback on, and a round would stay
+  // open indefinitely. unref'd so it never holds up process shutdown.
+  const roundTimer = setInterval(() => {
+    service.maybeAutoEndRound().catch((err) =>
+      console.error('auto-end round failed:', err instanceof Error ? err.message : err),
+    )
+  }, 1000)
+  ;(roundTimer as { unref?: () => void }).unref?.()
 
   createServer((req, res) => {
     handle(req, res).catch((err) => {
