@@ -4,6 +4,7 @@ import { motion } from 'motion/react'
 import { applyLeveredFill, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
 import { orderPnlLines, toCashPosition } from '../../lib/orderConfirm'
+import { averageFillPrice, slippageNudge } from '../../lib/slippage'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
 import { Panel } from '../components/Panel'
@@ -571,6 +572,48 @@ function ConfirmDialog({ title, lines, confirmLabel, tone, onConfirm, onCancel }
   )
 }
 
+/**
+ * Post-trade result popup: what the fill ACTUALLY did, as opposed to the
+ * pre-trade estimate in ConfirmDialog. Carries the realized P&L breakdown and
+ * the slippage nudge together in one dialog rather than two, since a closing
+ * market order can produce both.
+ */
+function ResultDialog({ title, lines, note, onClose }: {
+  title: string
+  lines: { k: string; v: string; tone?: 'up' | 'destructive' }[]
+  note?: string | null
+  onClose: () => void
+}) {
+  return (
+    <Overlay onClose={onClose}>
+      <h3 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>{title}</h3>
+      {lines.length > 0 && (
+        <dl className="mt-4 flex flex-col gap-1.5 text-[13px]">
+          {lines.map((l) => (
+            <div key={l.k} className="flex items-center justify-between">
+              <dt className="text-subtle">{l.k}</dt>
+              <dd className={`font-mono tabular-nums ${l.tone === 'up' ? 'text-up' : l.tone === 'destructive' ? 'text-destructive' : 'text-foreground'}`}>{l.v}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {note && (
+        <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.03] p-3">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: GOLD.solid }}>Slippage</div>
+          <p className="mt-1.5 text-[12px] leading-relaxed text-muted">{note}</p>
+        </div>
+      )}
+      <button onClick={onClose} className="mt-6 w-full rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Done</button>
+    </Overlay>
+  )
+}
+
+interface TradeResult {
+  title: string
+  lines: { k: string; v: string; tone?: 'up' | 'destructive' }[]
+  note: string | null
+}
+
 interface Toast { id: number; ok: boolean; title: string; detail?: string }
 function Toasts({ toasts }: { toasts: Toast[] }) {
   return (
@@ -597,6 +640,7 @@ function Terminal() {
   const [selected, setSelected] = useState('')
   const [tf, setTf] = useState<TF>('5min')
   const [pending, setPending] = useState<PendingOrder | null>(null)
+  const [result, setResult] = useState<TradeResult | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [announcement, setAnnouncement] = useState<Notification | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -671,17 +715,48 @@ function Terminal() {
   async function doPlace(o: PendingOrder) {
     setPending(null)
     analytics.capture('order_placed', { ticker: selected, side: o.side, type: o.type, qty: o.qty, leverage: o.leverage })
+    // Snapshot the inputs the post-trade popup needs BEFORE the fill mutates
+    // them: P&L has to be measured against the position as it stood going in.
+    const prePosition = toCashPosition(row?.position)
+    const rate = snap?.rate ?? 83
+    const commissionEnabled = snap?.round.commissionEnabled ?? false
     try {
       const res = await api.placeOrder({ ticker: selected, side: o.side, type: o.type, price: o.type === 'limit' ? o.price : undefined, qty: o.qty, leverage: o.leverage })
       if (!res.accepted) {
         analytics.capture('order_rejected', { ticker: selected, side: o.side, type: o.type, qty: o.qty, reason: res.reason })
         pushToast(false, 'Order rejected', res.reason); return
       }
-      const filled = (res.trades ?? []).reduce((a, t) => a + t.qty, 0)
+      const fills = res.trades ?? []
+      const filled = fills.reduce((a, t) => a + t.qty, 0)
       if (filled > 0) analytics.capture('order_filled', { ticker: selected, side: o.side, type: o.type, qty: o.qty, filledQty: filled })
-      if (filled === 0) pushToast(true, 'Order resting', `${o.qty} @ ${usd(o.price)} on the book`)
-      else if (filled < o.qty) pushToast(true, 'Partial fill', `${filled}/${o.qty} filled`)
-      else pushToast(true, 'Order filled', `${filled} @ avg ${usd(o.price)}`)
+      if (filled === 0) { pushToast(true, 'Order resting', `${o.qty} @ ${usd(o.price)} on the book`); return }
+
+      // Everything below is measured on what ACTUALLY filled — the average across
+      // however many levels the order touched, and only the quantity that traded.
+      const avg = averageFillPrice(fills)
+      const pnlLines = avg
+        ? orderPnlLines(prePosition, o.side === 'buy' ? avg.filledQty : -avg.filledQty, avg.avgFillPrice, rate, o.leverage, commissionEnabled)
+        : []
+      const nudge = slippageNudge({ orderType: o.type, side: o.side, bestPrice: res.bestPriceAtSubmit, fills })
+      if (nudge) analytics.capture('slippage_nudge_shown', { ticker: selected, side: o.side, qty: filled })
+
+      // A clean fill with nothing to teach stays a toast; the dialog only opens
+      // when there is a realized breakdown or a slippage nudge to show.
+      if (pnlLines.length === 0 && !nudge) {
+        pushToast(true, filled < o.qty ? 'Partial fill' : 'Order filled', `${filled} @ avg ${usd(avg?.avgFillPrice ?? o.price)}`)
+        return
+      }
+      setResult({
+        title: filled < o.qty ? 'Partial Fill' : 'Order Filled',
+        lines: [
+          { k: 'Instrument', v: selected },
+          { k: 'Side', v: o.side.toUpperCase(), tone: o.side === 'buy' ? 'up' : 'destructive' },
+          { k: 'Filled', v: filled < o.qty ? `${filled} of ${o.qty}` : String(filled) },
+          { k: 'Avg Fill', v: usd(avg?.avgFillPrice ?? o.price) },
+          ...pnlLines,
+        ],
+        note: nudge,
+      })
     } catch {
       // A POST is not auto-retried (it may have landed). Flag the connection and
       // tell the user to check the book before resubmitting, so we never risk a
@@ -763,6 +838,14 @@ function Terminal() {
               snap?.round.commissionEnabled ?? false,
             ),
           ]}
+        />
+      )}
+      {result && (
+        <ResultDialog
+          title={result.title}
+          lines={result.lines}
+          note={result.note}
+          onClose={() => setResult(null)}
         />
       )}
       {announcement && (

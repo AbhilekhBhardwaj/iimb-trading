@@ -88,6 +88,16 @@ export interface PlaceOrderResult {
   status?: Order['status']
   remainingQty?: number
   trades?: Trade[]
+  /**
+   * Top-of-book on the far side the instant BEFORE this order matched — best ask
+   * for a buy, best bid for a sell. MARKET orders only, and absent when that
+   * side of the book was empty.
+   *
+   * Captured server-side because only this process knows the book at match time;
+   * the terminal's depth poll can be up to a second stale, which would make the
+   * slippage nudge quietly wrong.
+   */
+  bestPriceAtSubmit?: number
 }
 
 /** A position enriched with its INR cost basis, posted margin and liquidation price. */
@@ -700,17 +710,27 @@ export class TradingService {
       roundId,
     })
 
-    // 7. Match.
+    // 7. Top-of-book on the far side, captured BEFORE matching consumes it —
+    // this is the price the taker could have got with a limit order, and the
+    // baseline the terminal's slippage nudge measures against. Market orders
+    // only: a limit order guarantees its own price, so it cannot slip.
+    let bestPriceAtSubmit: number | undefined
+    if (order.type === 'market') {
+      const book = this.engine.getDepth(input.ticker)
+      bestPriceAtSubmit = (order.side === 'buy' ? book.asks[0] : book.bids[0])?.price
+    }
+
+    // 8. Match.
     const trades =
       order.type === 'limit'
         ? this.engine.placeLimitOrder(order)
         : this.engine.placeMarketOrder(order)
 
-    // 8. Persist every resulting trade + both sides' positions. The taker (this
+    // 9. Persist every resulting trade + both sides' positions. The taker (this
     // order) is the aggressor, which drives the Times & Sales Buy/Sell column.
     for (const trade of trades) await this.persistTrade(trade, instrumentId, roundId, order.side)
 
-    // 9. Sync the taker and every matched maker's status/remaining to the DB.
+    // 10. Sync the taker and every matched maker's status/remaining to the DB.
     const affected = new Set<string>([order.id])
     for (const t of trades) {
       affected.add(t.buyOrderId)
@@ -724,6 +744,7 @@ export class TradingService {
       status: order.status,
       remainingQty: order.remainingQty,
       trades,
+      bestPriceAtSubmit,
     }
   }
 

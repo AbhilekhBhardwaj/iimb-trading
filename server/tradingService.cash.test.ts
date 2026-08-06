@@ -688,6 +688,66 @@ describe('service: trade history charges commission on the FULL fill', () => {
   })
 })
 
+describe('service: bestPriceAtSubmit captures top-of-book before matching', () => {
+  it('a market BUY reports the best ASK that was showing', async () => {
+    const { svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    // Two ask levels rested by B; the taker will walk both.
+    await svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'sell', type: 'limit', price: 230, qty: 5, leverage: 1 })
+    await svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'sell', type: 'limit', price: 232, qty: 5, leverage: 1 })
+
+    const res = await svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'buy', type: 'market', qty: 10, leverage: 1, markPrice: 232 })
+    expect(res.accepted).toBe(true)
+    expect(res.bestPriceAtSubmit).toBe(230) // the level BEFORE the walk consumed it
+    expect(res.trades?.map((t) => t.price)).toEqual([230, 232])
+  })
+
+  it('a market SELL reports the best BID that was showing', async () => {
+    const { svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'buy', type: 'limit', price: 229, qty: 5, leverage: 1 })
+    await svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'buy', type: 'limit', price: 227, qty: 5, leverage: 1 })
+
+    const res = await svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'sell', type: 'market', qty: 10, leverage: 1, markPrice: 227 })
+    expect(res.bestPriceAtSubmit).toBe(229)
+    expect(res.trades?.map((t) => t.price)).toEqual([229, 227])
+  })
+
+  it('is absent for a LIMIT order, which cannot slip', async () => {
+    const { svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'sell', type: 'limit', price: 230, qty: 10, leverage: 1 })
+
+    const res = await svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'buy', type: 'limit', price: 230, qty: 10, leverage: 1 })
+    expect(res.accepted).toBe(true)
+    expect(res.bestPriceAtSubmit).toBeUndefined()
+  })
+
+  it('is absent when that side of the book is empty', async () => {
+    const { svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    const res = await svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'buy', type: 'market', qty: 10, leverage: 1, markPrice: 230 })
+    expect(res.bestPriceAtSubmit).toBeUndefined()
+    expect(res.trades ?? []).toHaveLength(0)
+  })
+
+  it('equals the single fill price on a clean top-of-book fill', async () => {
+    const { svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'sell', type: 'limit', price: 230, qty: 50, leverage: 1 })
+
+    const res = await svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'buy', type: 'market', qty: 10, leverage: 1, markPrice: 230 })
+    expect(res.bestPriceAtSubmit).toBe(230)
+    expect(res.trades?.map((t) => t.price)).toEqual([230]) // no slippage to report
+  })
+})
+
 describe('service: chargesInr counts every fill, not just realizing ones', () => {
   it('counts an opening fill that has no history record at all', async () => {
     const { svc } = harness({ rate: 83, commission: true })

@@ -245,6 +245,13 @@ export interface PlaceOrderResult {
   status?: string
   remainingQty?: number
   trades?: { price: number; qty: number }[]
+  /**
+   * Top-of-book on the far side immediately before this order matched — best ask
+   * for a buy, best bid for a sell. MARKET orders only, absent when that side was
+   * empty. Measured server-side at match time, so the slippage nudge does not
+   * depend on a possibly-stale depth poll.
+   */
+  bestPriceAtSubmit?: number
 }
 
 async function authHeaders(): Promise<Record<string, string>> {
