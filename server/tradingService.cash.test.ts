@@ -511,7 +511,7 @@ describe('service: portfolio has no unrealized P&L, and charges are real', () =>
     expect(p.rate).toBe(83)
   })
 
-  it('chargesInr reports commission actually charged (was stubbed to 0)', async () => {
+  it('chargesInr reports commission actually charged, on BOTH fills', async () => {
     const { db, svc } = harness({ rate: 83, commission: true })
     await svc.loadInstruments()
     await svc.startRound(0)
@@ -519,13 +519,13 @@ describe('service: portfolio has no unrealized P&L, and charges are real', () =>
     await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
 
     const p = (await svc.portfolio(A)) as Record<string, any>
-    expect(p.chargesInr).toBeGreaterThan(0)
-    // Commission on the closing fill: 0.003 × 10 × 240 × 83.
-    expect(p.chargesInr).toBeCloseTo(0.003 * 10 * 240 * 83, 6)
+    const openCharge = 0.003 * 10 * 230 * 83 // ₹572.70 — the opening buy
+    const closeCharge = 0.003 * 10 * 240 * 83 // ₹597.60 — the closing sell
+    expect(p.chargesInr).toBeCloseTo(openCharge + closeCharge, 6) // ₹1,170.30
+    expect(p.chargesInr).not.toBeCloseTo(closeCharge, 6) // the old, understated figure
 
     // And it really was deducted from realized P&L, not just displayed.
-    const grossLessCharges = 8_300 - (0.003 * 10 * 230 * 83 + 0.003 * 10 * 240 * 83)
-    expect(Number(db.profile(A)!.realized_pnl_inr)).toBeCloseTo(grossLessCharges, 6)
+    expect(Number(db.profile(A)!.realized_pnl_inr)).toBeCloseTo(8_300 - (openCharge + closeCharge), 6)
   })
 
   it('trade history reconstructs P&L exactly, matching the stored total', async () => {
@@ -594,5 +594,231 @@ describe('service: the rate is pinned, persisted, and survives restart', () => {
     const reads = [svc.rateInr(), svc.rateInr(), svc.rateInr()]
     expect(new Set(reads).size).toBe(1)
     expect(reads[0]).toBe(83)
+  })
+})
+
+describe('service: trade history charges commission on the FULL fill', () => {
+  /**
+   * A flip: long 10, then sell 15 — 10 units close and 5 open a short. The live
+   * path charges commission on all 15, so the reconstructed history must too.
+   * Charging only the closed 10 under-reported it on the Portfolio.
+   */
+  it('reports the full-fill charge on a flip-through-zero, not the closed portion', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 15, price: 240, leverage: 1 })
+
+    const history = await svc.tradeHistory(A)
+    const flip = history.find((h) => h.qty === 10)!
+    expect(flip).toBeDefined()
+
+    const fullFill = 0.003 * 15 * 240 * 83 // ₹896.40 — what settleFill actually charged
+    const closedOnly = 0.003 * 10 * 240 * 83 // ₹597.60 — the old, understated figure
+    expect(flip.commissionInr).toBeCloseTo(fullFill, 6)
+    expect(flip.commissionInr).not.toBeCloseTo(closedOnly, 6)
+    expect(flip.commissionInr).toBeGreaterThan(closedOnly)
+  })
+
+  it('nets the full-fill commission out of the flip record realized P&L', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 15, price: 240, leverage: 1 })
+
+    const flip = (await svc.tradeHistory(A)).find((h) => h.qty === 10)!
+    expect(flip.grossPnlInr).toBeCloseTo(8_300, 6) // (240 − 230) × 10 × 83, closed units
+    expect(flip.realizedPnlInr).toBeCloseTo(8_300 - 0.003 * 15 * 240 * 83, 6)
+    expect(flip.realizedPnlInr).toBeCloseTo(flip.grossPnlInr - flip.commissionInr, 9)
+  })
+
+  it('leaves an ordinary close unchanged, where fill qty and closed qty agree', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    const close = (await svc.tradeHistory(A))[0]
+    expect(close.commissionInr).toBeCloseTo(0.003 * 10 * 240 * 83, 6)
+  })
+
+  it('leaves a partial reduce unchanged — the fill closes exactly what it sells', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 4, price: 240, leverage: 1 })
+
+    const reduce = (await svc.tradeHistory(A))[0]
+    expect(reduce.qty).toBe(4)
+    expect(reduce.commissionInr).toBeCloseTo(0.003 * 4 * 240 * 83, 6)
+  })
+
+  it('still charges nothing when the round has commission disabled', async () => {
+    const { svc } = harness({ rate: 83, commission: false })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 15, price: 240, leverage: 1 })
+
+    const flip = (await svc.tradeHistory(A)).find((h) => h.qty === 10)!
+    expect(flip.commissionInr).toBe(0)
+    expect(flip.realizedPnlInr).toBe(flip.grossPnlInr)
+  })
+
+  it('chargesInr on the Portfolio picks up the corrected flip charge', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 15, price: 240, leverage: 1 })
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    // Opening buy (10 @ 230) plus the full flip fill (15 @ 240).
+    expect(p.chargesInr).toBeCloseTo(0.003 * 10 * 230 * 83 + 0.003 * 15 * 240 * 83, 6)
+  })
+})
+
+describe('service: chargesInr counts every fill, not just realizing ones', () => {
+  it('counts an opening fill that has no history record at all', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    expect(p.tradeHistory).toHaveLength(0) // nothing realized yet
+    expect(p.chargesInr).toBeCloseTo(0.003 * 10 * 230 * 83, 6) // but a fee WAS charged
+  })
+
+  it('accumulates across several opening fills before anything is closed', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: A, seller: B, qty: 5, price: 240, leverage: 1 })
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    expect(p.tradeHistory).toHaveLength(0)
+    expect(p.chargesInr).toBeCloseTo(0.003 * 10 * 230 * 83 + 0.003 * 5 * 240 * 83, 6)
+  })
+
+  it('is zero when the round has commission disabled, however many fills', async () => {
+    const { svc } = harness({ rate: 83, commission: false })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    expect(p.chargesInr).toBe(0)
+  })
+
+  it('is zero for an account that has never traded', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    expect(p.chargesInr).toBe(0)
+    expect(p.tradeHistory).toHaveLength(0)
+  })
+
+  it('charges both counterparties independently for the same fill', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+
+    const pa = (await svc.portfolio(A)) as Record<string, any>
+    const pb = (await svc.portfolio(B)) as Record<string, any>
+    expect(pa.chargesInr).toBeCloseTo(0.003 * 10 * 230 * 83, 6)
+    expect(pb.chargesInr).toBeCloseTo(pa.chargesInr, 6)
+  })
+})
+
+describe('service: chargesInr and tradeHistory measure different things', () => {
+  /**
+   * By design these no longer reconcile against each other: history omits fills
+   * that realized nothing, while charges counts every fee taken. The invariant
+   * that still holds is gross − charges === the stored realized P&L.
+   */
+  it('chargesInr exceeds the commission visible in the history rows', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    const historyCommission = p.tradeHistory.reduce((s: number, h: any) => s + h.commissionInr, 0)
+    expect(historyCommission).toBeCloseTo(0.003 * 10 * 240 * 83, 6) // closing fill only
+    expect(p.chargesInr).toBeGreaterThan(historyCommission)
+    // The gap is exactly the opening fill's fee, which has no history row.
+    expect(p.chargesInr - historyCommission).toBeCloseTo(0.003 * 10 * 230 * 83, 6)
+  })
+
+  it('sum(history.realizedPnlInr) does NOT equal the stored realized P&L', async () => {
+    const { db, svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    const history = await svc.tradeHistory(A)
+    const summedNet = history.reduce((s, h) => s + h.realizedPnlInr, 0)
+    const stored = Number(db.profile(A)!.realized_pnl_inr)
+    expect(summedNet).toBeCloseTo(8_300 - 0.003 * 10 * 240 * 83, 6) // ₹7,702.40
+    expect(stored).toBeCloseTo(8_300 - (0.003 * 10 * 230 * 83 + 0.003 * 10 * 240 * 83), 6) // ₹7,129.70
+    expect(summedNet).not.toBeCloseTo(stored, 2)
+  })
+
+  it('reconciles via gross − charges === stored realized P&L', async () => {
+    const { db, svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    const summedGross = p.tradeHistory.reduce((s: number, h: any) => s + h.grossPnlInr, 0)
+    expect(summedGross - p.chargesInr).toBeCloseTo(Number(db.profile(A)!.realized_pnl_inr), 6)
+  })
+
+  it('reconciles the same way through a flip and a staged close', async () => {
+    const { db, svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 15, price: 240, leverage: 1 }) // flips A short 5
+    await cross(svc, { buyer: A, seller: B, qty: 5, price: 220, leverage: 1 }) // covers the short
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    const summedGross = p.tradeHistory.reduce((s: number, h: any) => s + h.grossPnlInr, 0)
+    expect(summedGross - p.chargesInr).toBeCloseTo(Number(db.profile(A)!.realized_pnl_inr), 6)
+  })
+
+  it('reconciles when the Master moves the rate between fills', async () => {
+    const { db, svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await svc.setUsdInrRate(90)
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    const summedGross = p.tradeHistory.reduce((s: number, h: any) => s + h.grossPnlInr, 0)
+    expect(summedGross - p.chargesInr).toBeCloseTo(Number(db.profile(A)!.realized_pnl_inr), 6)
+    // Each fill was charged at its OWN rate, not today's.
+    expect(p.chargesInr).toBeCloseTo(0.003 * 10 * 230 * 83 + 0.003 * 10 * 240 * 90, 6)
   })
 })

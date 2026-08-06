@@ -207,7 +207,11 @@ export interface Portfolio {
   xirr: number | null
   leverageReq: number
   openPositions: number
-  /** Commission actually charged, summed from closed trades. */
+  /**
+   * Commission actually charged, summed across EVERY fill — opening ones too,
+   * which realize nothing and so never appear in `tradeHistory`. Deliberately
+   * not equal to the commission visible in the history rows.
+   */
   chargesInr: number
   tradeHistory: TradeHistoryEntry[]
 }

@@ -28,6 +28,7 @@ import {
   MatchingEngine,
   RoundController,
   applyCashFill,
+  commissionInrFor,
   effectiveEntryRate,
   isLiquidatable,
   liquidationPrice,
@@ -49,6 +50,19 @@ import { COMMISSION_RATE, MAINTENANCE_MARGIN_RATE, USD_INR } from './config'
 
 type Severity = 'info' | 'warning' | 'error'
 const EPS = 1e-9
+
+/** One closed (or reduced) position, reconstructed from the trades table. */
+interface TradeHistoryEntry {
+  ticker: string
+  side: 'long' | 'short'
+  entryPriceInr: number
+  exitPriceInr: number
+  qty: number
+  grossPnlInr: number
+  commissionInr: number
+  realizedPnlInr: number
+  closedAt: number
+}
 
 export interface PlaceOrderInput {
   /** profiles.id / auth user uuid of the account placing the order. */
@@ -1001,15 +1015,16 @@ export class TradingService {
     // These four reads are INDEPENDENT — run them concurrently. Each is a remote
     // Supabase round-trip (~180ms); done serially they were this endpoint's
     // dominant cost (~4× latency ≈ 0.75s). One round-trip's worth now.
-    const [openingBalanceInr, positionsRes, t0, tradeHistory] = await Promise.all([
+    const [openingBalanceInr, positionsRes, t0, replay] = await Promise.all([
       this.startingCashInr(accountId),
       this.db
         .from('positions')
         .select('instrument_id, qty, avg_price, leverage, notional_basis_inr')
         .eq('account_id', accountId),
       this.eventStartMs(),
-      this.tradeHistory(accountId),
+      this.historyAndCharges(accountId),
     ])
+    const { history: tradeHistory, chargesInr } = replay
     if (positionsRes.error) throw positionsRes.error
     const data = positionsRes.data
     const posByTicker = new Map(
@@ -1067,9 +1082,9 @@ export class TradingService {
     const cashInr = totalPortfolioValueInr - marginUsedInr - marginReservedInr
     const totalPnlInr = realizedPnlInr
     const totalPnlPct = openingBalanceInr > 0 ? (totalPnlInr / openingBalanceInr) * 100 : 0
-    // Commission actually charged, summed from the reconstructed history — this
-    // was previously stubbed to 0 while commission was really being deducted.
-    const chargesInr = tradeHistory.reduce((s, t) => s + t.commissionInr, 0)
+    // chargesInr comes from the trades replay above, NOT from tradeHistory:
+    // history only records fills that realized something, so summing it dropped
+    // the commission charged on opening fills entirely.
 
     // XIRR: starting capital out at event start, current total value in as of now.
     // t0 was fetched concurrently above.
@@ -1173,16 +1188,36 @@ export class TradingService {
    * approximation at today's rate. Every fill that closes/reduces/flips emits one
    * closed-trade record. Most recent first, all amounts INR.
    */
-  async tradeHistory(
+  async tradeHistory(accountId: string): Promise<TradeHistoryEntry[]> {
+    return (await this.historyAndCharges(accountId)).history
+  }
+
+  /**
+   * One replay of an account's fills producing BOTH the closed-trade history and
+   * the total commission charged.
+   *
+   * They are deliberately different measures and must not be derived from each
+   * other:
+   *
+   *   history  — one record per fill that closed or reduced a position. An
+   *              opening fill produces no record, because nothing was realized.
+   *   charges  — every rupee of commission the engine actually took, across ALL
+   *              fills including pure opens. Deriving this from `history` used to
+   *              silently drop the commission on opening fills.
+   *
+   * The invariant that ties them back to the ledger is
+   * `Σ history.grossPnlInr − chargesInr === profiles.realized_pnl_inr`.
+   */
+  private async historyAndCharges(
     accountId: string,
-  ): Promise<{ ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; grossPnlInr: number; commissionInr: number; realizedPnlInr: number; closedAt: number }[]> {
+  ): Promise<{ history: TradeHistoryEntry[]; chargesInr: number }> {
     const { data: myOrders, error: oErr } = await this.db
       .from('orders')
       .select('id, leverage')
       .eq('account_id', accountId)
     if (oErr) throw oErr
     const ids = (myOrders ?? []).map((o) => o.id as string)
-    if (ids.length === 0) return []
+    if (ids.length === 0) return { history: [], chargesInr: 0 }
     const idSet = new Set(ids)
     const leverageByOrder = new Map((myOrders ?? []).map((o) => [o.id as string, Number(o.leverage)]))
     const inList = `(${ids.join(',')})`
@@ -1203,31 +1238,43 @@ export class TradingService {
     if (tErr) throw tErr
 
     const pos = new Map<string, CashPosition>()
-    const history: { ticker: string; side: 'long' | 'short'; entryPriceInr: number; exitPriceInr: number; qty: number; grossPnlInr: number; commissionInr: number; realizedPnlInr: number; closedAt: number }[] = []
+    const history: TradeHistoryEntry[] = []
+    let chargesInr = 0
+
     for (const t of trades ?? []) {
       const isBuyer = idSet.has(t.buy_order_id as string)
       const isSeller = idSet.has(t.sell_order_id as string)
-      if (isBuyer === isSeller) continue // both (self-trade) or neither → net zero for this account
+      if (!isBuyer && !isSeller) continue // not this account's fill at all
+
       const price = Number(t.price)
-      const signed = isBuyer ? Number(t.qty) : -Number(t.qty)
-      const ticker = this.idToTicker.get(t.instrument_id as string) ?? (t.instrument_id as string)
-      const myOrderId = (isBuyer ? t.buy_order_id : t.sell_order_id) as string
-      const leverage = leverageByOrder.get(myOrderId) ?? 1
       // The rate this fill settled at, with graceful fallbacks for pre-migration rows.
       const fillRate =
         t.usd_inr_rate !== null && t.usd_inr_rate !== undefined
           ? Number(t.usd_inr_rate)
           : (rateByRound.get(t.round_id as string) ?? USD_INR)
+      // Charged on the FULL fill notional, matching settleFill — not just the
+      // portion that closes, which differs when a fill flips through zero.
+      const commissionInr = commissionInrFor(
+        Number(t.qty),
+        price,
+        fillRate,
+        commissionByRound.get(t.round_id as string) ?? false,
+      )
+
+      // Commission is charged per SIDE. If this account somehow sat on both sides
+      // of one fill, settleFill charged it twice, so count it twice here.
+      chargesInr += commissionInr * ((isBuyer ? 1 : 0) + (isSeller ? 1 : 0))
+
+      if (isBuyer === isSeller) continue // self-trade → no net position effect
+
+      const signed = isBuyer ? Number(t.qty) : -Number(t.qty)
+      const ticker = this.idToTicker.get(t.instrument_id as string) ?? (t.instrument_id as string)
+      const myOrderId = (isBuyer ? t.buy_order_id : t.sell_order_id) as string
+      const leverage = leverageByOrder.get(myOrderId) ?? 1
 
       const cur = pos.get(ticker) ?? { qty: 0, avgPrice: 0, notionalBasisInr: 0, leverage }
       const next = applyCashFill(cur, signed, price, fillRate, leverage)
       if (next.realizedPnlInr !== 0) {
-        const closedQty = next.closedQty
-        // Commission on the closing portion of this fill, if that round charged
-        // it — computed on the same INR notional the live path uses.
-        const commissionInr = commissionByRound.get(t.round_id as string)
-          ? COMMISSION_RATE * closedQty * price * fillRate
-          : 0
         const gross = next.realizedPnlInr
         const perUnitBasisInr = cur.notionalBasisInr / cur.qty
         history.push({
@@ -1236,7 +1283,7 @@ export class TradingService {
           // Entry in INR at the rate it was ENTERED at; exit at this fill's rate.
           entryPriceInr: perUnitBasisInr,
           exitPriceInr: price * fillRate,
-          qty: closedQty,
+          qty: next.closedQty,
           grossPnlInr: gross,
           commissionInr,
           realizedPnlInr: gross - commissionInr, // net: proceeds − basis − charges
@@ -1250,7 +1297,7 @@ export class TradingService {
         leverage: next.leverage,
       })
     }
-    return history.reverse() // most recent first
+    return { history: history.reverse(), chargesInr } // most recent first
   }
 
   // -------------------------------------------------------------------------
@@ -1291,9 +1338,7 @@ export class TradingService {
     // active round has commission enabled. A cost, so it is deducted from each
     // account's realized P&L at the time of the fill. INR, like everything else
     // that settles.
-    const commissionInr = this.rounds.isCommissionActive()
-      ? COMMISSION_RATE * trade.qty * trade.price * rate
-      : 0
+    const commissionInr = commissionInrFor(trade.qty, trade.price, rate, this.rounds.isCommissionActive())
 
     // Buyer gains qty, seller loses qty — each valued at the execution price and
     // using ITS OWN order's leverage (matters only when the fill opens/flips).

@@ -230,3 +230,84 @@ export function applyCashFill(
     marginReleasedInr,
   }
 }
+
+// ---------------------------------------------------------------------------
+// Commission
+// ---------------------------------------------------------------------------
+
+/**
+ * Commission charged on every executed fill, per side, as a fraction of trade
+ * notional (qty × price) — applied only while the active round has commission
+ * enabled. 0.003 = 0.30%, the middle of IIMB's 0.2–0.5% range. Change this one
+ * line to set any rate (e.g. 0.002 for 0.2%, 0.005 for 0.5%).
+ *
+ * Lives in the engine rather than server/config.ts because both the settlement
+ * path and the terminal's order-confirmation preview need it; server/config.ts
+ * re-exports it so the two cannot drift apart.
+ */
+export const COMMISSION_RATE = 0.003
+
+/**
+ * Commission in INR for a fill.
+ *
+ * Charged on the FULL fill notional, matching the live settlement path — not
+ * just the portion that closes a position. The two differ only when an order
+ * flips through zero.
+ *
+ * When the round's commission toggle is off this is 0, because the toggle
+ * governs whether commission is CHARGED, not merely whether it is displayed.
+ */
+export function commissionInrFor(
+  fillQty: number,
+  price: number,
+  usdInrRate: number,
+  commissionEnabled: boolean,
+): number {
+  if (!commissionEnabled) return 0
+  return COMMISSION_RATE * Math.abs(fillQty) * price * usdInrRate
+}
+
+/** Gross / commission / net split for a fill that closes or reduces a position. */
+export interface ClosingPnlBreakdown {
+  /** Units of the pre-existing position this fill closes. */
+  closedQty: number
+  /** P&L on the closed units before charges, INR at this fill's rate. */
+  grossPnlInr: number
+  /** Commission on the fill, INR. 0 when the round has commission disabled. */
+  commissionInr: number
+  /** grossPnlInr − commissionInr: what actually lands in realized P&L. */
+  netPnlInr: number
+}
+
+/**
+ * Realized-P&L preview for an order, for the terminal's confirmation popup.
+ *
+ * Returns null when the fill opens or adds to a position — nothing is realized,
+ * so there is no breakdown to show. Gross comes straight out of `applyCashFill`,
+ * so the preview and the settlement path cannot diverge.
+ *
+ * `delta` is the signed order quantity (> 0 buy, < 0 sell), `price` the expected
+ * fill price in USD, and `usdInrRate` the round's pinned rate. This is a preview
+ * of a single complete fill: a partially-filled order realizes proportionally
+ * less.
+ */
+export function closingPnlBreakdown(
+  current: CashPosition,
+  delta: number,
+  price: number,
+  usdInrRate: number,
+  fillLeverage: number,
+  commissionEnabled: boolean,
+): ClosingPnlBreakdown | null {
+  const outcome = applyCashFill(current, delta, price, usdInrRate, fillLeverage)
+  if (outcome.closedQty === 0) return null
+
+  const grossPnlInr = outcome.realizedPnlInr
+  const commissionInr = commissionInrFor(delta, price, usdInrRate, commissionEnabled)
+  return {
+    closedQty: outcome.closedQty,
+    grossPnlInr,
+    commissionInr,
+    netPnlInr: grossPnlInr - commissionInr,
+  }
+}

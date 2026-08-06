@@ -19,8 +19,9 @@ export const MAINTENANCE_MARGIN_RATE = 0
 
 /**
  * Commission charged on every executed fill, per side, as a fraction of trade
- * notional (qty × price) — applied only while the active round has commission
- * enabled. 0.003 = 0.30%, the middle of IIMB's 0.2–0.5% range. Change this one
- * line to set any rate (e.g. 0.002 for 0.2%, 0.005 for 0.5%).
+ * notional. Defined in the shared engine (packages/engine/src/cash.ts) because
+ * the terminal's order-confirmation preview needs the same rate the settlement
+ * path charges; re-exported here so server-side imports keep their existing
+ * `from './config'` path and there is still exactly one definition.
  */
-export const COMMISSION_RATE = 0.003
+export { COMMISSION_RATE } from '@iimb-trading/engine'

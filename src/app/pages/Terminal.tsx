@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { applyLeveredFill, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
+import { orderPnlLines, toCashPosition } from '../../lib/orderConfirm'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
 import { Panel } from '../components/Panel'
@@ -750,6 +751,17 @@ function Terminal() {
             { k: 'Leverage', v: `${pending.leverage}x` },
             { k: 'Margin Required', v: marginLabel(pending.requiredInr) },
             { k: 'Est. Liquidation', v: liqLabel(pending.closes, pending.liq) },
+            // Realized-P&L preview. Closing or reducing shows Gross / Commission /
+            // Net; an opening fill shows the commission alone. Commission appears
+            // only while the round charges it. Empty otherwise, so nothing renders.
+            ...orderPnlLines(
+              toCashPosition(row?.position),
+              pending.side === 'buy' ? pending.qty : -pending.qty,
+              pending.price,
+              snap?.rate ?? 83,
+              pending.leverage,
+              snap?.round.commissionEnabled ?? false,
+            ),
           ]}
         />
       )}
