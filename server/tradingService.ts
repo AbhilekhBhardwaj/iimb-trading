@@ -289,6 +289,28 @@ export class TradingService {
     if (error) throw error
     const rows = new Map((data ?? []).map((r) => [r.id as string, r]))
 
+    // Rounds the Master created by starting past the end of the configured
+    // schedule (real-4, real-5, …) exist ONLY in the database — a fresh
+    // controller is built from the static config and knows nothing about them.
+    // Re-append them, in index order and with their persisted settings, before
+    // reconciling; otherwise they would look like unknown rounds and an active
+    // one would abort the boot.
+    const known = new Set(this.rounds.getSchedule().map((r) => r.id))
+    for (const row of [...(data ?? [])].sort((a, b) => Number(a.index) - Number(b.index))) {
+      const id = row.id as string
+      if (known.has(id)) continue
+      this.rounds.appendRound({
+        id,
+        mode: row.mode as RoundMode,
+        durationSeconds: Number(row.duration_seconds),
+        commissionEnabled: row.commission_enabled as boolean,
+        usdInrRate: Number(row.usd_inr_rate),
+        commissionRate: Number(row.commission_rate),
+        slippageEnabled: row.slippage_enabled as boolean,
+      })
+      known.add(id)
+    }
+
     const schedule = this.rounds.getSchedule()
     const active = (data ?? []).find((r) => r.status === 'active')
     const activeIdx = active ? schedule.findIndex((r) => r.id === active.id) : -1
@@ -590,6 +612,97 @@ export class TradingService {
    */
   private commissionTerms(): CommissionTerms {
     return { enabled: this.rounds.isCommissionActive(), rate: this.commissionRate() }
+  }
+
+  /**
+   * Master control: reset the whole event back to a clean start.
+   *
+   * DESTRUCTIVE and irreversible. Clears every trade, order and position, zeroes
+   * realized P&L (which restores each team's cash to starting_cash, since cash is
+   * derived as opening + realized − margin), ends any active round and returns
+   * the schedule to all-pending.
+   *
+   * Deliberately preserved: profiles/accounts, instruments and their reference
+   * prices, and the event_log — the audit trail must survive a reset, and the
+   * reset itself is recorded in it.
+   *
+   * Resets BOTH the database and this process's in-memory state. Clearing only
+   * the database is what has repeatedly produced a desynced server: round
+   * progress and the order books live in memory and are rebuilt only by
+   * rehydrate() at boot, so a DB-only wipe leaves the process believing rounds
+   * are consumed and orders still resting.
+   */
+  async resetEvent(caller: { accountId: string; role: string }): Promise<{
+    applied: boolean
+    reason?: string
+    cleared?: {
+      trades: number
+      orders: number
+      positions: number
+      rounds: number
+      notifications: number
+      accountsReset: number
+    }
+  }> {
+    if (caller.role !== 'master') return { applied: false, reason: 'forbidden' }
+
+    // Count first, so the audit entry records what was actually destroyed.
+    const countOf = async (table: string): Promise<number> => {
+      const { count } = await this.db.from(table).select('*', { count: 'exact', head: true })
+      return count ?? 0
+    }
+    const cleared = {
+      trades: await countOf('trades'),
+      orders: await countOf('orders'),
+      positions: await countOf('positions'),
+      rounds: await countOf('rounds'),
+      notifications: await countOf('notifications'),
+      accountsReset: 0,
+    }
+
+    // --- 1. In-memory first, so nothing can keep trading mid-reset -----------
+    // Drop every resting order from the books before the rows disappear.
+    for (const o of this.orders.values()) this.engine.cancelOrder(o.id)
+    this.orders.clear()
+    this.orderLeverage.clear()
+    this.realizedPnlInr.clear()
+    this.rounds.resetSchedule()
+    this.activeRoundId = null
+    this.nowSeconds = 0
+    this.roundStartedAtMs = null
+    this.roundDurationSeconds = 0
+    this.roundStartedAtSecond = 0
+    // Marks go back to each instrument's seed price, not the last trade of a
+    // run that no longer exists.
+    for (const [ticker, meta] of this.instrumentMeta) this.lastPrice.set(ticker, meta.referencePrice)
+
+    // --- 2. Database, in FK-safe order ---------------------------------------
+    // trades reference orders AND rounds; orders reference rounds.
+    const ALL = '00000000-0000-0000-0000-000000000000'
+    for (const [table, col, sentinel] of [
+      ['trades', 'id', ALL],
+      ['orders', 'id', ALL],
+      ['positions', 'account_id', ALL],
+      // Announcements and news from a previous run would otherwise still pop up
+      // on team terminals after a reset.
+      ['notifications', 'id', ALL],
+      ['rounds', 'id', ''],
+    ] as const) {
+      const { error } = await this.db.from(table).delete().neq(col, sentinel)
+      if (error) throw error
+    }
+
+    const { data: reset, error: pErr } = await this.db
+      .from('profiles')
+      .update({ realized_pnl: 0, realized_pnl_inr: 0 })
+      .neq('id', ALL)
+      .select('id')
+    if (pErr) throw pErr
+    cleared.accountsReset = (reset ?? []).length
+
+    // --- 3. Audit, written AFTER the wipe so it survives ---------------------
+    await this.log(caller.accountId, 'event_reset', 'warning', { ...cleared })
+    return { applied: true, cleared }
   }
 
   /**

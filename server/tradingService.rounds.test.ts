@@ -404,11 +404,21 @@ describe('(b) rehydrate reconciles finished rounds so none is replayed', () => {
     expect(recovered[0].payload).toMatchObject({ roundsRestored: 1 })
   })
 
-  it('throws if the active round is not in the configured schedule', async () => {
+  /**
+   * Used to throw. Now that the Master can extend the schedule by starting past
+   * its end, a round in the DB but not in the static config is the NORMAL result
+   * of a restart — it is re-appended and restored rather than aborting the boot.
+   */
+  it('restores an active round that is not in the configured schedule', async () => {
     const { svc } = makeService({
       rounds: [roundRow({ id: 'real-99', index: 9, status: 'active', ended_at: null })],
     })
-    await expect(svc.rehydrate()).rejects.toThrow(/real-99 not in RoundController config/)
+    await expect(svc.rehydrate()).resolves.toMatchObject({ roundsRestored: 1 })
+
+    const status = svc.getRoundStatus()
+    expect(status.active).toBe(true)
+    expect(status.id).toBe('real-99')
+    expect(svc.getSchedule().some((r) => r.id === 'real-99')).toBe(true)
   })
 })
 

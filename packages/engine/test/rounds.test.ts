@@ -165,13 +165,18 @@ describe('RoundController — activation order & single-active invariant', () =>
     expect(() => rc.startNextRound(10)).toThrow(/already active/)
   })
 
-  it('startNextRound throws once no pending rounds remain', () => {
+  it('startNextRound EXTENDS the schedule once no pending rounds remain', () => {
     const rc = new RoundController([
-      { mode: 'silent', durationSeconds: 100, commissionEnabled: false },
+      { id: 'real-1', mode: 'silent', durationSeconds: 100, commissionEnabled: false },
     ])
     rc.startNextRound(0)
     rc.advanceTime(100)
-    expect(() => rc.startNextRound(100)).toThrow(/no pending rounds/)
+
+    // Used to throw; now it appends and starts a fresh round.
+    const extra = rc.startNextRound(100)
+    expect(extra.id).toBe('real-2')
+    expect(rc.getSchedule()).toHaveLength(2)
+    expect(rc.getCurrentRound()?.id).toBe('real-2')
   })
 })
 
@@ -295,10 +300,136 @@ describe('RoundController — createEventConfig & full run', () => {
       expect(rc.getCurrentRound()).toBeNull()
     }
 
-    // Everything ended, nothing active, and no more rounds can start.
+    // Everything ended, nothing active.
     expect(rc.getCurrentRound()).toBeNull()
     expect(rc.getSchedule().every((r) => r.status === 'ended')).toBe(true)
     expect(rc.getSchedule()).toHaveLength(total)
-    expect(() => rc.startNextRound(clock)).toThrow(/no pending rounds/)
+
+    // And the schedule can still be extended past its configured end.
+    const extra = rc.startNextRound(clock)
+    expect(extra.id).toBe('real-8') // 7 real rounds configured → next is real-8
+    expect(rc.getSchedule()).toHaveLength(total + 1)
+  })
+})
+
+describe('RoundController — extending the schedule past its configured end', () => {
+  /** The standard event: mock-1, real-1, real-2, real-3. */
+  function standardEvent(): RoundController {
+    return new RoundController(
+      createEventConfig(
+        [
+          { mode: 'data_and_news', commissionEnabled: false },
+          { mode: 'only_data', commissionEnabled: true },
+          { mode: 'silent', commissionEnabled: true },
+        ],
+        { mockRounds: 1, mockDurationSeconds: 300, realDurationSeconds: 600 },
+      ),
+    )
+  }
+
+  /** Run every pending round to completion, returning the clock. */
+  function drain(rc: RoundController, clock = 0): number {
+    let t = clock
+    while (rc.getSchedule().some((r) => r.status === 'pending')) {
+      const r = rc.startNextRound(t)
+      t += r.durationSeconds
+      rc.advanceTime(t)
+    }
+    return t
+  }
+
+  it('the original four behave exactly as before', () => {
+    const rc = standardEvent()
+    expect(rc.getSchedule().map((r) => r.id)).toEqual(['mock-1', 'real-1', 'real-2', 'real-3'])
+
+    let t = 0
+    for (const id of ['mock-1', 'real-1', 'real-2', 'real-3']) {
+      const r = rc.startNextRound(t)
+      expect(r.id).toBe(id) // no extension while pending rounds remain
+      t += r.durationSeconds
+      rc.advanceTime(t)
+    }
+    expect(rc.getSchedule()).toHaveLength(4)
+  })
+
+  it('starting a 5th round creates real-4', () => {
+    const rc = standardEvent()
+    const t = drain(rc)
+
+    const fifth = rc.startNextRound(t)
+    expect(fifth.id).toBe('real-4')
+    expect(fifth.index).toBe(4)
+    expect(fifth.status).toBe('active')
+    expect(rc.getCurrentRound()?.id).toBe('real-4')
+  })
+
+  it('works repeatedly — 5th, 6th, 7th, 8th', () => {
+    const rc = standardEvent()
+    let t = drain(rc)
+
+    for (const expected of ['real-4', 'real-5', 'real-6', 'real-7']) {
+      const r = rc.startNextRound(t)
+      expect(r.id).toBe(expected)
+      t += r.durationSeconds
+      rc.advanceTime(t)
+    }
+    expect(rc.getSchedule()).toHaveLength(8)
+    expect(rc.getSchedule().map((r) => r.id)).toEqual([
+      'mock-1', 'real-1', 'real-2', 'real-3', 'real-4', 'real-5', 'real-6', 'real-7',
+    ])
+  })
+
+  it('an extension round inherits the LAST REAL round settings, not the mock', () => {
+    const rc = standardEvent()
+    const t = drain(rc)
+    const fifth = rc.startNextRound(t)
+
+    // real-3 is silent / 600s / commission on — mock-1 is data_and_news / 300s / off.
+    expect(fifth.mode).toBe('silent')
+    expect(fifth.durationSeconds).toBe(600)
+    expect(fifth.commissionEnabled).toBe(true)
+  })
+
+  it('carries the Master-set FX and commission rates forward', () => {
+    const rc = standardEvent()
+    drain(rc)
+    rc.setUsdInrRate(91) // lands on the next pending round… none, so nothing yet
+    const t = 10_000
+
+    const fifth = rc.startNextRound(t)
+    expect(fifth.usdInrRate).toBe(83) // inherited from real-3, untouched
+    rc.setUsdInrRate(91) // now targets the ACTIVE extension round
+    expect(rc.getUsdInrRate()).toBe(91)
+    rc.advanceTime(t + fifth.durationSeconds)
+
+    const sixth = rc.startNextRound(t + fifth.durationSeconds)
+    expect(sixth.id).toBe('real-5')
+    expect(sixth.usdInrRate).toBe(91) // inherited from the round before it
+  })
+
+  it('never reuses an id, and numbering ignores mock rounds', () => {
+    const rc = new RoundController(
+      createEventConfig([{ mode: 'silent', commissionEnabled: false }], { mockRounds: 3 }),
+    )
+    expect(rc.getSchedule().map((r) => r.id)).toEqual(['mock-1', 'mock-2', 'mock-3', 'real-1'])
+    const t = drain(rc)
+    expect(rc.startNextRound(t).id).toBe('real-2') // not real-5
+  })
+
+  it('still refuses to start while a round is active', () => {
+    const rc = standardEvent()
+    const t = drain(rc)
+    rc.startNextRound(t)
+    expect(() => rc.startNextRound(t + 1)).toThrow(/already active/)
+  })
+
+  it('an all-mock schedule extends with a real round', () => {
+    const rc = new RoundController([
+      { id: 'mock-1', mode: 'data_and_news', durationSeconds: 300, commissionEnabled: false },
+    ])
+    const t = drain(rc)
+    const next = rc.startNextRound(t)
+    expect(next.id).toBe('real-1')
+    expect(next.durationSeconds).toBe(300) // falls back to the last round of any kind
   })
 })

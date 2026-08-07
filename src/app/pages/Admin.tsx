@@ -94,6 +94,10 @@ function Admin() {
   // Commission rate is edited as a PERCENT ("0.30"), stored as a fraction (0.003).
   const [commissionDraft, setCommissionDraft] = useState('')
   const [savingCommission, setSavingCommission] = useState(false)
+  // Type-to-confirm for the destructive reset. Deliberately NOT seeded, and
+  // cleared after every attempt, so the button is never armed by accident.
+  const [resetConfirm, setResetConfirm] = useState('')
+  const [resetting, setResetting] = useState(false)
   const toastSeq = useRef(0)
   const ready = useRef(false)
   const draftsSeeded = useRef(false)
@@ -338,6 +342,37 @@ function Admin() {
       }
     },
   })
+
+  const RESET_WORD = 'RESET'
+  const resetArmed = resetConfirm.trim().toUpperCase() === RESET_WORD
+
+  const doResetEvent = () => {
+    if (!resetArmed) return
+    setPending({
+      title: 'Reset the entire event?',
+      detail:
+        'Permanently deletes ALL trades, orders, positions and notifications, ' +
+        'zeroes every team’s realized P&L (returning cash to its starting balance), ' +
+        'ends any active round and returns the schedule to all-pending. ' +
+        'Accounts, instruments and the audit log are kept. This cannot be undone.',
+      confirmLabel: 'Reset Event', tone: 'destructive',
+      run: async () => {
+        setResetting(true)
+        try {
+          const res = await api.resetEvent()
+          analytics.capture('event_reset', { ...res.cleared })
+          const c = res.cleared
+          await refresh()
+          toast(true, `Event reset — cleared ${c.trades} trades, ${c.orders} orders, ${c.positions} positions, ${c.notifications} notifications, ${c.rounds} rounds`)
+        } catch (err) {
+          toast(false, err instanceof Error ? err.message : 'Failed to reset event')
+        } finally {
+          setResetting(false)
+          setResetConfirm('') // always disarm, success or failure
+        }
+      },
+    })
+  }
 
   const doPush = () => {
     if (!title.trim()) { toast(false, 'Enter a title first'); return }
@@ -673,6 +708,74 @@ function Admin() {
             </table>
           </div>
         </Panel>
+
+        {/* 8. Danger zone. Last on the page, red-bordered, and armed only by
+             typing RESET — the server independently requires the same word, so
+             this is a second gate rather than the only one. */}
+        <motion.section
+          initial={MOTION.card.initial} animate={MOTION.card.animate} transition={{ duration: 0.45, delay: 0.2, ease: EASE }}
+          className={`${CARD} min-h-0 border-destructive/30`} style={{ boxShadow: CARD_SHADOW }}
+        >
+          <header className="flex shrink-0 items-center justify-between border-b border-destructive/20 px-4 py-2.5">
+            <h2 className="text-[11px] uppercase tracking-[0.18em] text-destructive">Danger Zone</h2>
+            <span className="font-mono text-[10px] text-subtle">irreversible</span>
+          </header>
+          <div className="p-4">
+            <h3 className="text-[13px] font-medium text-bright">Reset Event</h3>
+            <p className="mt-1.5 max-w-2xl text-[12px] leading-relaxed text-muted">
+              Returns the platform to a clean starting point so a test run — or a real event that has gone
+              wrong — can be restarted without touching the database by hand.
+            </p>
+
+            <div className="mt-4 grid max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="rounded-lg border border-destructive/25 bg-destructive/[0.05] px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-destructive">Destroys</div>
+                <ul className="mt-1.5 space-y-0.5 text-[11px] leading-relaxed text-muted">
+                  <li>All trades</li>
+                  <li>All orders, including anything resting</li>
+                  <li>All positions</li>
+                  <li>All notifications and announcements</li>
+                  <li>All realized P&amp;L — cash returns to its starting balance</li>
+                  <li>All round progress — the schedule returns to all-pending</li>
+                </ul>
+              </div>
+              <div className="rounded-lg border border-white/[0.08] bg-white/[0.02] px-3 py-2.5">
+                <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-subtle">Keeps</div>
+                <ul className="mt-1.5 space-y-0.5 text-[11px] leading-relaxed text-muted">
+                  <li>Team accounts and logins</li>
+                  <li>Instruments and their starting prices</li>
+                  <li>The audit log, including this reset</li>
+                </ul>
+              </div>
+            </div>
+
+            <div className="mt-4 flex flex-wrap items-end gap-3">
+              <label className="flex flex-col gap-1.5">
+                <span className="text-[10px] uppercase tracking-wider text-subtle">
+                  Type <span className="font-mono text-destructive">{RESET_WORD}</span> to enable
+                </span>
+                <input
+                  value={resetConfirm}
+                  onChange={(e) => setResetConfirm(e.target.value)}
+                  disabled={resetting}
+                  autoComplete="off"
+                  aria-label={`Type ${RESET_WORD} to enable the reset`}
+                  className={`${INPUT} w-44 font-mono uppercase tracking-[0.14em] disabled:cursor-not-allowed disabled:opacity-40 ${resetArmed ? 'border-destructive/60' : ''}`}
+                />
+              </label>
+              <button
+                onClick={doResetEvent}
+                disabled={!resetArmed || resetting}
+                className="rounded-lg border border-destructive/50 bg-destructive/15 px-5 py-2 text-sm font-medium text-destructive transition-colors hover:bg-destructive/25 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.02] disabled:text-subtle disabled:opacity-60"
+              >
+                {resetting ? 'Resetting…' : 'Reset Event'}
+              </button>
+              <p className="text-[11px] text-subtle">
+                {resetArmed ? 'Armed — you will still be asked to confirm.' : 'Disabled until the word matches.'}
+              </p>
+            </div>
+          </div>
+        </motion.section>
       </main>
 
       {pending && <ConfirmModal pending={pending} onClose={() => setPending(null)} />}

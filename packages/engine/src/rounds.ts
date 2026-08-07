@@ -80,7 +80,11 @@ export class RoundController {
   /** Index of the currently-active round, or null when between rounds. */
   private activeIndex: number | null = null
 
+  /** The definitions this controller was built from, kept for resetSchedule(). */
+  private readonly initialConfig: EventConfig
+
   constructor(config: EventConfig) {
+    this.initialConfig = config.map((d) => ({ ...d }))
     this.rounds = config.map((def, index) => {
       if (def.durationSeconds <= 0) {
         throw new Error(`round ${index} duration must be positive`)
@@ -109,21 +113,94 @@ export class RoundController {
 
   /**
    * Activate the next pending round at event-second `atSecond`, recording
-   * startedAt and computing endedAt from its duration. Throws if a round is
-   * already active (only one at a time) or if no pending rounds remain.
+   * startedAt and computing endedAt from its duration.
+   *
+   * When the configured schedule is exhausted, a fresh round is appended and
+   * started rather than failing — the schedule can always be extended, so the
+   * Master is never locked out. The new round inherits the settings of the most
+   * recent real round (see `appendRound`).
+   *
+   * Throws only if a round is already active; one at a time, always.
    */
   startNextRound(atSecond: number): Round {
     if (this.activeIndex !== null) {
       throw new Error('a round is already active; end it before starting the next')
     }
-    const next = this.rounds.find((r) => r.status === 'pending')
-    if (!next) throw new Error('no pending rounds remain')
+    const next = this.rounds.find((r) => r.status === 'pending') ?? this.createNextRound()
 
     next.status = 'active'
     next.startedAt = atSecond
     next.endedAt = atSecond + next.durationSeconds
     this.activeIndex = next.index
     return snapshot(next)
+  }
+
+  /**
+   * Wipe all round progress: every round returns to 'pending', nothing is
+   * active, and any dynamically-appended rounds are dropped so the schedule is
+   * exactly the one this controller was constructed with.
+   *
+   * Exists for the Master's "Reset Event". Clearing the database alone is NOT
+   * enough — round progress lives here in memory and is only rebuilt by
+   * rehydrate() at boot, so a DB-only reset leaves the running process out of
+   * sync and round/start then fails.
+   */
+  resetSchedule(): void {
+    const fresh = new RoundController(this.initialConfig)
+    this.rounds.length = 0
+    this.rounds.push(...fresh.rounds)
+    this.activeIndex = null
+  }
+
+  /**
+   * The id a dynamically-created round would take: one past the highest existing
+   * `real-N`. Ignores mock rounds, so `mock-1, real-1..3` yields `real-4`.
+   */
+  private nextRealId(): string {
+    let highest = 0
+    for (const r of this.rounds) {
+      const m = /^real-(\d+)$/.exec(r.id)
+      if (m) highest = Math.max(highest, Number(m[1]))
+    }
+    return `real-${highest + 1}`
+  }
+
+  /**
+   * Append a round to the end of the schedule and return the live object.
+   *
+   * Unspecified settings are inherited from the most recent REAL round, so an
+   * extension round matches the scored rounds rather than the mock ones. Falls
+   * back to the last round of any kind, then to library defaults, so this is
+   * safe even on an all-mock schedule.
+   */
+  private createNextRound(def: Partial<RoundDefinition> = {}): Round {
+    const template =
+      [...this.rounds].reverse().find((r) => /^real-\d+$/.test(r.id)) ??
+      this.rounds[this.rounds.length - 1]
+    const round: Round = {
+      id: def.id ?? this.nextRealId(),
+      index: this.rounds.length,
+      mode: def.mode ?? template?.mode ?? 'only_data',
+      durationSeconds: def.durationSeconds ?? template?.durationSeconds ?? 600,
+      commissionEnabled: def.commissionEnabled ?? template?.commissionEnabled ?? false,
+      usdInrRate: def.usdInrRate ?? template?.usdInrRate ?? DEFAULT_USD_INR_RATE,
+      commissionRate: def.commissionRate ?? template?.commissionRate ?? DEFAULT_COMMISSION_RATE,
+      slippageEnabled: def.slippageEnabled ?? template?.slippageEnabled ?? true,
+      status: 'pending',
+      startedAt: null,
+      endedAt: null,
+    }
+    this.rounds.push(round)
+    return round
+  }
+
+  /**
+   * Append a round explicitly. Used on restart to rebuild rounds that were
+   * created dynamically in a previous process and exist only in the database —
+   * pass the persisted row's settings so the restored round matches it exactly.
+   */
+  appendRound(def: Partial<RoundDefinition> = {}): Round {
+    return snapshot(this.createNextRound(def))
   }
 
   /**

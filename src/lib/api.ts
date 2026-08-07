@@ -265,6 +265,19 @@ export interface SetInstrumentPricesResult {
   instruments: InstrumentMeta[]
 }
 
+export interface ResetEventResult {
+  applied: boolean
+  cleared: {
+    trades: number
+    orders: number
+    positions: number
+    rounds: number
+    notifications: number
+    accountsReset: number
+  }
+  round: RoundStatus
+}
+
 export interface PlaceOrderResult {
   accepted: boolean
   reason?: string
@@ -427,6 +440,13 @@ export const api = {
   pushNotification: (kind: Notification['kind'], title: string, body?: string) =>
     post<{ ok: boolean }>('/notifications', { kind, title, body }),
   adminTeams: () => get<{ teams: TeamOverview[] }>('/admin/teams'),
+  /**
+   * Master-only. DESTRUCTIVE: clears every trade, order and position, zeroes all
+   * realized P&L (restoring cash to starting_cash) and returns the round schedule
+   * to all-pending. Accounts, instruments and the audit log are preserved.
+   * Requires the literal confirmation string, checked server-side too.
+   */
+  resetEvent: () => post<ResetEventResult>('/admin/reset', { confirm: 'RESET' }),
   /**
    * Master-only. Sets instrument starting prices for the upcoming round. Usable
    * before every round, not just the first. Rejects (throwing the server's

@@ -22,7 +22,9 @@ type Row = Record<string, any>
 // ---------------------------------------------------------------------------
 
 class FakeQuery implements PromiseLike<{ data: unknown; error: null }> {
-  private op: 'select' | 'insert' | 'update' | 'upsert' = 'select'
+  private op: 'select' | 'insert' | 'update' | 'upsert' | 'delete' = 'select'
+  /** Set by select('*', { count: 'exact' }) — resetEvent counts rows before wiping. */
+  private wantCount = false
   private payload: Row | Row[] = {}
   private conflictCols: string[] = ['id']
   private filters: ((r: Row) => boolean)[] = []
@@ -33,7 +35,12 @@ class FakeQuery implements PromiseLike<{ data: unknown; error: null }> {
     private readonly table: string,
   ) {}
 
-  select(): this {
+  select(_cols?: string, opts?: { count?: string; head?: boolean }): this {
+    if (opts?.count) this.wantCount = true
+    return this
+  }
+  delete(): this {
+    this.op = 'delete'
     return this
   }
   insert(rows: Row | Row[]): this {
@@ -113,7 +120,15 @@ class FakeQuery implements PromiseLike<{ data: unknown; error: null }> {
       else all.push({ ...row })
       return { data: [row], error: null }
     }
+    if (this.op === 'delete') {
+      // Splice in place so references held elsewhere stay valid.
+      for (let i = all.length - 1; i >= 0; i--) {
+        if (this.filters.every((f) => f(all[i]))) all.splice(i, 1)
+      }
+      return { data: [], error: null }
+    }
     const out = all.filter((r) => this.filters.every((f) => f(r))).map((r) => ({ ...r }))
+    if (this.wantCount) return { data: out, error: null, count: out.length } as never
     return this.one ? { data: out[0] ?? null, error: null } : { data: out, error: null }
   }
 
@@ -950,6 +965,330 @@ describe('setCommission: persists early, like the other round settings', () => {
 
     expect(recovery.roundsRestored).toBe(0)
     expect(svc2.getSchedule()[0].status).toBe('pending')
+  })
+})
+
+describe('the schedule extends indefinitely past its configured end', () => {
+  /** Run every configured round to completion. */
+  async function drain(svc: TradingService): Promise<number> {
+    let t = 0
+    while (svc.getSchedule().some((r) => r.status === 'pending')) {
+      const r = await svc.startRound(t)
+      t += r.durationSeconds
+      await svc.endRound(t)
+    }
+    return t
+  }
+
+  it('starting past the end creates the next sequential round instead of failing', async () => {
+    const { svc } = harness() // r1, r2, r3
+    await svc.loadInstruments()
+    const t = await drain(svc)
+    expect(svc.getSchedule()).toHaveLength(3)
+
+    const extra = await svc.startRound(t) // used to throw "no pending rounds remain"
+    expect(extra.id).toBe('real-1') // no real-N ids in this harness → starts the sequence
+    expect(svc.getRoundStatus().active).toBe(true)
+    expect(svc.getSchedule()).toHaveLength(4)
+  })
+
+  it('persists the new round to the DB like any other', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    const t = await drain(svc)
+    const extra = await svc.startRound(t)
+
+    const row = db.rows('rounds').find((r) => r.id === extra.id)!
+    expect(row).toBeDefined()
+    expect(row.status).toBe('active')
+    expect(row.started_at).toBeTruthy()
+    expect(Number(row.index)).toBe(3)
+  })
+
+  it('works repeatedly — three extensions in a row', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    let t = await drain(svc)
+
+    for (const expected of ['real-1', 'real-2', 'real-3']) {
+      const r = await svc.startRound(t)
+      expect(r.id).toBe(expected)
+      t += r.durationSeconds
+      await svc.endRound(t)
+    }
+    expect(svc.getSchedule()).toHaveLength(6)
+  })
+
+  it('teams can trade in an extension round exactly as in a configured one', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    const t = await drain(svc)
+    await svc.startRound(t)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230 })
+    const pos = db.rows('positions').find((p) => p.account_id === A)!
+    expect(Number(pos.qty)).toBe(10)
+    expect(Number(pos.notional_basis_inr)).toBeCloseTo(10 * 230 * 83, 6)
+  })
+
+  it('an extension round SURVIVES a restart while active', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    const t = await drain(svc)
+    const extra = await svc.startRound(t)
+
+    // Fresh controller from the STATIC config — it knows nothing about `extra`.
+    const rounds2 = new RoundController(SCHEDULE)
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.getRoundStatus().active).toBe(true)
+    expect(svc2.getRoundStatus().id).toBe(extra.id)
+    expect(svc2.getSchedule().map((r) => r.id)).toContain(extra.id)
+  })
+
+  it('an ENDED extension round is restored and never replayed', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    let t = await drain(svc)
+    const fourth = await svc.startRound(t)
+    t += fourth.durationSeconds
+    await svc.endRound(t)
+
+    const rounds2 = new RoundController(SCHEDULE)
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.getSchedule().find((r) => r.id === fourth.id)?.status).toBe('ended')
+    // Starting again yields the NEXT id, not a replay of the restored one.
+    const fifth = await svc2.startRound(t + 1)
+    expect(fifth.id).not.toBe(fourth.id)
+    expect(fifth.id).toBe('real-2')
+  })
+
+  it('restores several extension rounds in order', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    let t = await drain(svc)
+    for (let i = 0; i < 3; i++) {
+      const r = await svc.startRound(t)
+      t += r.durationSeconds
+      await svc.endRound(t)
+    }
+
+    const rounds2 = new RoundController(SCHEDULE)
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.getSchedule().map((r) => r.id)).toEqual(['r1', 'r2', 'r3', 'real-1', 'real-2', 'real-3'])
+    expect(svc2.getSchedule().every((r) => r.status === 'ended')).toBe(true)
+  })
+
+  it('the extension carries the Master-set rates forward', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    const t = await drain(svc)
+
+    const extra = await svc.startRound(t)
+    await svc.setUsdInrRate(MASTER, 92)
+    await svc.setCommissionRate(MASTER, 0.006)
+    await svc.endRound(t + extra.durationSeconds)
+
+    const next = await svc.startRound(t + extra.durationSeconds)
+    expect(next.usdInrRate).toBe(92)
+    expect(next.commissionRate).toBe(0.006)
+  })
+})
+
+describe('resetEvent: wipes trading state and leaves the platform usable', () => {
+  /** Build a dirty event: rounds run, trades filled, P&L booked, an order resting. */
+  async function dirty() {
+    const h = harness()
+    await h.svc.loadInstruments()
+    await h.svc.startRound(0)
+    await cross(h.svc, { buyer: A, seller: B, qty: 10, price: 230 })
+    await cross(h.svc, { buyer: B, seller: A, qty: 4, price: 240 }) // realizes P&L
+    // Leave one order resting on the book.
+    await h.svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'buy', type: 'limit', price: 100, qty: 5, leverage: 1 })
+    return h
+  }
+
+  it('the setup really is dirty first', async () => {
+    const { db, svc } = await dirty()
+    expect(db.rows('trades').length).toBeGreaterThan(0)
+    expect(db.rows('orders').length).toBeGreaterThan(0)
+    expect(db.rows('positions').length).toBeGreaterThan(0)
+    expect(Number(db.rows('profiles').find((p) => p.id === A)!.realized_pnl_inr)).not.toBe(0)
+    expect(svc.getRoundStatus().active).toBe(true)
+  })
+
+  it('clears trades, orders, positions and rounds', async () => {
+    const { db, svc } = await dirty()
+    const res = await svc.resetEvent(MASTER)
+
+    expect(res.applied).toBe(true)
+    expect(db.rows('trades')).toHaveLength(0)
+    expect(db.rows('orders')).toHaveLength(0)
+    expect(db.rows('positions')).toHaveLength(0)
+    expect(db.rows('rounds')).toHaveLength(0)
+  })
+
+  it('clears notifications, so no announcement survives into the next run', async () => {
+    const { db, svc } = await dirty()
+    await svc.publishNotification('announcement', 'Round 1 is live', 'Good luck.')
+    await svc.publishNotification('daily_news', 'Rates hold steady')
+    expect(db.rows('notifications')).toHaveLength(2)
+
+    const res = await svc.resetEvent(MASTER)
+    expect(db.rows('notifications')).toHaveLength(0)
+    expect(res.cleared?.notifications).toBe(2)
+
+    // And nothing resurfaces on a team's snapshot afterwards.
+    const snap = (await svc.snapshot(A, 'team', 'AAPL')) as Record<string, any>
+    expect(snap.notifications).toHaveLength(0)
+  })
+
+  it('zeroes realized P&L on every account, restoring cash to starting_cash', async () => {
+    const { db, svc } = await dirty()
+    await svc.resetEvent(MASTER)
+
+    for (const p of db.rows('profiles')) {
+      expect(Number(p.realized_pnl_inr)).toBe(0)
+      expect(Number(p.realized_pnl)).toBe(0)
+    }
+    const port = (await svc.portfolio(A)) as Record<string, any>
+    expect(port.cashInr).toBe(START_CASH) // cash is derived — back to full
+    expect(port.totalPortfolioValueInr).toBe(START_CASH)
+    expect(port.realizedPnlInr).toBe(0)
+    expect(port.openPositions).toBe(0)
+    expect(port.chargesInr).toBe(0)
+  })
+
+  it('ends the active round and returns the schedule to all-pending', async () => {
+    const { svc } = await dirty()
+    await svc.resetEvent(MASTER)
+
+    expect(svc.getRoundStatus().active).toBe(false)
+    expect(svc.getRoundStatus().id).toBeNull()
+    expect(svc.getSchedule().every((r) => r.status === 'pending')).toBe(true)
+    expect(svc.getSchedule().map((r) => r.id)).toEqual(['r1', 'r2', 'r3'])
+  })
+
+  it('drops dynamically-added extension rounds', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    let t = 0
+    for (let i = 0; i < 5; i++) { // 3 configured + 2 extensions
+      const r = await svc.startRound(t)
+      t += r.durationSeconds
+      await svc.endRound(t)
+    }
+    expect(svc.getSchedule()).toHaveLength(5)
+
+    await svc.resetEvent(MASTER)
+    expect(svc.getSchedule()).toHaveLength(3)
+    expect(svc.getSchedule().every((r) => r.status === 'pending')).toBe(true)
+  })
+
+  it('clears the in-memory order book, not just the rows', async () => {
+    const { svc } = await dirty()
+    await svc.resetEvent(MASTER)
+    const depth = svc.depthView('AAPL', true)
+    expect(depth.bids).toHaveLength(0)
+    expect(depth.asks).toHaveLength(0)
+  })
+
+  it('resets marks back to the instrument reference price', async () => {
+    const { svc } = await dirty()
+    expect(svc.ltp('AAPL')).toBe(240) // last trade
+    await svc.resetEvent(MASTER)
+    expect(svc.ltp('AAPL')).toBe(230) // AAPL reference_price
+  })
+
+  it('PRESERVES accounts, instruments and the audit log', async () => {
+    const { db, svc } = await dirty()
+    const logsBefore = db.rows('event_log').length
+    await svc.resetEvent(MASTER)
+
+    expect(db.rows('profiles')).toHaveLength(3) // team01, team02, master
+    expect(db.rows('instruments')).toHaveLength(3)
+    expect(db.rows('event_log').length).toBeGreaterThanOrEqual(logsBefore) // never truncated
+  })
+
+  it('is master-only and changes nothing when refused', async () => {
+    const { db, svc } = await dirty()
+    const tradesBefore = db.rows('trades').length
+
+    for (const who of [TEAM, { accountId: 'acct-mm', role: 'market_maker' }]) {
+      const res = await svc.resetEvent(who)
+      expect(res.applied).toBe(false)
+      expect(res.reason).toBe('forbidden')
+    }
+    expect(db.rows('trades')).toHaveLength(tradesBefore)
+    expect(svc.getRoundStatus().active).toBe(true) // round untouched
+    expect(db.rows('event_log').filter((e) => e.event_type === 'event_reset')).toHaveLength(0)
+  })
+
+  it('logs the reset, attributed to the master, with what was cleared', async () => {
+    const { db, svc } = await dirty()
+    await svc.resetEvent(MASTER)
+
+    const logged = db.rows('event_log').filter((e) => e.event_type === 'event_reset')
+    expect(logged).toHaveLength(1)
+    expect(logged[0].account_id).toBe(MASTER.accountId)
+    expect(logged[0].severity).toBe('warning')
+    expect(logged[0].payload.trades).toBeGreaterThan(0)
+    expect(logged[0].payload.accountsReset).toBe(3)
+  })
+
+  it('THE PLATFORM IS USABLE IMMEDIATELY AFTER — start a round and trade', async () => {
+    const { db, svc } = await dirty()
+    await svc.resetEvent(MASTER)
+
+    // Start a round: must serve the FIRST round again, not fail or skip.
+    const r = await svc.startRound(0)
+    expect(r.id).toBe('r1')
+    expect(svc.getRoundStatus().active).toBe(true)
+
+    // And teams can trade normally, from a clean slate.
+    const fill = await cross(svc, { buyer: A, seller: B, qty: 10, price: 250 })
+    expect(fill.accepted).toBe(true)
+    const pos = db.rows('positions').find((p) => p.account_id === A)!
+    expect(Number(pos.qty)).toBe(10)
+    expect(Number(pos.notional_basis_inr)).toBeCloseTo(10 * 250 * 83, 6)
+  })
+
+  it('is safe to run repeatedly', async () => {
+    const { db, svc } = await dirty()
+    for (let i = 0; i < 3; i++) {
+      const res = await svc.resetEvent(MASTER)
+      expect(res.applied).toBe(true)
+      // Re-dirty between resets so each one has real work to do.
+      await svc.startRound(0)
+      await cross(svc, { buyer: A, seller: B, qty: 2, price: 210 })
+    }
+    await svc.resetEvent(MASTER)
+    expect(db.rows('trades')).toHaveLength(0)
+    expect(db.rows('positions')).toHaveLength(0)
+    expect(svc.getSchedule().every((r) => r.status === 'pending')).toBe(true)
+  })
+
+  it('a reset event survives a restart — the DB really is clean', async () => {
+    const { db, svc } = await dirty()
+    await svc.resetEvent(MASTER)
+
+    const rounds2 = new RoundController(SCHEDULE)
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    const recovery = await svc2.rehydrate()
+
+    expect(recovery.roundsRestored).toBe(0)
+    expect(recovery.ordersRestored).toBe(0)
+    expect(recovery.accountsWithPnl).toBe(0)
+    expect(svc2.getSchedule().every((r) => r.status === 'pending')).toBe(true)
   })
 })
 

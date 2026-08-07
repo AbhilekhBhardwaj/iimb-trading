@@ -325,6 +325,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
     return json(res, 200, { round: service.getRoundStatus(), changed: result.changed })
   }
+  // DESTRUCTIVE: wipes all trading state. Requires an explicit typed confirmation
+  // in the body as a second gate beyond master auth, so a stray POST cannot do it.
+  if (method === 'POST' && path === '/api/admin/reset') {
+    if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
+    const b = await readJson(req)
+    if (String(b.confirm ?? '') !== 'RESET') {
+      return json(res, 400, { error: 'confirmation required: send { confirm: "RESET" }', applied: false })
+    }
+    const result = await service.resetEvent({ accountId: caller.accountId, role: caller.role })
+    if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
+    return json(res, 200, { applied: true, cleared: result.cleared, round: service.getRoundStatus() })
+  }
   if (method === 'GET' && path === '/api/admin/teams') {
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
     return json(res, 200, { teams: await service.teamsOverview() })
