@@ -136,13 +136,20 @@ export function slippageMessage(s: Slippage): string {
 /**
  * The whole thing end to end: executed order in, nudge sentence out, or null
  * when there is nothing to say. This is what the Terminal calls.
+ *
+ * `enabled` is the round's Master-controlled display switch. When false the
+ * nudge is suppressed even if real slippage occurred — the fill is unaffected,
+ * teams are simply not shown the coaching line. Defaults to true so callers that
+ * predate the toggle keep working.
  */
 export function slippageNudge(input: {
   orderType: OrderType
   side: Side
   bestPrice: number | null | undefined
   fills: Fill[] | null | undefined
+  enabled?: boolean
 }): string | null {
+  if (input.enabled === false) return null
   const s = computeSlippage(input)
   return s ? slippageMessage(s) : null
 }

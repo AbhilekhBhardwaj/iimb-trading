@@ -313,6 +313,18 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
     return json(res, 200, { round: service.getRoundStatus(), changed: result.changed })
   }
+  // Slippage nudge visibility. Display-only, so no settlement concerns — the
+  // Master may flip it at any time, including mid-round.
+  if (method === 'POST' && path === '/api/round/slippage') {
+    if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
+    const b = await readJson(req)
+    const result = await service.setSlippageEnabled(
+      { accountId: caller.accountId, role: caller.role },
+      b.enabled === true,
+    )
+    if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
+    return json(res, 200, { round: service.getRoundStatus(), changed: result.changed })
+  }
   if (method === 'GET' && path === '/api/admin/teams') {
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
     return json(res, 200, { teams: await service.teamsOverview() })

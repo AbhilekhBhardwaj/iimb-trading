@@ -160,6 +160,8 @@ function Admin() {
   // Commission target: the active round, else the next pending round.
   const target = schedule.find((r) => r.status === 'active') ?? schedule.find((r) => r.status === 'pending') ?? null
   const targetCommission = target?.commissionEnabled ?? false
+  // Slippage nudge visibility for the round this control targets. Display-only.
+  const targetSlippage = target?.slippageEnabled ?? round.slippageEnabled
 
   const doStart = () => setPending({
     title: 'Start Next Round?', detail: 'Activates the next pending round. Teams will be able to trade immediately.',
@@ -321,6 +323,22 @@ function Admin() {
     })
   }
 
+  const doSlippage = (enabled: boolean) => setPending({
+    title: `Turn the slippage nudge ${enabled ? 'ON' : 'OFF'}?`,
+    detail: `${enabled ? 'Shows' : 'Hides'} the "a limit order could have saved you $X" note in the post-trade popup for the ${round.active ? 'current' : 'next'} round (${target ? roundLabel(target.id) : '—'}). Display only — orders, fills and settlement are unaffected either way.`,
+    confirmLabel: enabled ? 'Show' : 'Hide', tone: 'gold',
+    run: async () => {
+      try {
+        await api.setSlippageEnabled(enabled)
+        analytics.capture('slippage_toggle_set', { enabled })
+        await refresh()
+        toast(true, `Slippage nudge ${enabled ? 'shown' : 'hidden'}`)
+      } catch (err) {
+        toast(false, err instanceof Error ? err.message : 'Failed to set slippage nudge')
+      }
+    },
+  })
+
   const doPush = () => {
     if (!title.trim()) { toast(false, 'Enter a title first'); return }
     const label = KINDS.find((x) => x.k === kind)!.label
@@ -471,8 +489,9 @@ function Admin() {
           </div>
         </Panel>
 
-        {/* 3. Settlement rate. Sits next to prices because both are round
-             configuration, but unlike prices this one is NOT locked mid-round. */}
+        {/* 3. Half-width row: settlement rate + slippage nudge. Both are round
+             configuration the Master may change at any time, including mid-round. */}
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
         <Panel title="Settlement Rate (USD/INR)" delay={0.05}
           right={<span className="font-mono text-[11px] text-muted">{round.active ? 'in force' : 'next round'} <span className="text-bright">{num(targetRate)}</span></span>}
         >
@@ -510,8 +529,32 @@ function Admin() {
           </div>
         </Panel>
 
+        {/* 4. Slippage nudge — same pattern as Commission: a display toggle for
+             the round, with no effect on matching, fills or settlement. */}
+        <Panel title="Slippage Nudge" delay={0.05}>
+          <p className="text-[12px] leading-relaxed text-muted">
+            Show or hide the slippage note for the <span className="text-bright">{round.active ? 'current' : 'next'}</span> round
+            {target ? <span className="font-mono text-subtle"> ({roundLabel(target.id)})</span> : null}.
+          </p>
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            {[true, false].map((on) => (
+              <button key={String(on)} onClick={() => doSlippage(on)}
+                className={`rounded-lg border py-3 text-sm font-medium uppercase transition-colors ${targetSlippage === on ? (on ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/20 bg-white/[0.05] text-bright') : 'border-white/10 bg-white/[0.02] text-muted hover:bg-white/[0.04]'}`}>
+                {on ? 'On' : 'Off'}{targetSlippage === on ? ' ·  current' : ''}
+              </button>
+            ))}
+          </div>
+          <p className="mt-4 rounded-md border border-white/[0.08] bg-white/[0.02] px-3 py-2 text-[10px] leading-relaxed text-muted">
+            After a market order walks past the best price, the post-trade popup tells the team
+            <span className="text-bright"> what a limit order would have saved them</span>. This setting only controls
+            whether that note is shown — orders, fills and settlement are identical either way. Nothing appears when a
+            market order fills cleanly at one price, or for limit orders.
+          </p>
+        </Panel>
+        </div>
+
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-          {/* 4. Broadcast */}
+          {/* 5. Broadcast */}
           <Panel title="Broadcast" delay={0.05}>
             <div className="flex gap-1.5">
               {KINDS.map((x) => (
@@ -546,7 +589,7 @@ function Admin() {
             </div>
           </Panel>
 
-          {/* 5. Commission */}
+          {/* 6. Commission */}
           <Panel title="Commission" delay={0.1}>
             <p className="text-[12px] leading-relaxed text-muted">
               Show or hide the Commission line for the <span className="text-bright">{round.active ? 'current' : 'next'}</span> round
@@ -601,7 +644,7 @@ function Admin() {
           </Panel>
         </div>
 
-        {/* 6. Teams */}
+        {/* 7. Teams */}
         <Panel title="Teams" delay={0.15} right={<span className="font-mono text-[10px] text-subtle">{teams.length}</span>}>
           <div className="overflow-x-auto">
             <table className="w-full text-[13px]">

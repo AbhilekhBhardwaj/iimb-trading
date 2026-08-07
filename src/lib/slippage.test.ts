@@ -280,6 +280,59 @@ describe('nothing to measure', () => {
   })
 })
 
+describe('the round toggle suppresses the nudge', () => {
+  /** A walked market buy that genuinely slipped $10.00 — the nudge case. */
+  const WALKED = {
+    orderType: 'market' as const,
+    side: 'buy' as const,
+    bestPrice: 230,
+    fills: [{ price: 230, qty: 5 }, { price: 232, qty: 5 }],
+  }
+
+  it('shows the nudge when enabled', () => {
+    expect(slippageNudge({ ...WALKED, enabled: true })).toContain('could have saved you $10.00')
+  })
+
+  it('suppresses the nudge when disabled, DESPITE real slippage', () => {
+    expect(slippageNudge({ ...WALKED, enabled: false })).toBeNull()
+  })
+
+  it('defaults to shown when the flag is omitted', () => {
+    expect(slippageNudge(WALKED)).toContain('could have saved you $10.00')
+    expect(slippageNudge({ ...WALKED, enabled: undefined })).toContain('could have saved you $10.00')
+  })
+
+  it('the underlying slippage is still computed — only the display is gated', () => {
+    // The toggle must not rewrite what happened, just whether teams see it.
+    const s = computeSlippage(WALKED)!
+    expect(s.slippageUsd).toBeCloseTo(10, 9)
+    expect(slippageNudge({ ...WALKED, enabled: false })).toBeNull()
+  })
+
+  it('suppresses on the sell side too', () => {
+    const sold = {
+      orderType: 'market' as const,
+      side: 'sell' as const,
+      bestPrice: 229,
+      fills: [{ price: 229, qty: 5 }, { price: 227, qty: 5 }],
+    }
+    expect(slippageNudge({ ...sold, enabled: true })).toContain('saved you $10.00')
+    expect(slippageNudge({ ...sold, enabled: false })).toBeNull()
+  })
+
+  it('stays null for a clean fill whether enabled or not', () => {
+    const clean = { orderType: 'market' as const, side: 'buy' as const, bestPrice: 230, fills: [{ price: 230, qty: 10 }] }
+    expect(slippageNudge({ ...clean, enabled: true })).toBeNull()
+    expect(slippageNudge({ ...clean, enabled: false })).toBeNull()
+  })
+
+  it('stays null for a limit order whether enabled or not', () => {
+    const lim = { ...WALKED, orderType: 'limit' as const }
+    expect(slippageNudge({ ...lim, enabled: true })).toBeNull()
+    expect(slippageNudge({ ...lim, enabled: false })).toBeNull()
+  })
+})
+
 describe('slippageNudge end to end', () => {
   it('returns the sentence for a walked market order', () => {
     expect(

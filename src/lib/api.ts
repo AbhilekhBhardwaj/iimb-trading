@@ -21,6 +21,8 @@ export interface RoundStatus {
   usdInrRate: number
   /** Commission rate pinned for this round, as a fraction of notional per side. */
   commissionRate: number
+  /** Show the slippage nudge to teams this round. Display-only. */
+  slippageEnabled: boolean
 }
 
 export interface InstrumentMeta {
@@ -126,6 +128,8 @@ export interface ScheduleRound {
   usdInrRate: number
   /** Commission rate pinned for this round, as a fraction of notional per side. */
   commissionRate: number
+  /** Show the slippage nudge to teams this round. Display-only. */
+  slippageEnabled: boolean
 }
 
 export interface TeamOverview {
@@ -412,6 +416,12 @@ export const api = {
    */
   setCommissionRate: (commissionRate: number) =>
     post<{ round: RoundStatus; changed: ScheduleRound | null }>('/round/commission-rate', { commissionRate }),
+  /**
+   * Master-only. Shows or hides the slippage nudge for the active round (or the
+   * next pending one). Display-only: never affects matching, fills or settlement.
+   */
+  setSlippageEnabled: (enabled: boolean) =>
+    post<{ round: RoundStatus; changed: ScheduleRound | null }>('/round/slippage', { enabled }),
   roundSchedule: () => get<{ schedule: ScheduleRound[] }>('/round/schedule'),
   notificationsList: () => get<{ notifications: Notification[] }>('/notifications'),
   pushNotification: (kind: Notification['kind'], title: string, body?: string) =>

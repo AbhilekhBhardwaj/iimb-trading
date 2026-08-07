@@ -748,7 +748,10 @@ function Terminal() {
       const pnlLines = avg
         ? orderPnlLines(prePosition, o.side === 'buy' ? avg.filledQty : -avg.filledQty, avg.avgFillPrice, rate, o.leverage, commission)
         : []
-      const nudge = slippageNudge({ orderType: o.type, side: o.side, bestPrice: res.bestPriceAtSubmit, fills })
+      const nudge = slippageNudge({
+        orderType: o.type, side: o.side, bestPrice: res.bestPriceAtSubmit, fills,
+        enabled: snap?.round.slippageEnabled ?? true,
+      })
       if (nudge) analytics.capture('slippage_nudge_shown', { ticker: selected, side: o.side, qty: filled })
 
       // A clean fill with nothing to teach stays a toast; the dialog only opens

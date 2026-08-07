@@ -317,6 +317,12 @@ export class TradingService {
         if (isValidCommissionRate(persistedCommission)) {
           this.rounds.setCommissionRate(persistedCommission)
         }
+        if (typeof active!.slippage_enabled === 'boolean') {
+          this.rounds.setSlippageEnabled(active!.slippage_enabled as boolean)
+        }
+        if (typeof active!.commission_enabled === 'boolean') {
+          this.rounds.setCommission(active!.commission_enabled as boolean)
+        }
         reconciled++
         break
       }
@@ -350,6 +356,8 @@ export class TradingService {
       if (Number.isFinite(persisted) && persisted > 0) this.rounds.setUsdInrRate(persisted)
       const persistedCommission = Number(row?.commission_rate)
       if (isValidCommissionRate(persistedCommission)) this.rounds.setCommissionRate(persistedCommission)
+      if (typeof row?.slippage_enabled === 'boolean') this.rounds.setSlippageEnabled(row.slippage_enabled as boolean)
+      if (typeof row?.commission_enabled === 'boolean') this.rounds.setCommission(row.commission_enabled as boolean)
     }
     return reconciled
   }
@@ -446,6 +454,7 @@ export class TradingService {
         commission_enabled: round.commissionEnabled,
         usd_inr_rate: round.usdInrRate,
         commission_rate: round.commissionRate,
+        slippage_enabled: round.slippageEnabled,
         status: 'active',
         started_at: new Date().toISOString(),
         ended_at: null,
@@ -584,6 +593,49 @@ export class TradingService {
   }
 
   /**
+   * Master control: show or hide the slippage nudge on the ACTIVE round, or —
+   * when none is active — the next pending one. Purely a display switch: it never
+   * affects matching, fills or settlement, so it is safe at any time.
+   *
+   * Persisted immediately (creating the round's row early if it has not started)
+   * so a change made between rounds survives a restart.
+   */
+  async setSlippageEnabled(
+    caller: { accountId: string; role: string },
+    enabled: boolean,
+  ): Promise<{ applied: boolean; reason?: string; changed: Round | null }> {
+    if (caller.role !== 'master') return { applied: false, reason: 'forbidden', changed: null }
+
+    const previous = this.rounds.isSlippageActive()
+    const changed = this.rounds.setSlippageEnabled(enabled)
+    if (!changed) return { applied: false, reason: 'no pending round to set slippage on', changed: null }
+
+    const { error } = await this.db.from('rounds').upsert(
+      {
+        id: changed.id,
+        index: changed.index,
+        mode: changed.mode,
+        duration_seconds: changed.durationSeconds,
+        commission_enabled: changed.commissionEnabled,
+        usd_inr_rate: changed.usdInrRate,
+        commission_rate: changed.commissionRate,
+        slippage_enabled: changed.slippageEnabled,
+        status: changed.status,
+      },
+      { onConflict: 'id' },
+    )
+    if (error) throw error
+
+    await this.log(caller.accountId, 'slippage_toggle_changed', 'info', {
+      roundId: changed.id,
+      index: changed.index,
+      slippageEnabled: changed.slippageEnabled,
+      previous,
+    })
+    return { applied: true, changed }
+  }
+
+  /**
    * Master control: set the commission rate on the ACTIVE round, or — when none
    * is active — the next pending one. Allowed at any time, including mid-round,
    * on the same forward-only model as the USD→INR rate: the charge on a fill is
@@ -617,6 +669,7 @@ export class TradingService {
         commission_enabled: changed.commissionEnabled,
         usd_inr_rate: changed.usdInrRate,
         commission_rate: changed.commissionRate,
+        slippage_enabled: changed.slippageEnabled,
         status: changed.status,
       },
       { onConflict: 'id' },
@@ -683,6 +736,7 @@ export class TradingService {
         commission_enabled: changed.commissionEnabled,
         usd_inr_rate: changed.usdInrRate,
         commission_rate: changed.commissionRate,
+        slippage_enabled: changed.slippageEnabled,
         status: changed.status,
       },
       { onConflict: 'id' },
@@ -715,6 +769,8 @@ export class TradingService {
     usdInrRate: number
     /** Commission rate pinned for this round (or the default between rounds). */
     commissionRate: number
+    /** Show the slippage nudge to teams this round. Display-only. */
+    slippageEnabled: boolean
   } {
     const cur = this.activeRoundId === null ? null : this.rounds.getCurrentRound()
     return {
@@ -726,6 +782,7 @@ export class TradingService {
       remainingSeconds: this.getRoundRemainingSeconds(),
       usdInrRate: this.rateInr(),
       commissionRate: this.commissionRate(),
+      slippageEnabled: this.rounds.isSlippageActive(),
     }
   }
 
@@ -816,10 +873,27 @@ export class TradingService {
   async setCommission(enabled: boolean): Promise<Round | null> {
     const changed = this.rounds.setCommission(enabled)
     if (!changed) return null
-    if (this.activeRoundId === changed.id) {
-      const { error } = await this.db.from('rounds').update({ commission_enabled: enabled }).eq('id', changed.id)
-      if (error) throw error
-    }
+
+    // Persist immediately, creating the round's row early when it has not started
+    // yet. The previous version only wrote for an ALREADY-ACTIVE round, so a
+    // toggle set between rounds lived in memory and vanished on restart.
+    // Same early-upsert pattern as setSlippageEnabled / setUsdInrRate.
+    const { error } = await this.db.from('rounds').upsert(
+      {
+        id: changed.id,
+        index: changed.index,
+        mode: changed.mode,
+        duration_seconds: changed.durationSeconds,
+        commission_enabled: changed.commissionEnabled,
+        usd_inr_rate: changed.usdInrRate,
+        commission_rate: changed.commissionRate,
+        slippage_enabled: changed.slippageEnabled,
+        status: changed.status,
+      },
+      { onConflict: 'id' },
+    )
+    if (error) throw error
+
     await this.log(null, 'commission_changed', 'info', { roundId: changed.id, enabled })
     return changed
   }

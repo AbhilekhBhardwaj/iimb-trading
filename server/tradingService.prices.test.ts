@@ -757,6 +757,202 @@ describe('setCommissionRate: master-only, changeable at any time, attributed', (
   })
 })
 
+describe('setSlippageEnabled: master-only, changeable at any time, persisted', () => {
+  it('defaults to ON', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    expect(svc.getRoundStatus().slippageEnabled).toBe(true)
+  })
+
+  it('turns the nudge OFF mid-round, effective immediately', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    const res = await svc.setSlippageEnabled(MASTER, false)
+    expect(res.applied).toBe(true)
+    expect(res.changed?.id).toBe('r1') // the ACTIVE round
+    expect(svc.getRoundStatus().slippageEnabled).toBe(false)
+  })
+
+  it('turns it back ON', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setSlippageEnabled(MASTER, false)
+    await svc.setSlippageEnabled(MASTER, true)
+    expect(svc.getRoundStatus().slippageEnabled).toBe(true)
+  })
+
+  it('applies between rounds, targeting the NEXT round', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+
+    const res = await svc.setSlippageEnabled(MASTER, false)
+    expect(res.applied).toBe(true)
+    expect(svc.getSchedule()[0].slippageEnabled).toBe(false)
+    await svc.startRound(0)
+    expect(svc.getRoundStatus().slippageEnabled).toBe(false)
+  })
+
+  it('persists to the round row, mid-round and between rounds', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+
+    await svc.setSlippageEnabled(MASTER, false)
+    expect(db.rows('rounds').find((r) => r.id === 'r1')!.slippage_enabled).toBe(false)
+
+    await svc.startRound(0)
+    await svc.setSlippageEnabled(MASTER, true)
+    const row = db.rows('rounds').find((r) => r.id === 'r1')!
+    expect(row.slippage_enabled).toBe(true)
+    expect(row.status).toBe('active') // not downgraded
+  })
+
+  it('refuses a team account and changes nothing', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    const res = await svc.setSlippageEnabled(TEAM, false)
+    expect(res.applied).toBe(false)
+    expect(res.reason).toBe('forbidden')
+    expect(svc.getRoundStatus().slippageEnabled).toBe(true)
+  })
+
+  it('refuses a market maker', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    const res = await svc.setSlippageEnabled({ accountId: 'acct-mm', role: 'market_maker' }, false)
+    expect(res.applied).toBe(false)
+    expect(res.reason).toBe('forbidden')
+  })
+
+  it('attributes the change to the master and records the previous value', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setSlippageEnabled(MASTER, false)
+
+    const logged = db.rows('event_log').filter((e) => e.event_type === 'slippage_toggle_changed')
+    expect(logged).toHaveLength(1)
+    expect(logged[0].account_id).toBe(MASTER.accountId)
+    expect(logged[0].payload).toMatchObject({ slippageEnabled: false, previous: true })
+  })
+
+  it('writes no audit event when refused', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setSlippageEnabled(TEAM, false)
+    expect(db.rows('event_log').filter((e) => e.event_type === 'slippage_toggle_changed')).toHaveLength(0)
+  })
+
+  it('does not touch commission, prices or the FX rate', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setSlippageEnabled(MASTER, false)
+
+    const s = svc.getRoundStatus()
+    expect(s.commissionEnabled).toBe(false) // schedule default, unchanged
+    expect(s.usdInrRate).toBe(83)
+    expect(s.commissionRate).toBe(0.003)
+    expect(svc.ltp('AAPL')).toBe(230)
+  })
+})
+
+describe('setCommission: persists early, like the other round settings', () => {
+  it('writes a BETWEEN-ROUNDS toggle to the DB immediately', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    expect(db.rows('rounds')).toHaveLength(0)
+
+    await svc.setCommission(true) // no round started yet
+    const row = db.rows('rounds').find((r) => r.id === 'r1')!
+    expect(row).toBeDefined()
+    expect(row.commission_enabled).toBe(true)
+    expect(row.status).toBe('pending')
+  })
+
+  it('a between-rounds toggle SURVIVES a restart before the round starts', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setCommission(true) // schedule default is false
+
+    const rounds2 = new RoundController(SCHEDULE)
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.getSchedule()[0].commissionEnabled).toBe(true) // not the config default
+    await svc2.startRound(0)
+    expect(svc2.getRoundStatus().commissionEnabled).toBe(true)
+  })
+
+  it('a MID-ROUND toggle survives a restart too', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setCommission(true)
+    expect(db.rows('rounds').find((r) => r.id === 'r1')!.commission_enabled).toBe(true)
+
+    const rounds2 = new RoundController(SCHEDULE)
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.getRoundStatus().active).toBe(true)
+    expect(svc2.getRoundStatus().commissionEnabled).toBe(true)
+  })
+
+  it('turning it back OFF persists and survives too', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setCommission(true)
+    await svc.setCommission(false)
+    expect(db.rows('rounds').find((r) => r.id === 'r1')!.commission_enabled).toBe(false)
+
+    const rounds2 = new RoundController(SCHEDULE)
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+    expect(svc2.getSchedule()[0].commissionEnabled).toBe(false)
+  })
+
+  it('does not downgrade an active round or clobber its siblings', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setUsdInrRate(MASTER, 90)
+    await svc.setCommissionRate(MASTER, 0.005)
+    await svc.setSlippageEnabled(MASTER, false)
+    await svc.startRound(0)
+    await svc.setCommission(true)
+
+    const row = db.rows('rounds').find((r) => r.id === 'r1')!
+    expect(row.status).toBe('active') // still active
+    expect(row.started_at).toBeTruthy() // startRound's timestamp intact
+    expect(Number(row.usd_inr_rate)).toBe(90) // other settings preserved
+    expect(Number(row.commission_rate)).toBe(0.005)
+    expect(row.slippage_enabled).toBe(false)
+  })
+
+  it('the pending round row does not make rehydrate think it already ran', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setCommission(true)
+
+    const rounds2 = new RoundController(SCHEDULE)
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    const recovery = await svc2.rehydrate()
+
+    expect(recovery.roundsRestored).toBe(0)
+    expect(svc2.getSchedule()[0].status).toBe('pending')
+  })
+})
+
 describe('setInstrumentPrices: audit log', () => {
   it('logs one instrument_price_set per instrument, attributed to the master', async () => {
     const { db, svc } = harness()

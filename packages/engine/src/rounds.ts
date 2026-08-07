@@ -45,6 +45,11 @@ export interface Round {
    * side. Fixed unless the Master changes it — see `setCommissionRate`.
    */
   commissionRate: number
+  /**
+   * Show teams the slippage nudge after a market order walked the book.
+   * DISPLAY-ONLY: never affects matching, fills or settlement.
+   */
+  slippageEnabled: boolean
   status: RoundStatus
   /** Event-clock second the round started; null until activated. */
   startedAt: number | null
@@ -61,6 +66,8 @@ export interface RoundDefinition {
   usdInrRate?: number
   /** Commission rate for this round; defaults to DEFAULT_COMMISSION_RATE. */
   commissionRate?: number
+  /** Show the slippage nudge this round; defaults to true. */
+  slippageEnabled?: boolean
   /** Optional stable id; falls back to `round-<n>` by position. */
   id?: string
 }
@@ -92,6 +99,7 @@ export class RoundController {
         commissionEnabled: def.commissionEnabled,
         usdInrRate: def.usdInrRate ?? DEFAULT_USD_INR_RATE,
         commissionRate: def.commissionRate ?? DEFAULT_COMMISSION_RATE,
+        slippageEnabled: def.slippageEnabled ?? true,
         status: 'pending',
         startedAt: null,
         endedAt: null,
@@ -163,6 +171,14 @@ export class RoundController {
   /** Whether commission applies right now — false between rounds. */
   isCommissionActive(): boolean {
     return this.activeIndex === null ? false : this.rounds[this.activeIndex].commissionEnabled
+  }
+
+  /**
+   * Whether the slippage nudge should be shown right now. Between rounds there is
+   * nothing to trade, so this reads false — same convention as isCommissionActive.
+   */
+  isSlippageActive(): boolean {
+    return this.activeIndex === null ? false : this.rounds[this.activeIndex].slippageEnabled
   }
 
   /**
@@ -239,6 +255,22 @@ export class RoundController {
    * Forward-only, exactly like the FX rate: fills already settled keep the rate
    * they were charged at, because the charge was computed at fill time.
    */
+  /**
+   * Master-Terminal control: show/hide the slippage nudge on the ACTIVE round,
+   * or — when none is active — the NEXT pending round. Same targeting rule as
+   * setCommission. Purely a display switch; nothing about matching or settlement
+   * depends on it.
+   */
+  setSlippageEnabled(enabled: boolean): Round | null {
+    const target =
+      this.activeIndex !== null
+        ? this.rounds[this.activeIndex]
+        : this.rounds.find((r) => r.status === 'pending')
+    if (!target) return null
+    target.slippageEnabled = enabled
+    return snapshot(target)
+  }
+
   setCommissionRate(rate: number): Round | null {
     if (!isValidCommissionRate(rate)) {
       throw new Error(`commissionRate must be between 0 and ${MAX_COMMISSION_RATE} (got ${rate})`)
@@ -271,6 +303,8 @@ export interface RealRoundSpec {
   usdInrRate?: number
   /** Override the event's default commission rate for this round. */
   commissionRate?: number
+  /** Override whether the slippage nudge is shown for this round. */
+  slippageEnabled?: boolean
 }
 
 export interface EventConfigOptions {
@@ -288,6 +322,8 @@ export interface EventConfigOptions {
   usdInrRate?: number
   /** Commission rate every round starts pinned at. Default DEFAULT_COMMISSION_RATE. */
   commissionRate?: number
+  /** Whether the slippage nudge is shown. Default true. */
+  slippageEnabled?: boolean
 }
 
 /**
@@ -311,6 +347,7 @@ export function createEventConfig(
     mockCommission = false,
     usdInrRate = DEFAULT_USD_INR_RATE,
     commissionRate = DEFAULT_COMMISSION_RATE,
+    slippageEnabled = true,
   } = options
 
   const config: RoundDefinition[] = []
@@ -322,6 +359,7 @@ export function createEventConfig(
       commissionEnabled: mockCommission,
       usdInrRate,
       commissionRate,
+      slippageEnabled,
     })
   }
   realRounds.forEach((spec, i) => {
@@ -332,6 +370,7 @@ export function createEventConfig(
       commissionEnabled: spec.commissionEnabled,
       usdInrRate: spec.usdInrRate ?? usdInrRate,
       commissionRate: spec.commissionRate ?? commissionRate,
+      slippageEnabled: spec.slippageEnabled ?? slippageEnabled,
     })
   })
   return config
