@@ -51,6 +51,8 @@ function Portfolio() {
   const [closing, setClosing] = useState<InventoryRow | null>(null)
   const [closeQty, setCloseQty] = useState('')
   const [closeType, setCloseType] = useState<OrderType>('market')
+  /** Limit price draft, seeded from the mark when the Exit panel opens. */
+  const [closePrice, setClosePrice] = useState('')
   const [pending, setPending] = useState<OrderTerms | null>(null)
   const [result, setResult] = useState<TradeResult | null>(null)
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null)
@@ -115,8 +117,11 @@ function Portfolio() {
     slippageEnabled: data.slippageEnabled,
   })
 
-  /** The order the Close button proposes: full size, in the closing direction. */
-  const termsFor = (row: InventoryRow, qty: number, type: OrderType): OrderTerms | null => {
+  /**
+   * The exit order. Direction is DERIVED from the position sign, never chosen —
+   * that is why the row shows one neutral "Exit" rather than Buy/Sell.
+   */
+  const termsFor = (row: InventoryRow, qty: number, type: OrderType, price: number): OrderTerms | null => {
     const close = closingOrderFor({ qty: row.qty! })
     if (!close) return null
     return {
@@ -124,7 +129,7 @@ function Portfolio() {
       side: close.side,
       type,
       qty,
-      price: row.ltp, // limit defaults to the mark; market uses it as the estimate
+      price, // limit price, or the mark as a market estimate
       leverage: row.leverage ?? 1,
       requiredInr: -1, // a reduce/close frees margin
       liq: null,
@@ -132,10 +137,11 @@ function Portfolio() {
     }
   }
 
-  const openClose = (row: InventoryRow) => {
+  const openExit = (row: InventoryRow) => {
     setClosing(row)
     setCloseQty(String(Math.abs(row.qty!))) // default to the FULL position
     setCloseType('market')
+    setClosePrice(row.ltp > 0 ? row.ltp.toFixed(2) : '')
   }
 
   const submitClose = () => {
@@ -146,7 +152,13 @@ function Portfolio() {
       setToast({ ok: false, text: `Quantity must be between 1 and ${max}` })
       return
     }
-    const terms = termsFor(closing, qty, closeType)
+    // A market exit prices off the mark; a limit exit uses the typed price.
+    const price = closeType === 'limit' ? Number(closePrice) : closing.ltp
+    if (closeType === 'limit' && (!Number.isFinite(price) || price <= 0)) {
+      setToast({ ok: false, text: 'Enter a limit price greater than 0' })
+      return
+    }
+    const terms = termsFor(closing, qty, closeType, price)
     if (terms) setPending(terms)
   }
 
@@ -253,7 +265,7 @@ function Portfolio() {
                     <th className="px-3 py-3 text-right font-medium">Entry Price</th>
                     <th className="px-3 py-3 text-right font-medium">Entry Rate</th>
                     <th className="px-5 py-3 text-right font-medium">Cost Basis</th>
-                    <th className="px-5 py-3 text-right font-medium">Close</th>
+                    <th className="px-5 py-3 text-right font-medium">Exit</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono tabular-nums">
@@ -272,17 +284,14 @@ function Portfolio() {
                         </td>
                         <td className="px-5 py-3 text-right text-foreground">{inr(r.costBasisInr!)}</td>
                         <td className="px-5 py-3 text-right">
-                          {/* Sell closes a long, Buy closes a short — the label
-                              names the actual action, not a generic "Close". */}
+                          {/* One neutral action on every row. Whether this sells
+                              a long or buys back a short is derived from the
+                              position, never presented as a choice. */}
                           <button
-                            onClick={() => openClose(r)}
-                            className={`rounded-md border px-3 py-1 text-[11px] font-medium uppercase transition-colors ${
-                              long
-                                ? 'border-destructive/40 text-destructive hover:bg-destructive/10'
-                                : 'border-up/40 text-up hover:bg-up/10'
-                            }`}
+                            onClick={() => openExit(r)}
+                            className="rounded-md border border-white/15 px-3 py-1 text-[11px] font-medium uppercase text-muted transition-colors hover:border-white/25 hover:bg-white/[0.06] hover:text-bright"
                           >
-                            {long ? 'Sell' : 'Buy'}
+                            Exit
                           </button>
                         </td>
                       </tr>
@@ -351,12 +360,15 @@ function Portfolio() {
       {closing && !pending && (
         <Overlay onClose={() => setClosing(null)}>
           <h3 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>
-            Close {closing.ticker}
+            Exit {closing.ticker}
           </h3>
+          {/* States what they hold, rather than framing buy-vs-sell as a choice. */}
           <p className="mt-2 text-[12px] text-muted">
-            {closing.qty! > 0 ? 'Selling' : 'Buying back'} up to{' '}
-            <span className="font-mono text-bright">{Math.abs(closing.qty!)}</span> at a mark of{' '}
-            <span className="font-mono text-bright">{usd(closing.ltp)}</span>. Reduce the quantity for a partial close.
+            <span className="text-bright">{closing.qty! > 0 ? 'Long' : 'Short'}</span>{' '}
+            <span className="font-mono text-bright">{Math.abs(closing.qty!)}</span>
+            <span className="text-subtle"> · mark </span>
+            <span className="font-mono text-bright">{usd(closing.ltp)}</span>
+            . Reduce the quantity to exit part of the position.
           </p>
 
           <div className="mt-4 flex items-end gap-3">
@@ -366,7 +378,7 @@ function Portfolio() {
                 type="number" min={1} max={Math.abs(closing.qty!)}
                 value={closeQty}
                 onChange={(e) => setCloseQty(e.target.value)}
-                aria-label={`Quantity to close of ${closing.ticker}`}
+                aria-label={`Quantity of ${closing.ticker} to exit`}
                 className={`${INPUT} font-mono tabular-nums`}
               />
             </label>
@@ -381,11 +393,26 @@ function Portfolio() {
               ))}
             </div>
           </div>
+
+          {/* Only a limit exit has a price to set; a market exit takes the mark. */}
+          {closeType === 'limit' && (
+            <label className="mt-3 flex flex-col gap-1.5">
+              <span className="text-[10px] uppercase tracking-wider text-subtle">Limit price (USD)</span>
+              <input
+                type="number" step="0.01" min={0}
+                value={closePrice}
+                onChange={(e) => setClosePrice(e.target.value)}
+                aria-label={`Limit price to exit ${closing.ticker}`}
+                className={`${INPUT} font-mono tabular-nums`}
+              />
+            </label>
+          )}
+
           <button
             onClick={() => setCloseQty(String(Math.abs(closing.qty!)))}
             className="mt-2 text-[11px] text-subtle underline-offset-2 transition-colors hover:text-bright hover:underline"
           >
-            Close the full position
+            Exit the full position
           </button>
 
           <div className="mt-6 flex gap-2">
