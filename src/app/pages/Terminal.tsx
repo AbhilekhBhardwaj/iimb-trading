@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { applyLeveredFill, DEFAULT_COMMISSION_RATE, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
 import { toCashPosition } from '../../lib/orderConfirm'
+import { depthCountLabel, spreadScrollTop } from '../../lib/depthLadder'
 import { buildConfirmLines, buildTradeOutcome, type MarketContext } from '../../lib/orderFlow'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
@@ -384,7 +385,7 @@ const DEPTH_LEVELS = 30 // per side; the ladder scrolls within its panel to reve
 /** Shared 3-column grid: bid-size | central price | ask-size. */
 const LADDER_COLS = 'grid grid-cols-[1fr_84px_1fr] items-center'
 
-function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
+function DepthLadder({ snap, role, ticker }: { snap: Snapshot | null; role: string; ticker: string }) {
   const depth = snap?.depth
   // Zero-qty levels are already excluded upstream. Asks ascending (best/lowest
   // first); bids descending (best/highest first). Both sides nearest the spread.
@@ -395,14 +396,51 @@ function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
   const resting = role === 'market_maker' ? depth?.restingOrders : undefined
   const empty = asks.length === 0 && bids.length === 0
 
+  // The ladder is one continuous scroller, so it opens at the TOP of the ask
+  // stack — the furthest-away offers — with the spread and every bid below the
+  // fold. Centre the spread instead, and stop doing so the moment the user
+  // scrolls for themselves so the 2s poll can never yank the view back.
+  const scrollerRef = useRef<HTMLDivElement | null>(null)
+  const spreadRef = useRef<HTMLDivElement | null>(null)
+  const autoTopRef = useRef(0)
+  const userScrolledRef = useRef(false)
+
+  useLayoutEffect(() => {
+    userScrolledRef.current = false // a new instrument is a fresh book
+  }, [ticker])
+
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current
+    const spreadEl = spreadRef.current
+    if (!scroller || !spreadEl || userScrolledRef.current) return
+    const box = spreadEl.getBoundingClientRect()
+    const top = spreadScrollTop({
+      // Offset WITHIN the scrolled content — offsetTop would measure from the
+      // panel (the nearest positioned ancestor), not from the scroller.
+      spreadTop: box.top - scroller.getBoundingClientRect().top + scroller.scrollTop,
+      spreadHeight: box.height,
+      viewportHeight: scroller.clientHeight,
+      contentHeight: scroller.scrollHeight,
+    })
+    autoTopRef.current = top
+    scroller.scrollTop = top
+  }, [ticker, empty, asks.length, bids.length])
+
   return (
     <Panel
       title="Market Depth"
       delay={0.06}
-      right={role === 'market_maker' ? <span className="text-[9px] uppercase tracking-wider text-[#E8C46A]">MM · full book</span> : undefined}
+      right={
+        <span className="flex items-center gap-2">
+          {/* How deep each side runs. Answers "is there more below?" without
+              having to scroll to find out. */}
+          <span className="font-mono text-[10px] tabular-nums text-subtle">{depthCountLabel(bids.length, asks.length)}</span>
+          {role === 'market_maker' && <span className="text-[9px] uppercase tracking-wider text-[#E8C46A]">MM · full book</span>}
+        </span>
+      }
     >
       <div className="flex min-h-0 flex-1 flex-col p-2 text-[11px]">
-        <div className={`${LADDER_COLS} px-2 pb-1 text-[9px] uppercase tracking-wider text-subtle`}>
+        <div className={`${LADDER_COLS} shrink-0 px-2 pb-1 text-[9px] uppercase tracking-wider text-subtle`}>
           <span className="text-right">Bid Size</span>
           <span className="text-center">Price</span>
           <span className="text-left">Ask Size</span>
@@ -411,23 +449,31 @@ function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
         {empty ? (
           <div className="flex flex-1 items-center justify-center text-subtle">No resting orders.</div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-1">
+          <div
+            ref={scrollerRef}
+            onScroll={(e) => {
+              // Only a scroll that lands somewhere we did not put it counts as
+              // the user taking over; assigning scrollTop also fires this.
+              if (Math.abs(e.currentTarget.scrollTop - autoTopRef.current) > 2) userScrolledRef.current = true
+            }}
+            className="flex min-h-0 flex-1 flex-col overflow-y-auto px-1"
+          >
             {/* ASKS above the spread — lowest (best) sits at the bottom, nearest the line */}
-            <div className="flex flex-col gap-px">
+            <div className="flex shrink-0 flex-col gap-px">
               {[...asks].reverse().map((l) => (
                 <LadderRow key={`a${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} side="ask" />
               ))}
             </div>
 
             {/* Spread divider line */}
-            <div className="my-1.5 flex items-center gap-2 px-2">
+            <div ref={spreadRef} className="my-1.5 flex shrink-0 items-center gap-2 px-2">
               <div className="h-px flex-1 bg-white/[0.12]" />
               <span className="font-mono text-[10px] tabular-nums text-subtle">{spread === null ? '—' : usd(spread)}</span>
               <div className="h-px flex-1 bg-white/[0.12]" />
             </div>
 
             {/* BIDS below the spread — highest (best) sits at the top, nearest the line */}
-            <div className="flex flex-col gap-px">
+            <div className="flex shrink-0 flex-col gap-px">
               {bids.map((l) => (
                 <LadderRow key={`b${l.price}`} price={l.price} qty={l.qty} maxQty={maxQty} side="bid" />
               ))}
@@ -435,12 +481,15 @@ function DepthLadder({ snap, role }: { snap: Snapshot | null; role: string }) {
           </div>
         )}
 
+        {/* Market maker's per-order view. Its own scroller with a fixed share of
+            the panel, so a book with dozens of resting orders is fully reachable
+            instead of being capped at the four rows an 80px box allowed. */}
         {resting && resting.length > 0 && (
-          <div className="mt-2 border-t border-white/[0.06] pt-2">
-            <div className="mb-1 text-[9px] uppercase tracking-[0.16em] text-subtle">Resting Orders ({resting.length})</div>
-            <div className="flex max-h-20 flex-col gap-0.5 overflow-y-auto">
+          <div className="mt-2 flex min-h-0 shrink-0 basis-2/5 flex-col border-t border-white/[0.06] pt-2">
+            <div className="mb-1 shrink-0 text-[9px] uppercase tracking-[0.16em] text-subtle">Resting Orders ({resting.length})</div>
+            <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto pr-1">
               {resting.map((o) => (
-                <div key={o.orderId} className="flex items-center gap-2 font-mono tabular-nums">
+                <div key={o.orderId} className="flex shrink-0 items-center gap-2 font-mono tabular-nums">
                   <span className={`w-9 ${o.side === 'buy' ? 'text-up' : 'text-destructive'}`}>{o.side === 'buy' ? 'BUY' : 'SELL'}</span>
                   <span className="w-16 text-right text-foreground">{usd(o.price)}</span>
                   <span className="w-12 text-right text-muted">{o.remainingQty}</span>
@@ -705,9 +754,12 @@ function Terminal() {
         </div>
 
         {/* RIGHT column: chart / depth / times & sales */}
-        <div className="grid min-h-0 grid-rows-[minmax(0,1.45fr)_minmax(0,1.15fr)_minmax(0,0.8fr)] gap-4">
+        {/* Depth gets a slightly larger share than before (1.15 → 1.3fr), taken
+            from the chart so the column total is unchanged — three visible price
+            levels was too few to read a book from. */}
+        <div className="grid min-h-0 grid-rows-[minmax(0,1.3fr)_minmax(0,1.3fr)_minmax(0,0.8fr)] gap-4">
           <PriceChart snap={snap} ticker={selected} ltp={row?.ltp ?? 0} tf={tf} onTf={setTf} />
-          <DepthLadder snap={snap} role={boot.role} />
+          <DepthLadder snap={snap} role={boot.role} ticker={selected} />
           <TimesAndSales snap={snap} ticker={selected} />
         </div>
       </div>

@@ -62,6 +62,38 @@
   --font-display: 'PP Editorial New', serif;
 }
 
+/*
+ * Scrollbars, styled for a near-black UI.
+ *
+ * Every scrollable panel already sets `overflow-y-auto`, but the browser's
+ * default chrome is light-grey — and on some platforms a thin overlay bar that
+ * fades out entirely — so a panel holding more content than it can show reads
+ * as a cropped one with no way in. A visible, permanently-present bar is the
+ * affordance that says "there is more below". Applied globally so Market Depth,
+ * Times & Sales, the instrument list and the Portfolio tables all agree.
+ *
+ * Deliberately NOT `color-scheme: dark`, which would also restyle every input
+ * and select in the app.
+ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
 body {
   background: var(--color-background);
   color: var(--color-foreground);
