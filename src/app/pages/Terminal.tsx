@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { applyLeveredFill, DEFAULT_COMMISSION_RATE, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
-import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
+import { CARD, CARD_SHADOW, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
 import { toCashPosition } from '../../lib/orderConfirm'
 import { buildConfirmLines, buildTradeOutcome, type MarketContext } from '../../lib/orderFlow'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
+import { ConfirmDialog, Overlay, ResultDialog, type TradeResult } from '../components/OrderDialogs'
 import { Panel } from '../components/Panel'
 import PriceChart from './PriceChart'
 import { CANDLE_SPAN, DOWN, intervalOf, type TF, UP, usd } from './terminalShared'
@@ -523,92 +524,6 @@ function TimesAndSales({ snap, ticker }: { snap: Snapshot | null; ticker: string
       </div>
     </Panel>
   )
-}
-
-// ---------------------------------------------------------------------------
-// Popups
-// ---------------------------------------------------------------------------
-function Overlay({ children, onClose }: { children: ReactNode; onClose?: () => void }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-6 backdrop-blur-sm" onClick={onClose}>
-      <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, ease: EASE }}
-        className={`${CARD} w-full max-w-sm p-6`} style={{ boxShadow: CARD_SHADOW }} onClick={(e) => e.stopPropagation()}>
-        {children}
-      </motion.div>
-    </div>
-  )
-}
-
-function ConfirmDialog({ title, lines, confirmLabel, tone, onConfirm, onCancel }: {
-  title: string
-  lines: { k: string; v: string; tone?: 'up' | 'destructive' }[]
-  confirmLabel: string
-  tone: 'up' | 'destructive'
-  onConfirm: () => void
-  onCancel: () => void
-}) {
-  return (
-    <Overlay onClose={onCancel}>
-      <h3 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>{title}</h3>
-      <dl className="mt-4 flex flex-col gap-1.5 text-[13px]">
-        {lines.map((l) => (
-          <div key={l.k} className="flex items-center justify-between">
-            <dt className="text-subtle">{l.k}</dt>
-            <dd className={`font-mono tabular-nums ${l.tone === 'up' ? 'text-up' : l.tone === 'destructive' ? 'text-destructive' : 'text-foreground'}`}>{l.v}</dd>
-          </div>
-        ))}
-      </dl>
-      <div className="mt-6 flex gap-2">
-        <button onClick={onCancel} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Cancel</button>
-        <button onClick={onConfirm}
-          className={`flex-1 rounded-full py-2.5 text-sm font-medium text-bright transition-colors ${tone === 'up' ? 'bg-up/20 hover:bg-up/30' : 'bg-destructive/20 hover:bg-destructive/30'}`}>
-          {confirmLabel}
-        </button>
-      </div>
-    </Overlay>
-  )
-}
-
-/**
- * Post-trade result popup: what the fill ACTUALLY did, as opposed to the
- * pre-trade estimate in ConfirmDialog. Carries the realized P&L breakdown and
- * the slippage nudge together in one dialog rather than two, since a closing
- * market order can produce both.
- */
-function ResultDialog({ title, lines, note, onClose }: {
-  title: string
-  lines: { k: string; v: string; tone?: 'up' | 'destructive' }[]
-  note?: string | null
-  onClose: () => void
-}) {
-  return (
-    <Overlay onClose={onClose}>
-      <h3 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>{title}</h3>
-      {lines.length > 0 && (
-        <dl className="mt-4 flex flex-col gap-1.5 text-[13px]">
-          {lines.map((l) => (
-            <div key={l.k} className="flex items-center justify-between">
-              <dt className="text-subtle">{l.k}</dt>
-              <dd className={`font-mono tabular-nums ${l.tone === 'up' ? 'text-up' : l.tone === 'destructive' ? 'text-destructive' : 'text-foreground'}`}>{l.v}</dd>
-            </div>
-          ))}
-        </dl>
-      )}
-      {note && (
-        <div className="mt-4 rounded-lg border border-white/10 bg-white/[0.03] p-3">
-          <div className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: GOLD.solid }}>Slippage</div>
-          <p className="mt-1.5 text-[12px] leading-relaxed text-muted">{note}</p>
-        </div>
-      )}
-      <button onClick={onClose} className="mt-6 w-full rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Done</button>
-    </Overlay>
-  )
-}
-
-interface TradeResult {
-  title: string
-  lines: { k: string; v: string; tone?: 'up' | 'destructive' }[]
-  note: string | null
 }
 
 interface Toast { id: number; ok: boolean; title: string; detail?: string }

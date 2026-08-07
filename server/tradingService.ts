@@ -1537,6 +1537,12 @@ export class TradingService {
 
     return {
       rate,
+      // Round settings the Portfolio's Close action needs to build the SAME
+      // confirm and result dialogs the Terminal does. Sent here so the page does
+      // not need a second bootstrap() round-trip just to price a close.
+      commissionEnabled: this.rounds.isCommissionActive(),
+      commissionRate: this.commissionRate(),
+      slippageEnabled: this.rounds.isSlippageActive(),
       openingBalanceInr,
       realizedPnlInr,
       cashInr,

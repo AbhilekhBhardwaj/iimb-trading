@@ -200,6 +200,10 @@ export interface TradeHistoryEntry {
 export interface Portfolio {
   /** USD→INR pinned for the current round. */
   rate: number
+  /** Round settings, so a close placed from here matches the Terminal exactly. */
+  commissionEnabled: boolean
+  commissionRate: number
+  slippageEnabled: boolean
   openingBalanceInr: number
   realizedPnlInr: number
   /** Spendable INR: equity − margin posted − margin reserved. */
