@@ -118,10 +118,43 @@ export interface PlaceOrderInput {
   role?: string
 }
 
+/**
+ * Stable machine codes for every way an order can be turned away before it
+ * reaches the book. The free-text `reason` stays as-is for the smoke scripts
+ * and the event log; THIS is what the UI switches on to build its message.
+ */
+export type RejectionCode =
+  | 'no_active_round'
+  | 'unknown_instrument'
+  | 'invalid_qty'
+  | 'invalid_leverage'
+  | 'missing_limit_price'
+  | 'no_reference_price'
+  | 'insufficient_margin'
+
+/**
+ * Everything the UI needs to explain a rejection in the user's own terms.
+ *
+ * The margin figures used to be logged to `event_log` and nowhere else, which
+ * left the terminal able to say only "insufficient_margin" — the numbers that
+ * make the message actionable never crossed the wire.
+ */
+export interface OrderRejection {
+  code: RejectionCode
+  /** Cash the order needed, INR. Present for `insufficient_margin`. */
+  requiredInr?: number
+  /** Cash actually free, INR. Present for `insufficient_margin`. */
+  availableInr?: number
+  /** The instrument, for `unknown_instrument`. */
+  ticker?: string
+}
+
 export interface PlaceOrderResult {
   accepted: boolean
   /** Present when the order was rejected before matching. */
   reason?: string
+  /** Structured detail for a rejection; absent when accepted. */
+  rejection?: OrderRejection
   orderId?: string
   status?: Order['status']
   remainingQty?: number
@@ -1053,17 +1086,17 @@ export class TradingService {
   async placeOrder(input: PlaceOrderInput): Promise<PlaceOrderResult> {
     // 1. Round gate — no active round means no trading.
     if (this.rounds.getMode() === null || this.activeRoundId === null) {
-      return this.reject(input, 'no active round')
+      return this.reject(input, 'no active round', { code: 'no_active_round' })
     }
     // 2. Instrument must be known.
     const instrumentId = this.tickerToId.get(input.ticker)
-    if (!instrumentId) return this.reject(input, `unknown instrument: ${input.ticker}`)
+    if (!instrumentId) return this.reject(input, `unknown instrument: ${input.ticker}`, { code: 'unknown_instrument', ticker: input.ticker })
     // 3. Basic validation.
-    if (!(input.qty > 0)) return this.reject(input, 'qty must be positive')
+    if (!(input.qty > 0)) return this.reject(input, 'qty must be positive', { code: 'invalid_qty' })
     const leverage = input.leverage ?? 1
-    if (!(leverage >= 1)) return this.reject(input, 'invalid_leverage')
+    if (!(leverage >= 1)) return this.reject(input, 'invalid_leverage', { code: 'invalid_leverage' })
     if (input.type === 'limit' && (input.price === undefined || Number.isNaN(input.price))) {
-      return this.reject(input, 'limit order requires a price')
+      return this.reject(input, 'limit order requires a price', { code: 'missing_limit_price' })
     }
 
     // 4. Margin / buying-power gate — BEFORE the matching engine. Value the order
@@ -1072,7 +1105,7 @@ export class TradingService {
     const valuationPrice =
       input.type === 'limit' ? (input.price as number) : (input.markPrice ?? this.lastPrice.get(input.ticker))
     if (valuationPrice === undefined || !(valuationPrice > 0)) {
-      return this.reject(input, 'no_reference_price')
+      return this.reject(input, 'no_reference_price', { code: 'no_reference_price' })
     }
     const rate = this.rateInr()
     const existing = await this.cashPosition(input.accountId, instrumentId)
@@ -1092,6 +1125,10 @@ export class TradingService {
       const availableInr = await this.availableCashInr(input.accountId)
       if (requiredInr > availableInr + EPS) {
         return this.reject(input, 'insufficient_margin', {
+          code: 'insufficient_margin',
+          requiredInr,
+          availableInr,
+        }, {
           requiredMarginInr: requiredInr,
           availableMarginInr: availableInr,
           leverage,
@@ -2058,6 +2095,7 @@ export class TradingService {
   private async reject(
     input: PlaceOrderInput,
     reason: string,
+    rejection: OrderRejection,
     extra: Record<string, unknown> = {},
   ): Promise<PlaceOrderResult> {
     await this.log(input.accountId, 'order_rejected', 'warning', {
@@ -2070,7 +2108,7 @@ export class TradingService {
       leverage: input.leverage ?? 1,
       ...extra,
     })
-    return { accepted: false, reason }
+    return { accepted: false, reason, rejection }
   }
 
   /**

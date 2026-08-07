@@ -250,3 +250,88 @@ describe('one implementation — Portfolio and Terminal cannot diverge', () => {
     expect(buildTradeOutcome(portfolio, ctx(), res)).toEqual(buildTradeOutcome(terminal, ctx(), res))
   })
 })
+
+describe('a rejected order NEVER enters the success flow', () => {
+  /**
+   * The bug this pins: a rejected order carries no trades, so before the
+   * rejection branch existed `filled === 0` sent it down the "Order resting"
+   * path — a GREEN toast telling the trader their order was on the book when
+   * the server had refused it outright.
+   */
+  const rejected = {
+    accepted: false,
+    reason: 'insufficient_margin',
+    rejection: { code: 'insufficient_margin' as const, requiredInr: 166_000, availableInr: 40_000 },
+  }
+
+  it('is a reject outcome, not a resting toast', () => {
+    const out = buildTradeOutcome(order({ side: 'buy', closes: false }), ctx({ position: null }), rejected)
+    expect(out.kind).toBe('reject')
+  })
+
+  it('never claims the order is on the book', () => {
+    const out = buildTradeOutcome(order({ side: 'buy', closes: false }), ctx({ position: null }), rejected)
+    expect(JSON.stringify(out)).not.toContain('resting')
+    expect(JSON.stringify(out)).not.toContain('on the book')
+  })
+
+  it('carries the numbers a trader needs to fix it', () => {
+    const out = buildTradeOutcome(order(), ctx(), rejected)
+    expect(out.kind === 'reject' && out.detail).toContain('₹1,66,000')
+    expect(out.kind === 'reject' && out.detail).toContain('₹40,000')
+  })
+
+  it('shows no P&L breakdown — nothing was realized', () => {
+    const out = buildTradeOutcome(order(), ctx(), rejected)
+    expect(out).not.toHaveProperty('lines')
+  })
+
+  it('rejects BEFORE reading trades, even on a contradictory payload', () => {
+    // Defensive: accepted:false with fills attached must still reject rather
+    // than book a phantom P&L against a trade that did not happen.
+    const out = buildTradeOutcome(order(), ctx(), { ...rejected, trades: [{ price: 190, qty: 10 }] })
+    expect(out.kind).toBe('reject')
+  })
+
+  it.each([
+    'no_active_round', 'unknown_instrument', 'invalid_qty',
+    'invalid_leverage', 'missing_limit_price', 'no_reference_price', 'insufficient_margin',
+  ] as const)('%s reaches the UI as a reject outcome', (code) => {
+    const out = buildTradeOutcome(order(), ctx(), { accepted: false, reason: code, rejection: { code } })
+    expect(out.kind).toBe('reject')
+    expect(out.kind === 'reject' && out.title.startsWith('Order rejected')).toBe(true)
+  })
+
+  it('the Portfolio Exit flow rejects identically to the Terminal', () => {
+    const close = closingOrderFor(LONG)!
+    const fromPortfolio = buildTradeOutcome(order({ side: close.side, qty: close.qty }), ctx(), rejected)
+    const fromTerminal = buildTradeOutcome(order({ side: 'sell', qty: 10 }), ctx(), rejected)
+    expect(fromPortfolio).toEqual(fromTerminal)
+  })
+})
+
+describe('an ACCEPTED order still behaves exactly as before', () => {
+  it('a filled close still opens the normal result dialog', () => {
+    const out = buildTradeOutcome(order(), ctx(), { accepted: true, trades: [{ price: 190, qty: 10 }], bestPriceAtSubmit: 190 })
+    expect(out.kind).toBe('dialog')
+    expect(out.kind === 'dialog' && out.title).toBe('Order Filled')
+    expect(out.kind === 'dialog' && valueOf(out.lines, 'Gross P&L')).toBe('+₹8,300')
+  })
+
+  it('an accepted-but-unfilled order still rests, as a toast', () => {
+    const out = buildTradeOutcome(order({ qty: 10, price: 250 }), ctx(), { accepted: true, trades: [] })
+    expect(out).toEqual({ kind: 'toast', ok: true, title: 'Order resting', detail: '10 @ $250.00 on the book' })
+  })
+
+  it('adding the accepted flag changed nothing about a successful fill', () => {
+    const res = { trades: [{ price: 190, qty: 10 }], bestPriceAtSubmit: 190 }
+    expect(buildTradeOutcome(order(), ctx(), { ...res, accepted: true })).toEqual(buildTradeOutcome(order(), ctx(), res))
+  })
+
+  it('the slippage nudge still rides along on an accepted market fill', () => {
+    const out = buildTradeOutcome(order({ type: 'market' }), ctx(), {
+      accepted: true, trades: [{ price: 190, qty: 5 }, { price: 188, qty: 5 }], bestPriceAtSubmit: 190,
+    })
+    expect(out.kind === 'dialog' && out.note).toContain('could have saved you $10.00')
+  })
+})

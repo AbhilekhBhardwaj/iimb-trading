@@ -8,7 +8,7 @@ import { depthCountLabel, spreadScrollTop } from '../../lib/depthLadder'
 import { buildConfirmLines, buildTradeOutcome, type MarketContext } from '../../lib/orderFlow'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
-import { ConfirmDialog, Overlay, ResultDialog, type TradeResult } from '../components/OrderDialogs'
+import { ConfirmDialog, Overlay, RejectDialog, type RejectionResult, ResultDialog, type TradeResult } from '../components/OrderDialogs'
 import { Panel } from '../components/Panel'
 import PriceChart from './PriceChart'
 import { CANDLE_SPAN, DOWN, intervalOf, type TF, UP, usd } from './terminalShared'
@@ -602,6 +602,8 @@ function Terminal() {
   const [tf, setTf] = useState<TF>('5min')
   const [pending, setPending] = useState<PendingOrder | null>(null)
   const [result, setResult] = useState<TradeResult | null>(null)
+  /** A refused order. Modal, like a fill — never a toast that fades away. */
+  const [rejected, setRejected] = useState<RejectionResult | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [announcement, setAnnouncement] = useState<Notification | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -697,17 +699,19 @@ function Terminal() {
     const ctx = marketContext()
     try {
       const res = await api.placeOrder({ ticker: selected, side: o.side, type: o.type, price: o.type === 'limit' ? o.price : undefined, qty: o.qty, leverage: o.leverage })
-      if (!res.accepted) {
-        analytics.capture('order_rejected', { ticker: selected, side: o.side, type: o.type, qty: o.qty, reason: res.reason })
-        pushToast(false, 'Order rejected', res.reason); return
-      }
       const filled = (res.trades ?? []).reduce((a, t) => a + t.qty, 0)
-      if (filled > 0) analytics.capture('order_filled', { ticker: selected, side: o.side, type: o.type, qty: o.qty, filledQty: filled })
+      if (res.accepted && filled > 0) analytics.capture('order_filled', { ticker: selected, side: o.side, type: o.type, qty: o.qty, filledQty: filled })
 
       // The rest vs toast vs dialog decision, the realized breakdown and the
       // slippage nudge all live in lib/orderFlow, so the Portfolio's Close
       // action produces exactly this outcome from exactly this code.
       const outcome = buildTradeOutcome({ ...o, ticker: selected }, ctx, res)
+      // A refusal is the loudest thing this flow can produce: same modal weight
+      // as a fill, and it stays until dismissed.
+      if (outcome.kind === 'reject') {
+        analytics.capture('order_rejected', { ticker: selected, side: o.side, type: o.type, qty: o.qty, reason: res.reason, code: outcome.code })
+        setRejected({ title: outcome.title, detail: outcome.detail }); return
+      }
       if (outcome.kind === 'toast') { pushToast(true, outcome.title, outcome.detail); return }
       if (outcome.note) analytics.capture('slippage_nudge_shown', { ticker: selected, side: o.side, qty: outcome.filledQty })
       setResult({ title: outcome.title, lines: outcome.lines, note: outcome.note })
@@ -795,6 +799,8 @@ function Terminal() {
           <button onClick={() => setAnnouncement(null)} className="mt-6 w-full rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Dismiss</button>
         </Overlay>
       )}
+      {rejected && <RejectDialog title={rejected.title} detail={rejected.detail} onClose={() => setRejected(null)} />}
+
       <Toasts toasts={toasts} />
     </div>
   )

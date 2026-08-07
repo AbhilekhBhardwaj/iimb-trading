@@ -14,6 +14,7 @@
 import { type CashPosition, type CommissionTerms } from '@iimb-trading/engine'
 import { inr, usd } from './format'
 import { type ConfirmLine, orderPnlLines } from './orderConfirm'
+import { type OrderRejection, rejectionMessage } from './orderRejection'
 import { averageFillPrice, type Fill, slippageNudge } from './slippage'
 
 type Side = 'buy' | 'sell'
@@ -48,6 +49,10 @@ export interface MarketContext {
 
 /** What the server said about the order. */
 export interface PlacementResult {
+  /** False when the order was turned away before reaching the book. */
+  accepted?: boolean
+  reason?: string
+  rejection?: OrderRejection
   trades?: Fill[]
   bestPriceAtSubmit?: number
 }
@@ -137,13 +142,16 @@ export function buildCancelLines(o: CancellableOrder): ConfirmLine[] {
 
 /** What should happen after the server accepted the order. */
 export type TradeOutcome =
+  /** The order never reached the book. Shown as a modal, never a fading toast. */
+  | { kind: 'reject'; title: string; detail: string; code: string }
   | { kind: 'toast'; ok: true; title: string; detail: string }
   | { kind: 'dialog'; title: string; lines: ConfirmLine[]; note: string | null; filledQty: number }
 
 /**
  * Turn an accepted placement into the outcome the UI shows.
  *
- * Nothing filled → the order is resting, a toast. Filled with nothing to teach →
+ * Rejected → an error dialog, always. Nothing filled → the order is resting, a
+ * toast. Filled with nothing to teach →
  * a toast. Filled with a realized breakdown or a slippage nudge → the result
  * dialog. Everything is measured on what ACTUALLY filled: the volume-weighted
  * average across however many levels the order touched, and only the quantity
@@ -154,6 +162,13 @@ export function buildTradeOutcome(
   ctx: MarketContext,
   res: PlacementResult,
 ): TradeOutcome {
+  // REJECTION FIRST, before anything reads `trades`. A rejected order has no
+  // fills, so every later branch would read it as "resting on the book" — which
+  // is precisely how a bounced order came to look like a successful one. Making
+  // this a case of the shared outcome means no caller can forget to check.
+  const rejected = rejectionMessage(res)
+  if (rejected) return { kind: 'reject', ...rejected }
+
   const fills = res.trades ?? []
   const filled = fills.reduce((a, t) => a + t.qty, 0)
   if (filled === 0) {

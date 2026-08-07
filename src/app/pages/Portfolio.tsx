@@ -5,7 +5,7 @@ import { DEFAULT_COMMISSION_RATE } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, INPUT } from '../../lib/design-patterns'
 import { supabase } from '../../lib/supabase'
 import { api, type InventoryRow, type OrderType, type Portfolio as PortfolioData, type WorkingOrder } from '../../lib/api'
-import { ConfirmDialog, Overlay, ResultDialog, type TradeResult } from '../components/OrderDialogs'
+import { ConfirmDialog, Overlay, RejectDialog, type RejectionResult, ResultDialog, type TradeResult } from '../components/OrderDialogs'
 import { toCashPosition } from '../../lib/orderConfirm'
 import { buildCancelLines, buildConfirmLines, buildTradeOutcome, closingOrderFor, type MarketContext, type OrderTerms } from '../../lib/orderFlow'
 import { usd } from '../../lib/format'
@@ -55,6 +55,8 @@ function Portfolio() {
   const [closePrice, setClosePrice] = useState('')
   const [pending, setPending] = useState<OrderTerms | null>(null)
   const [result, setResult] = useState<TradeResult | null>(null)
+  /** A refused exit order. Modal, matching the Terminal exactly. */
+  const [rejected, setRejected] = useState<RejectionResult | null>(null)
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null)
   /** The working order awaiting cancel confirmation, and the one in flight. */
   const [cancelling, setCancelling] = useState<WorkingOrder | null>(null)
@@ -177,9 +179,13 @@ function Portfolio() {
         ticker: o.ticker, side: o.side, type: o.type,
         price: o.type === 'limit' ? o.price : undefined, qty: o.qty, leverage: o.leverage,
       })
-      if (!res.accepted) { setToast({ ok: false, text: `Order rejected — ${res.reason ?? 'unknown reason'}` }); return }
-
       const outcome = buildTradeOutcome(o, ctx, res)
+      // Same modal the Terminal shows, from the same outcome — an exit that is
+      // refused must never look like an exit that worked.
+      if (outcome.kind === 'reject') {
+        analytics.capture('order_rejected', { ticker: o.ticker, side: o.side, qty: o.qty, reason: res.reason, code: outcome.code, from: 'portfolio' })
+        setRejected({ title: outcome.title, detail: outcome.detail }); return
+      }
       if (outcome.kind === 'toast') setToast({ ok: true, text: `${outcome.title} — ${outcome.detail}` })
       else setResult({ title: outcome.title, lines: outcome.lines, note: outcome.note })
       const p = await api.portfolio() // reflect the fill immediately
@@ -533,6 +539,8 @@ function Portfolio() {
           lines={buildCancelLines(cancelling)}
         />
       )}
+
+      {rejected && <RejectDialog title={rejected.title} detail={rejected.detail} onClose={() => setRejected(null)} />}
 
       {result && (
         <ResultDialog title={result.title} lines={result.lines} note={result.note} onClose={() => setResult(null)} />

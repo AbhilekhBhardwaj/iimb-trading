@@ -62,6 +62,49 @@ export function ConfirmDialog({ title, lines, confirmLabel, tone, onConfirm, onC
   )
 }
 
+/** A rejected order, ready to render. Mirrors TradeOutcome's `reject` variant. */
+export interface RejectionResult {
+  title: string
+  detail: string
+}
+
+/**
+ * A rejected order.
+ *
+ * Deliberately the SAME weight as ResultDialog — a modal, over a dimmed
+ * backdrop, dismissed by a click. It used to be a 12px toast in the corner that
+ * faded after 4.5 seconds, which made the failure quieter than the success and
+ * is how a bounced order came to look like a placed one.
+ *
+ * There is no "Cancel"/"Confirm" pair because there is nothing to decide: the
+ * order did not happen. One button, and it says so.
+ */
+export function RejectDialog({ title, detail, onClose }: {
+  title: string
+  detail: string
+  onClose: () => void
+}) {
+  return (
+    <Overlay onClose={onClose}>
+      <div className="flex items-start gap-3">
+        {/* A destructive-toned mark, so the dialog reads as a refusal at a
+            glance rather than on the second line. */}
+        <span aria-hidden className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-destructive/15 text-[15px] font-semibold text-destructive">
+          !
+        </span>
+        <h3 className="text-destructive" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem', lineHeight: 1.15 }} role="alert">
+          {title}
+        </h3>
+      </div>
+      <p className="mt-4 text-[13px] leading-relaxed text-muted">{detail}</p>
+      <button onClick={onClose}
+        className="mt-6 w-full rounded-full bg-destructive/20 py-2.5 text-sm font-medium text-bright transition-colors hover:bg-destructive/30">
+        Dismiss
+      </button>
+    </Overlay>
+  )
+}
+
 /** What a fill ACTUALLY did, as opposed to ConfirmDialog's pre-trade estimate. */
 export interface TradeResult {
   title: string

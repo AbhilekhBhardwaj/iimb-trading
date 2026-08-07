@@ -300,9 +300,29 @@ export interface ResetEventResult {
   round: RoundStatus
 }
 
+/** Mirrors the server's RejectionCode — see server/tradingService.ts. */
+export type RejectionCode =
+  | 'no_active_round'
+  | 'unknown_instrument'
+  | 'invalid_qty'
+  | 'invalid_leverage'
+  | 'missing_limit_price'
+  | 'no_reference_price'
+  | 'insufficient_margin'
+
+/** Structured detail behind a rejection, so the UI can explain it with numbers. */
+export interface OrderRejection {
+  code: RejectionCode
+  requiredInr?: number
+  availableInr?: number
+  ticker?: string
+}
+
 export interface PlaceOrderResult {
   accepted: boolean
   reason?: string
+  /** Present only when `accepted` is false. */
+  rejection?: OrderRejection
   orderId?: string
   status?: string
   remainingQty?: number
