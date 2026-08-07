@@ -118,9 +118,25 @@ function Portfolio() {
             <span>{gain >= 0 ? '+' : '−'}{num(Math.abs(data.totalPnlPct), 2)}%</span>
           </div>
 
-          <div className="mt-8 max-w-xs">
-            <div className="text-[10px] uppercase tracking-[0.16em] text-subtle">Cash Available</div>
-            <div className="mt-1 font-mono text-2xl tabular-nums text-bright">{inr(data.cashInr)}</div>
+          {/* Commission sits beside cash, not inside Trade History: IIMB wants the
+              total always visible, and it is charged on EVERY fill regardless of
+              whether the confirmation popup itemises it. The history table below
+              lists closing fills only, so its Charges column sums to less than
+              this figure whenever an opening fill was charged. */}
+          <div className="mt-8 grid max-w-lg grid-cols-2 gap-8">
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.16em] text-subtle">Cash Available</div>
+              <div className="mt-1 font-mono text-2xl tabular-nums text-bright">{inr(data.cashInr)}</div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.16em] text-subtle">Commission Charged</div>
+              <div className={`mt-1 font-mono text-2xl tabular-nums ${data.chargesInr > 0 ? 'text-destructive' : 'text-bright'}`}>
+                {data.chargesInr > 0 ? `−${inr(data.chargesInr)}` : inr(0)}
+              </div>
+              <div className="mt-1.5 text-[10px] leading-relaxed text-subtle">
+                Every fill, opens included. Already deducted from your P&amp;L above.
+              </div>
+            </div>
           </div>
         </section>
 
