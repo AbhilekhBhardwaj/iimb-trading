@@ -4,10 +4,10 @@ import { motion } from 'motion/react'
 import { DEFAULT_COMMISSION_RATE } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, INPUT } from '../../lib/design-patterns'
 import { supabase } from '../../lib/supabase'
-import { api, type InventoryRow, type OrderType, type Portfolio as PortfolioData } from '../../lib/api'
+import { api, type InventoryRow, type OrderType, type Portfolio as PortfolioData, type WorkingOrder } from '../../lib/api'
 import { ConfirmDialog, Overlay, ResultDialog, type TradeResult } from '../components/OrderDialogs'
 import { toCashPosition } from '../../lib/orderConfirm'
-import { buildConfirmLines, buildTradeOutcome, closingOrderFor, type MarketContext, type OrderTerms } from '../../lib/orderFlow'
+import { buildCancelLines, buildConfirmLines, buildTradeOutcome, closingOrderFor, type MarketContext, type OrderTerms } from '../../lib/orderFlow'
 import { usd } from '../../lib/format'
 import { analytics } from '../../lib/analytics'
 
@@ -56,6 +56,9 @@ function Portfolio() {
   const [pending, setPending] = useState<OrderTerms | null>(null)
   const [result, setResult] = useState<TradeResult | null>(null)
   const [toast, setToast] = useState<{ ok: boolean; text: string } | null>(null)
+  /** The working order awaiting cancel confirmation, and the one in flight. */
+  const [cancelling, setCancelling] = useState<WorkingOrder | null>(null)
+  const [cancelBusy, setCancelBusy] = useState<string | null>(null)
 
   useEffect(() => {
     analytics.pageview('/portfolio')
@@ -187,6 +190,29 @@ function Portfolio() {
     }
   }
 
+  /** Cancel a resting order, then refresh — same shape as the Exit flow. */
+  const doCancel = async (o: WorkingOrder) => {
+    setCancelling(null)
+    setCancelBusy(o.orderId)
+    analytics.capture('order_cancelled', { ticker: o.ticker, side: o.side, remainingQty: o.remainingQty, from: 'portfolio' })
+    try {
+      const res = await api.cancelOrder(o.orderId)
+      setToast(
+        res.cancelled
+          ? { ok: true, text: `Cancelled ${o.remainingQty} ${o.ticker} — margin released` }
+          // Already filled or swept between render and click; the refresh below
+          // will drop it from the list either way.
+          : { ok: false, text: `Could not cancel — the order is no longer working` },
+      )
+      setData(await api.portfolio())
+    } catch {
+      setLive(false)
+      setToast({ ok: false, text: 'Network hiccup — cancel not confirmed, check the Terminal.' })
+    } finally {
+      setCancelBusy(null)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-background text-foreground">
       {/* Nav */}
@@ -303,7 +329,67 @@ function Portfolio() {
           )}
         </section>
 
-        {/* SECTION 2 — Trade History (closed / reduced) */}
+        {/* SECTION 2 — Working Orders. Sits between positions and history because
+            that is the lifecycle order: what you hold, what is still working,
+            what has closed. */}
+        <section className="mt-12 border-t border-white/[0.06] pt-10">
+          <h2 className="mb-1 text-sm font-medium text-bright">Working Orders</h2>
+          <p className="mb-4 text-[11px] text-subtle">
+            Orders resting on the book. Cancelling releases the margin they reserve; anything already filled stays
+            filled.
+          </p>
+
+          {data.workingOrders.length === 0 ? (
+            <p className="text-sm text-subtle">No working orders</p>
+          ) : (
+            <div className={`${CARD} overflow-hidden`} style={{ boxShadow: CARD_SHADOW }}>
+              <table className="w-full text-[13px]">
+                <thead>
+                  <tr className="border-b border-white/[0.08] text-[10px] uppercase tracking-wider text-subtle">
+                    <th className="px-5 py-3 text-left font-medium">Ticker</th>
+                    <th className="px-3 py-3 text-left font-medium">Side</th>
+                    <th className="px-3 py-3 text-left font-medium">Type</th>
+                    <th className="px-3 py-3 text-right font-medium">Price</th>
+                    <th className="px-3 py-3 text-right font-medium">Qty</th>
+                    <th className="px-3 py-3 text-right font-medium">Remaining</th>
+                    <th className="px-3 py-3 text-right font-medium">Placed</th>
+                    <th className="px-5 py-3 text-right font-medium">Cancel</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono tabular-nums">
+                  {data.workingOrders.map((o) => (
+                    <tr key={o.orderId} className="border-b border-white/[0.04] last:border-0">
+                      <td className="px-5 py-3 text-left font-semibold text-bright">{o.ticker}</td>
+                      <td className={`px-3 py-3 text-left ${o.side === 'buy' ? 'text-up' : 'text-destructive'}`}>
+                        {o.side.toUpperCase()}
+                      </td>
+                      <td className="px-3 py-3 text-left uppercase text-subtle">{o.type}</td>
+                      <td className="px-3 py-3 text-right text-foreground">{o.price === null ? '—' : usd(o.price)}</td>
+                      <td className="px-3 py-3 text-right text-muted">{o.qty}</td>
+                      {/* Remaining is what a cancel actually withdraws — highlighted
+                          when the order is part-filled so the difference is visible. */}
+                      <td className={`px-3 py-3 text-right ${o.remainingQty < o.qty ? 'text-[#E8C46A]' : 'text-muted'}`}>
+                        {o.remainingQty}
+                      </td>
+                      <td className="px-3 py-3 text-right text-subtle">{dtLabel(o.placedAt)}</td>
+                      <td className="px-5 py-3 text-right">
+                        <button
+                          onClick={() => setCancelling(o)}
+                          disabled={cancelBusy === o.orderId}
+                          className="rounded-md border border-white/15 px-3 py-1 text-[11px] font-medium uppercase text-muted transition-colors hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          {cancelBusy === o.orderId ? '…' : 'Cancel'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+
+        {/* SECTION 3 — Trade History (closed / reduced) */}
         <section className="mt-12 border-t border-white/[0.06] pt-10">
           <h2 className="mb-4 text-sm font-medium text-bright">Trade History</h2>
 
@@ -432,6 +518,19 @@ function Portfolio() {
           onCancel={() => setPending(null)}
           onConfirm={() => placeClose(pending)}
           lines={buildConfirmLines(pending, marketContext(closing))}
+        />
+      )}
+
+      {/* Cancel confirmation — the SAME dialog the order flow uses, with rows
+          from buildCancelLines. Never cancels on a single click. */}
+      {cancelling && (
+        <ConfirmDialog
+          title="Cancel Order?"
+          tone="destructive"
+          confirmLabel="Cancel Order"
+          onCancel={() => setCancelling(null)}
+          onConfirm={() => doCancel(cancelling)}
+          lines={buildCancelLines(cancelling)}
         />
       )}
 

@@ -1,6 +1,7 @@
 import { type CashPosition, DEFAULT_COMMISSION_RATE } from '@iimb-trading/engine'
 import { describe, expect, it } from 'vitest'
 import {
+  buildCancelLines,
   buildConfirmLines,
   buildTradeOutcome,
   closingOrderFor,
@@ -190,6 +191,36 @@ describe('the post-trade outcome — nothing to show', () => {
       { trades: [{ price: 190, qty: 5 }], bestPriceAtSubmit: 190 },
     )
     expect(out).toMatchObject({ kind: 'toast', title: 'Order filled', detail: '5 @ avg $190.00' })
+  })
+})
+
+describe('buildCancelLines — the cancel confirmation', () => {
+  const resting = { ticker: 'AAPL', side: 'buy' as const, type: 'limit' as const, price: 100, qty: 10, remainingQty: 10 }
+
+  it('names the instrument, side, type and price', () => {
+    const lines = buildCancelLines(resting)
+    expect(keys(lines)).toEqual(['Instrument', 'Side', 'Type', 'Price', 'Cancelling'])
+    expect(valueOf(lines, 'Instrument')).toBe('AAPL')
+    expect(valueOf(lines, 'Side')).toBe('BUY')
+    expect(valueOf(lines, 'Price')).toBe('$100.00')
+  })
+
+  it('an untouched order cancels its whole quantity', () => {
+    expect(valueOf(buildCancelLines(resting), 'Cancelling')).toBe('10 of 10')
+  })
+
+  it('a PARTIALLY filled order cancels only what remains, and says so', () => {
+    const lines = buildCancelLines({ ...resting, remainingQty: 6 })
+    expect(valueOf(lines, 'Cancelling')).toBe('6 of 10')
+    expect(valueOf(lines, 'Already filled')).toBe('4 — stays filled')
+  })
+
+  it('does not mention filled quantity when there is none', () => {
+    expect(keys(buildCancelLines(resting))).not.toContain('Already filled')
+  })
+
+  it('handles an order with no price', () => {
+    expect(valueOf(buildCancelLines({ ...resting, price: null }), 'Price')).toBe('—')
   })
 })
 

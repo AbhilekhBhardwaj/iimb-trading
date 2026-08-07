@@ -68,6 +68,22 @@ function hasUnlimitedBuyingPower(role: string | undefined): boolean {
   return role !== undefined && UNLIMITED_BUYING_POWER.has(role)
 }
 
+/** An order still working on the book, for the account's own orders list. */
+export interface WorkingOrder {
+  orderId: string
+  ticker: string
+  side: Side
+  type: OrderType
+  /** Limit price; null for a market order (which never rests). */
+  price: number | null
+  qty: number
+  remainingQty: number
+  status: Order['status']
+  leverage: number
+  /** Wall-clock ms the order was placed. */
+  placedAt: number
+}
+
 /** One closed (or reduced) position, reconstructed from the trades table. */
 interface TradeHistoryEntry {
   ticker: string
@@ -1368,6 +1384,46 @@ export class TradingService {
   }
 
   /** The caller's own resting orders for an instrument (for the working-orders list + cancel). */
+  /**
+   * Every order this account currently has working, across ALL instruments.
+   *
+   * Distinct from `myRestingOrders`, which is per-ticker and feeds the Terminal's
+   * depth view. This one carries the instrument and the wall-clock placement time
+   * so a standalone list can show what was placed and when.
+   *
+   * Resting state comes from the in-memory book (the authority on what is still
+   * working); `created_at` comes from the DB, because the engine's `timestamp` is
+   * a monotonic sequence counter for time priority, not a clock.
+   */
+  async workingOrders(accountId: string): Promise<WorkingOrder[]> {
+    const mine = [...this.orders.values()].filter(
+      (o) => o.userId === accountId && (o.status === 'active' || o.status === 'partially_filled'),
+    )
+    if (mine.length === 0) return []
+
+    const { data, error } = await this.db
+      .from('orders')
+      .select('id, created_at')
+      .in('id', mine.map((o) => o.id))
+    if (error) throw error
+    const placedAt = new Map((data ?? []).map((r) => [r.id as string, Date.parse(r.created_at as string)]))
+
+    return mine
+      .map((o) => ({
+        orderId: o.id,
+        ticker: o.instrument,
+        side: o.side,
+        type: o.type,
+        price: o.price ?? null,
+        qty: o.qty,
+        remainingQty: o.remainingQty,
+        status: o.status,
+        leverage: this.orderLeverage.get(o.id) ?? 1,
+        placedAt: placedAt.get(o.id) ?? 0,
+      }))
+      .sort((a, b) => b.placedAt - a.placedAt) // most recent first
+  }
+
   myRestingOrders(
     accountId: string,
     ticker: string,
@@ -1543,6 +1599,9 @@ export class TradingService {
       commissionEnabled: this.rounds.isCommissionActive(),
       commissionRate: this.commissionRate(),
       slippageEnabled: this.rounds.isSlippageActive(),
+      // The account's own resting orders, so /portfolio can list and cancel them
+      // without a second round-trip.
+      workingOrders: await this.workingOrders(accountId),
       openingBalanceInr,
       realizedPnlInr,
       cashInr,

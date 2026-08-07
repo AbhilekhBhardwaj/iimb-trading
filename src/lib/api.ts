@@ -197,6 +197,22 @@ export interface TradeHistoryEntry {
   closedAt: number
 }
 
+/** An order still working on the book — the account's own. */
+export interface WorkingOrder {
+  orderId: string
+  ticker: string
+  side: Side
+  type: OrderType
+  /** Limit price; null for a market order (which never rests). */
+  price: number | null
+  qty: number
+  remainingQty: number
+  status: string
+  leverage: number
+  /** Wall-clock ms the order was placed. */
+  placedAt: number
+}
+
 export interface Portfolio {
   /** USD→INR pinned for the current round. */
   rate: number
@@ -204,6 +220,8 @@ export interface Portfolio {
   commissionEnabled: boolean
   commissionRate: number
   slippageEnabled: boolean
+  /** The account's currently-working orders, most recent first. */
+  workingOrders: WorkingOrder[]
   openingBalanceInr: number
   realizedPnlInr: number
   /** Spendable INR: equity − margin posted − margin reserved. */

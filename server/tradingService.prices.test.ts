@@ -1481,6 +1481,118 @@ describe('market maker has unlimited buying power; teams do not', () => {
   })
 })
 
+describe('workingOrders + cancel — the account\'s resting orders', () => {
+  async function withResting() {
+    const h = harness()
+    await h.svc.loadInstruments()
+    await h.svc.startRound(0)
+    // A rests two orders that will NOT fill; B rests one of its own.
+    const a1 = await h.svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'buy', type: 'limit', price: 100, qty: 10, leverage: 1 })
+    const a2 = await h.svc.placeOrder({ accountId: A, ticker: 'NVDA', side: 'sell', type: 'limit', price: 999, qty: 4, leverage: 1 })
+    const b1 = await h.svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'buy', type: 'limit', price: 90, qty: 7, leverage: 1 })
+    return { ...h, a1: a1.orderId!, a2: a2.orderId!, b1: b1.orderId! }
+  }
+
+  it('lists only THIS account\'s working orders', async () => {
+    const { svc, a1, a2, b1 } = await withResting()
+    const ids = (await svc.workingOrders(A)).map((o) => o.orderId)
+    expect(ids).toHaveLength(2)
+    expect(ids).toEqual(expect.arrayContaining([a1, a2]))
+    expect(ids).not.toContain(b1)
+  })
+
+  it('carries instrument, side, type, quantities, price and placed time', async () => {
+    const { svc, a2 } = await withResting()
+    const row = (await svc.workingOrders(A)).find((o) => o.orderId === a2)!
+    expect(row).toMatchObject({
+      ticker: 'NVDA', side: 'sell', type: 'limit', price: 999,
+      qty: 4, remainingQty: 4, status: 'active', leverage: 1,
+    })
+    expect(row.placedAt).toBeGreaterThan(0)
+  })
+
+  it('spans every instrument, not just one', async () => {
+    const { svc } = await withResting()
+    expect(new Set((await svc.workingOrders(A)).map((o) => o.ticker))).toEqual(new Set(['AAPL', 'NVDA']))
+  })
+
+  it('shows a PARTIALLY filled order with its remaining quantity', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'buy', type: 'limit', price: 230, qty: 10, leverage: 1 })
+    await svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'sell', type: 'limit', price: 230, qty: 4, leverage: 1 })
+
+    const row = (await svc.workingOrders(A))[0]
+    expect(row.status).toBe('partially_filled')
+    expect(row.qty).toBe(10)
+    expect(row.remainingQty).toBe(6)
+  })
+
+  it('excludes filled and cancelled orders', async () => {
+    const { svc, a1 } = await withResting()
+    // Fully fill a fresh order, and cancel a1.
+    await svc.placeOrder({ accountId: A, ticker: 'AAPL', side: 'buy', type: 'limit', price: 230, qty: 5, leverage: 1 })
+    await svc.placeOrder({ accountId: B, ticker: 'AAPL', side: 'sell', type: 'limit', price: 230, qty: 5, leverage: 1 })
+    await svc.cancelOrder(a1, { accountId: A, role: 'team' })
+
+    const ids = (await svc.workingOrders(A)).map((o) => o.orderId)
+    expect(ids).not.toContain(a1)
+    expect(ids).toHaveLength(1) // only the untouched NVDA order
+  })
+
+  it('is empty for an account with nothing working', async () => {
+    const { svc } = await withResting()
+    expect(await svc.workingOrders('acct-master')).toEqual([])
+  })
+
+  // --- cancel -------------------------------------------------------------
+
+  it('cancelling REMOVES the order from the list', async () => {
+    const { svc, a1 } = await withResting()
+    expect((await svc.workingOrders(A)).map((o) => o.orderId)).toContain(a1)
+
+    expect(await svc.cancelOrder(a1, { accountId: A, role: 'team' })).toBe(true)
+    expect((await svc.workingOrders(A)).map((o) => o.orderId)).not.toContain(a1)
+  })
+
+  it('cancelling releases the margin the order reserved', async () => {
+    const { svc, a1 } = await withResting()
+    const before = (await svc.portfolio(A)) as Record<string, any>
+    expect(Number(before.marginReservedInr)).toBeGreaterThan(0)
+
+    await svc.cancelOrder(a1, { accountId: A, role: 'team' })
+    const after = (await svc.portfolio(A)) as Record<string, any>
+    expect(Number(after.marginReservedInr)).toBeLessThan(Number(before.marginReservedInr))
+  })
+
+  it('a team CANNOT cancel another team\'s order', async () => {
+    const { svc, b1 } = await withResting()
+    expect(await svc.cancelOrder(b1, { accountId: A, role: 'team' })).toBe(false)
+    expect((await svc.workingOrders(B)).map((o) => o.orderId)).toContain(b1) // still working
+  })
+
+  it('the master can cancel anyone\'s order', async () => {
+    const { svc, b1 } = await withResting()
+    expect(await svc.cancelOrder(b1, { accountId: 'acct-master', role: 'master' })).toBe(true)
+    expect((await svc.workingOrders(B)).map((o) => o.orderId)).not.toContain(b1)
+  })
+
+  it('cancelling an unknown or already-cancelled order reports false', async () => {
+    const { svc, a1 } = await withResting()
+    expect(await svc.cancelOrder('no-such-order', { accountId: A, role: 'team' })).toBe(false)
+    await svc.cancelOrder(a1, { accountId: A, role: 'team' })
+    expect(await svc.cancelOrder(a1, { accountId: A, role: 'team' })).toBe(false)
+  })
+
+  it('the portfolio payload carries the same list', async () => {
+    const { svc } = await withResting()
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    expect(p.workingOrders).toHaveLength(2)
+    expect(p.workingOrders.map((o: any) => o.ticker).sort()).toEqual(['AAPL', 'NVDA'])
+  })
+})
+
 describe('setInstrumentPrices: audit log', () => {
   it('logs one instrument_price_set per instrument, attributed to the master', async () => {
     const { db, svc } = harness()

@@ -103,6 +103,38 @@ export function buildConfirmLines(o: OrderTerms, ctx: MarketContext): ConfirmLin
   ]
 }
 
+/** The subset of a working order the cancel dialog needs. */
+export interface CancellableOrder {
+  ticker: string
+  side: Side
+  type: OrderType
+  price: number | null
+  qty: number
+  remainingQty: number
+}
+
+/**
+ * Rows for the cancel-confirmation dialog.
+ *
+ * Shows REMAINING quantity prominently: a partially-filled order only cancels
+ * what is left, and the filled part stays done. Anything already filled is
+ * called out explicitly so nobody expects cancelling to unwind it.
+ */
+export function buildCancelLines(o: CancellableOrder): ConfirmLine[] {
+  const filled = o.qty - o.remainingQty
+  const lines: ConfirmLine[] = [
+    { k: 'Instrument', v: o.ticker },
+    { k: 'Side', v: o.side.toUpperCase(), tone: o.side === 'buy' ? 'up' : 'destructive' },
+    { k: 'Type', v: o.type.toUpperCase() },
+    { k: 'Price', v: o.price === null ? '—' : usd(o.price) },
+    { k: 'Cancelling', v: `${o.remainingQty} of ${o.qty}` },
+  ]
+  if (filled > 0) {
+    lines.push({ k: 'Already filled', v: `${filled} — stays filled`, tone: 'destructive' })
+  }
+  return lines
+}
+
 /** What should happen after the server accepted the order. */
 export type TradeOutcome =
   | { kind: 'toast'; ok: true; title: string; detail: string }
