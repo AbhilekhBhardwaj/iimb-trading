@@ -24,4 +24,4 @@ export const MAINTENANCE_MARGIN_RATE = 0
  * path charges; re-exported here so server-side imports keep their existing
  * `from './config'` path and there is still exactly one definition.
  */
-export { COMMISSION_RATE } from '@iimb-trading/engine'
+export { DEFAULT_COMMISSION_RATE } from '@iimb-trading/engine'

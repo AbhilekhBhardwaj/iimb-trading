@@ -14,6 +14,8 @@
  * but this module deliberately knows nothing about orders.
  */
 
+import { DEFAULT_COMMISSION_RATE, isValidCommissionRate, MAX_COMMISSION_RATE } from './cash'
+
 export type RoundMode = 'data_and_news' | 'only_data' | 'silent'
 export type RoundStatus = 'pending' | 'active' | 'ended'
 
@@ -38,6 +40,11 @@ export interface Round {
   commissionEnabled: boolean
   /** USD→INR rate in force for this round. Fixed unless the Master changes it. */
   usdInrRate: number
+  /**
+   * Commission rate in force for this round, as a fraction of trade notional per
+   * side. Fixed unless the Master changes it — see `setCommissionRate`.
+   */
+  commissionRate: number
   status: RoundStatus
   /** Event-clock second the round started; null until activated. */
   startedAt: number | null
@@ -52,6 +59,8 @@ export interface RoundDefinition {
   commissionEnabled: boolean
   /** USD→INR rate for this round; defaults to DEFAULT_USD_INR_RATE. */
   usdInrRate?: number
+  /** Commission rate for this round; defaults to DEFAULT_COMMISSION_RATE. */
+  commissionRate?: number
   /** Optional stable id; falls back to `round-<n>` by position. */
   id?: string
 }
@@ -72,6 +81,9 @@ export class RoundController {
       if (def.usdInrRate !== undefined && def.usdInrRate <= 0) {
         throw new Error(`round ${index} usdInrRate must be positive`)
       }
+      if (def.commissionRate !== undefined && !isValidCommissionRate(def.commissionRate)) {
+        throw new Error(`round ${index} commissionRate must be between 0 and ${MAX_COMMISSION_RATE}`)
+      }
       return {
         id: def.id ?? `round-${index + 1}`,
         index,
@@ -79,6 +91,7 @@ export class RoundController {
         durationSeconds: def.durationSeconds,
         commissionEnabled: def.commissionEnabled,
         usdInrRate: def.usdInrRate ?? DEFAULT_USD_INR_RATE,
+        commissionRate: def.commissionRate ?? DEFAULT_COMMISSION_RATE,
         status: 'pending',
         startedAt: null,
         endedAt: null,
@@ -161,6 +174,14 @@ export class RoundController {
     return this.activeIndex === null ? null : this.rounds[this.activeIndex].usdInrRate
   }
 
+  /**
+   * The commission rate in force right now, or null between rounds. Like the FX
+   * rate, constant for the round unless the Master changes it.
+   */
+  getCommissionRate(): number | null {
+    return this.activeIndex === null ? null : this.rounds[this.activeIndex].commissionRate
+  }
+
   /** The active round's mode, or null between rounds. */
   getMode(): RoundMode | null {
     return this.activeIndex === null ? null : this.rounds[this.activeIndex].mode
@@ -208,6 +229,28 @@ export class RoundController {
     target.usdInrRate = rate
     return snapshot(target)
   }
+
+  /**
+   * Master-Terminal control: set the commission rate on the ACTIVE round, or —
+   * when no round is active — the NEXT pending round. Same targeting rule as
+   * setUsdInrRate. Returns a snapshot of the round changed, or null if there is
+   * neither an active nor a pending round.
+   *
+   * Forward-only, exactly like the FX rate: fills already settled keep the rate
+   * they were charged at, because the charge was computed at fill time.
+   */
+  setCommissionRate(rate: number): Round | null {
+    if (!isValidCommissionRate(rate)) {
+      throw new Error(`commissionRate must be between 0 and ${MAX_COMMISSION_RATE} (got ${rate})`)
+    }
+    const target =
+      this.activeIndex !== null
+        ? this.rounds[this.activeIndex]
+        : this.rounds.find((r) => r.status === 'pending')
+    if (!target) return null
+    target.commissionRate = rate
+    return snapshot(target)
+  }
 }
 
 function snapshot(round: Round): Round {
@@ -226,6 +269,8 @@ export interface RealRoundSpec {
   durationSeconds?: number
   /** Override the event's default USD→INR rate for this round. */
   usdInrRate?: number
+  /** Override the event's default commission rate for this round. */
+  commissionRate?: number
 }
 
 export interface EventConfigOptions {
@@ -241,6 +286,8 @@ export interface EventConfigOptions {
   mockCommission?: boolean
   /** USD→INR rate every round starts pinned at. Default DEFAULT_USD_INR_RATE. */
   usdInrRate?: number
+  /** Commission rate every round starts pinned at. Default DEFAULT_COMMISSION_RATE. */
+  commissionRate?: number
 }
 
 /**
@@ -263,6 +310,7 @@ export function createEventConfig(
     mockMode = 'data_and_news',
     mockCommission = false,
     usdInrRate = DEFAULT_USD_INR_RATE,
+    commissionRate = DEFAULT_COMMISSION_RATE,
   } = options
 
   const config: RoundDefinition[] = []
@@ -273,6 +321,7 @@ export function createEventConfig(
       durationSeconds: mockDurationSeconds,
       commissionEnabled: mockCommission,
       usdInrRate,
+      commissionRate,
     })
   }
   realRounds.forEach((spec, i) => {
@@ -282,6 +331,7 @@ export function createEventConfig(
       durationSeconds: spec.durationSeconds ?? realDurationSeconds,
       commissionEnabled: spec.commissionEnabled,
       usdInrRate: spec.usdInrRate ?? usdInrRate,
+      commissionRate: spec.commissionRate ?? commissionRate,
     })
   })
   return config

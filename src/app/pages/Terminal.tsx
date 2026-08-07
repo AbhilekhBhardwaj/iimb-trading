@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
-import { applyLeveredFill, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
+import { applyLeveredFill, DEFAULT_COMMISSION_RATE, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
 import { orderPnlLines, toCashPosition } from '../../lib/orderConfirm'
 import { averageFillPrice, slippageNudge } from '../../lib/slippage'
@@ -278,41 +278,49 @@ function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
             })}
           </div>
 
-          {/* Qty + Price side by side; Limit/Market stacked to their right */}
+          {/* Qty/Price and the submit button share a left column so the
+              Limit/Market toggles can stretch down the full height of BOTH rows
+              rather than just the input row — which also pulls the submit button
+              in from the right edge. */}
           <div className="flex gap-2">
-            <label className="flex-1">
-              <span className="mb-0.5 block text-[9px] uppercase tracking-[0.14em] text-subtle">Qty</span>
-              <input ref={qtyInputRef} type="number" min={1} value={qtyStr}
-                onChange={(e) => setQtyStr(e.target.value)}
-                className={`${INPUT} font-mono tabular-nums`} style={{ paddingTop: 4, paddingBottom: 4 }} />
-            </label>
-            <label className="flex-1">
-              <span className="mb-0.5 block text-[9px] uppercase tracking-[0.14em] text-subtle">Price</span>
-              <input ref={priceInputRef} type="number" step="0.01" disabled={type === 'market'}
-                value={type === 'market' ? (ltp > 0 ? ltp.toFixed(2) : '') : priceStr}
-                onChange={(e) => { edited.current = true; setPriceStr(e.target.value) }}
-                className={`${INPUT} font-mono tabular-nums disabled:opacity-50`} style={{ paddingTop: 4, paddingBottom: 4, color: priceColor }} />
-            </label>
-            <div className="flex w-16 flex-col gap-1 self-stretch pt-[15px]">
+            <div className="flex flex-1 flex-col gap-1">
+              <div className="flex gap-2">
+                <label className="flex-1">
+                  <span className="mb-0.5 block text-[9px] uppercase tracking-[0.14em] text-subtle">Qty</span>
+                  <input ref={qtyInputRef} type="number" min={1} value={qtyStr}
+                    onChange={(e) => setQtyStr(e.target.value)}
+                    className={`${INPUT} font-mono tabular-nums`} style={{ paddingTop: 4, paddingBottom: 4 }} />
+                </label>
+                <label className="flex-1">
+                  <span className="mb-0.5 block text-[9px] uppercase tracking-[0.14em] text-subtle">Price</span>
+                  <input ref={priceInputRef} type="number" step="0.01" disabled={type === 'market'}
+                    value={type === 'market' ? (ltp > 0 ? ltp.toFixed(2) : '') : priceStr}
+                    onChange={(e) => { edited.current = true; setPriceStr(e.target.value) }}
+                    className={`${INPUT} font-mono tabular-nums disabled:opacity-50`} style={{ paddingTop: 4, paddingBottom: 4, color: priceColor }} />
+                </label>
+              </div>
+
+              {/* Minimal submit — kept comfortably tall/tappable on purpose. Enabled
+                  whenever a round is active so an empty field surfaces the popup. */}
+              <button
+                disabled={!roundActive}
+                onClick={submit}
+                className={`rounded-lg border py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
+                  side === 'buy' ? 'border-up/40 bg-up/10 text-up hover:bg-up/20' : 'border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20'
+                }`}>
+                {roundActive ? `Place ${side.toUpperCase()} Order` : 'Waiting for round…'}
+              </button>
+            </div>
+
+            <div className="flex w-20 flex-col gap-1.5 self-stretch pt-[15px]">
               {(['limit', 'market'] as const).map((t) => (
                 <button key={t} onClick={() => setType(t)}
-                  className={`flex-1 rounded-md border text-[9px] uppercase tracking-wide transition-colors ${type === t ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
+                  className={`flex-1 rounded-md border text-[10px] uppercase tracking-wide transition-colors ${type === t ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]' : 'border-white/10 text-muted hover:bg-white/[0.04]'}`}>
                   {t}
                 </button>
               ))}
             </div>
           </div>
-
-          {/* Minimal submit — kept comfortably tall/tappable on purpose. Enabled
-              whenever a round is active so an empty field surfaces the popup. */}
-          <button
-            disabled={!roundActive}
-            onClick={submit}
-            className={`rounded-lg border py-2 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-              side === 'buy' ? 'border-up/40 bg-up/10 text-up hover:bg-up/20' : 'border-destructive/40 bg-destructive/10 text-destructive hover:bg-destructive/20'
-            }`}>
-            {roundActive ? `Place ${side.toUpperCase()} Order` : 'Waiting for round…'}
-          </button>
         </div>
       </Panel>
 
@@ -719,7 +727,10 @@ function Terminal() {
     // them: P&L has to be measured against the position as it stood going in.
     const prePosition = toCashPosition(row?.position)
     const rate = snap?.rate ?? 83
-    const commissionEnabled = snap?.round.commissionEnabled ?? false
+    const commission = {
+      enabled: snap?.round.commissionEnabled ?? false,
+      rate: snap?.round.commissionRate ?? DEFAULT_COMMISSION_RATE,
+    }
     try {
       const res = await api.placeOrder({ ticker: selected, side: o.side, type: o.type, price: o.type === 'limit' ? o.price : undefined, qty: o.qty, leverage: o.leverage })
       if (!res.accepted) {
@@ -735,7 +746,7 @@ function Terminal() {
       // however many levels the order touched, and only the quantity that traded.
       const avg = averageFillPrice(fills)
       const pnlLines = avg
-        ? orderPnlLines(prePosition, o.side === 'buy' ? avg.filledQty : -avg.filledQty, avg.avgFillPrice, rate, o.leverage, commissionEnabled)
+        ? orderPnlLines(prePosition, o.side === 'buy' ? avg.filledQty : -avg.filledQty, avg.avgFillPrice, rate, o.leverage, commission)
         : []
       const nudge = slippageNudge({ orderType: o.type, side: o.side, bestPrice: res.bestPriceAtSubmit, fills })
       if (nudge) analytics.capture('slippage_nudge_shown', { ticker: selected, side: o.side, qty: filled })
@@ -822,7 +833,10 @@ function Terminal() {
             { k: 'Side', v: pending.side.toUpperCase(), tone: pending.side === 'buy' ? 'up' : 'destructive' },
             { k: 'Type', v: pending.type.toUpperCase() },
             { k: 'Quantity', v: String(pending.qty) },
-            { k: 'Price', v: pending.type === 'market' ? 'MARKET' : usd(pending.price) },
+            // A market order has no guaranteed price; show the current mark as an
+            // estimate rather than the bare word "MARKET". If it walks the book
+            // the real average lands in the post-trade dialog, with the nudge.
+            { k: 'Price', v: pending.type === 'market' ? `~${usd(pending.price)} at execution` : usd(pending.price) },
             { k: 'Leverage', v: `${pending.leverage}x` },
             { k: 'Margin Required', v: marginLabel(pending.requiredInr) },
             { k: 'Est. Liquidation', v: liqLabel(pending.closes, pending.liq) },
@@ -835,7 +849,7 @@ function Terminal() {
               pending.price,
               snap?.rate ?? 83,
               pending.leverage,
-              snap?.round.commissionEnabled ?? false,
+              { enabled: snap?.round.commissionEnabled ?? false, rate: snap?.round.commissionRate ?? DEFAULT_COMMISSION_RATE },
             ),
           ]}
         />

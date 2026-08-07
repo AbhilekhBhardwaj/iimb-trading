@@ -509,6 +509,254 @@ describe('setInstrumentPrices: validation is all-or-nothing', () => {
   })
 })
 
+describe('setUsdInrRate: master-only, changeable at any time, attributed', () => {
+  it('applies between rounds, pinning the rate on the NEXT round', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+
+    const res = await svc.setUsdInrRate(MASTER, 90)
+    expect(res.applied).toBe(true)
+    expect(res.changed?.usdInrRate).toBe(90)
+    expect(svc.getSchedule()[0].usdInrRate).toBe(90)
+  })
+
+  /**
+   * rateInr() reads the ACTIVE round and falls back to the default between
+   * rounds, so it does NOT reflect a pending round's new rate. Anything showing
+   * the Master their pending rate must read the schedule, not rateInr().
+   */
+  it('rateInr() still reports the default until that round starts', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.setUsdInrRate(MASTER, 90)
+
+    expect(svc.rateInr()).toBe(83) // not yet in force
+    await svc.startRound(0)
+    expect(svc.rateInr()).toBe(90) // now it is
+  })
+
+  it('refuses a team account', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+
+    const res = await svc.setUsdInrRate(TEAM, 90)
+    expect(res.applied).toBe(false)
+    expect(res.reason).toBe('forbidden')
+    expect(svc.rateInr()).toBe(83)
+  })
+
+  it('succeeds MID-ROUND and takes effect immediately', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    expect(svc.rateInr()).toBe(83)
+
+    const res = await svc.setUsdInrRate(MASTER, 90)
+    expect(res.applied).toBe(true)
+    expect(res.reason).toBeUndefined()
+    expect(res.changed?.id).toBe('r1') // the ACTIVE round, not the next one
+    expect(svc.rateInr()).toBe(90) // in force straight away
+  })
+
+  it('persists a mid-round change onto the active round row', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setUsdInrRate(MASTER, 90)
+
+    const row = db.rows('rounds').find((r) => r.id === 'r1')!
+    expect(Number(row.usd_inr_rate)).toBe(90)
+    expect(row.status).toBe('active') // still active — not downgraded
+    expect(row.started_at).toBeTruthy() // startRound's timestamp survives
+  })
+
+  it('can be changed repeatedly within a single round', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    for (const r of [86, 91, 88.5]) {
+      const res = await svc.setUsdInrRate(MASTER, r)
+      expect(res.applied).toBe(true)
+      expect(svc.rateInr()).toBe(r)
+    }
+  })
+
+  it('after a round ends, targets the NEXT round rather than the finished one', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.endRound(600)
+
+    const res = await svc.setUsdInrRate(MASTER, 90)
+    expect(res.applied).toBe(true)
+    expect(res.changed?.id).toBe('r2') // the next pending round
+    expect(svc.getSchedule()[0].usdInrRate).toBe(83) // the finished round keeps its own
+    await svc.startRound(700)
+    expect(svc.rateInr()).toBe(90)
+  })
+
+  it('rejects a non-positive or non-finite rate', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    for (const bad of [0, -5, Number.NaN]) {
+      const res = await svc.setUsdInrRate(MASTER, bad)
+      expect(res.applied).toBe(false)
+      expect(res.reason).toBe('usdInrRate must be a positive number')
+    }
+    expect(svc.rateInr()).toBe(83)
+  })
+
+  it('attributes the change to the master and records the previous rate', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setUsdInrRate(MASTER, 90)
+
+    const logged = db.rows('event_log').filter((e) => e.event_type === 'usd_inr_rate_changed')
+    expect(logged).toHaveLength(1)
+    expect(logged[0].account_id).toBe(MASTER.accountId) // was null before
+    expect(logged[0].payload).toMatchObject({ usdInrRate: 90, previousRate: 83 })
+  })
+
+  it('writes no audit event when refused', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setUsdInrRate(TEAM, 90) // wrong role
+    await svc.setUsdInrRate(MASTER, -1) // invalid rate
+
+    expect(db.rows('event_log').filter((e) => e.event_type === 'usd_inr_rate_changed')).toHaveLength(0)
+  })
+
+  it('is repeatable, the last call winning', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    for (const r of [85, 88, 92]) {
+      const res = await svc.setUsdInrRate(MASTER, r)
+      expect(res.applied).toBe(true)
+      expect(res.changed?.usdInrRate).toBe(r)
+    }
+    await svc.startRound(0)
+    expect(svc.rateInr()).toBe(92)
+  })
+})
+
+describe('setCommissionRate: master-only, changeable at any time, attributed', () => {
+  it('applies between rounds, pinning the rate on the NEXT round', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+
+    const res = await svc.setCommissionRate(MASTER, 0.005)
+    expect(res.applied).toBe(true)
+    expect(res.changed?.commissionRate).toBe(0.005)
+    expect(svc.getSchedule()[0].commissionRate).toBe(0.005)
+  })
+
+  it('succeeds MID-ROUND and takes effect immediately', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    expect(svc.commissionRate()).toBe(0.003)
+
+    const res = await svc.setCommissionRate(MASTER, 0.005)
+    expect(res.applied).toBe(true)
+    expect(res.changed?.id).toBe('r1') // the ACTIVE round
+    expect(svc.commissionRate()).toBe(0.005)
+  })
+
+  it('persists a mid-round change onto the active round row', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setCommissionRate(MASTER, 0.005)
+
+    const row = db.rows('rounds').find((r) => r.id === 'r1')!
+    expect(Number(row.commission_rate)).toBe(0.005)
+    expect(row.status).toBe('active')
+  })
+
+  it('persists a between-rounds change immediately, on a pending row', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setCommissionRate(MASTER, 0.002)
+
+    const row = db.rows('rounds').find((r) => r.id === 'r1')!
+    expect(Number(row.commission_rate)).toBe(0.002)
+    expect(row.status).toBe('pending')
+  })
+
+  it('refuses a team account', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+
+    const res = await svc.setCommissionRate(TEAM, 0.005)
+    expect(res.applied).toBe(false)
+    expect(res.reason).toBe('forbidden')
+    expect(svc.getSchedule()[0].commissionRate).toBe(0.003)
+  })
+
+  it('accepts 0 (a free round) and 1 (the ceiling)', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    expect((await svc.setCommissionRate(MASTER, 0)).applied).toBe(true)
+    expect(svc.getSchedule()[0].commissionRate).toBe(0)
+    expect((await svc.setCommissionRate(MASTER, 1)).applied).toBe(true)
+    expect(svc.getSchedule()[0].commissionRate).toBe(1)
+  })
+
+  it('rejects a negative, out-of-range or non-finite rate', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    for (const bad of [-0.001, 1.5, Number.NaN]) {
+      const res = await svc.setCommissionRate(MASTER, bad)
+      expect(res.applied).toBe(false)
+      expect(res.reason).toBe('commissionRate must be a fraction between 0 and 1')
+    }
+    expect(svc.getSchedule()[0].commissionRate).toBe(0.003)
+  })
+
+  it('attributes the change to the master and records the previous rate', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setCommissionRate(MASTER, 0.005)
+
+    const logged = db.rows('event_log').filter((e) => e.event_type === 'commission_rate_changed')
+    expect(logged).toHaveLength(1)
+    expect(logged[0].account_id).toBe(MASTER.accountId)
+    expect(logged[0].payload).toMatchObject({ commissionRate: 0.005, previousRate: 0.003 })
+  })
+
+  it('writes no audit event when refused', async () => {
+    const { db, svc } = harness()
+    await svc.loadInstruments()
+    await svc.setCommissionRate(TEAM, 0.005)
+    await svc.setCommissionRate(MASTER, -1)
+
+    expect(db.rows('event_log').filter((e) => e.event_type === 'commission_rate_changed')).toHaveLength(0)
+  })
+
+  it('is repeatable within a single round, the last call winning', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    for (const r of [0.001, 0.004, 0.0025]) {
+      expect((await svc.setCommissionRate(MASTER, r)).applied).toBe(true)
+      expect(svc.commissionRate()).toBe(r)
+    }
+  })
+
+  it('is independent of the on/off toggle', async () => {
+    const { svc } = harness()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setCommissionRate(MASTER, 0.005)
+    await svc.setCommission(false)
+
+    // The rate is still pinned; the toggle only decides whether it is charged.
+    expect(svc.commissionRate()).toBe(0.005)
+    expect(svc.getRoundStatus().commissionEnabled).toBe(false)
+  })
+})
+
 describe('setInstrumentPrices: audit log', () => {
   it('logs one instrument_price_set per instrument, attributed to the master', async () => {
     const { db, svc } = harness()

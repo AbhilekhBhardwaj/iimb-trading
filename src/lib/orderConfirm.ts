@@ -27,6 +27,7 @@ import {
   FLAT_CASH,
   type CashPosition,
   type ClosingPnlBreakdown,
+  type CommissionTerms,
 } from '@iimb-trading/engine'
 import { inrSigned } from './format'
 
@@ -110,7 +111,7 @@ export function orderPnlLines(
   price: number,
   usdInrRate: number,
   fillLeverage: number,
-  commissionEnabled: boolean,
+  commission: CommissionTerms,
 ): ConfirmLine[] {
   if (!Number.isFinite(signedQty) || signedQty === 0) return []
   if (!Number.isFinite(price) || price <= 0) return []
@@ -121,12 +122,12 @@ export function orderPnlLines(
     price,
     usdInrRate,
     fillLeverage,
-    commissionEnabled,
+    commission.rate,
   )
-  if (breakdown) return pnlBreakdownLines(breakdown, commissionEnabled)
+  if (breakdown) return pnlBreakdownLines(breakdown, commission.enabled)
 
-  // Opening or adding: nothing realized to split, but the fill is still charged.
-  // With the toggle off that charge is genuinely zero, so there is nothing to say.
-  if (!commissionEnabled) return []
-  return [commissionLine(commissionInrFor(signedQty, price, usdInrRate, true))]
+  // Opening or adding: nothing realized to split, but the fill IS still charged.
+  // With the toggle off the charge still happens — it is simply not itemised.
+  if (!commission.enabled) return []
+  return [commissionLine(commissionInrFor(signedQty, price, usdInrRate, commission.rate))]
 }

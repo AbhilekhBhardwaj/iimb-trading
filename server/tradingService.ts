@@ -29,12 +29,15 @@ import {
   RoundController,
   applyCashFill,
   commissionInrFor,
+  DEFAULT_COMMISSION_RATE,
   effectiveEntryRate,
   isLiquidatable,
+  isValidCommissionRate,
   liquidationPrice,
   postedMarginInr,
   xirr,
   type CashPosition,
+  type CommissionTerms,
   type Depth,
   type LeveredPosition,
   type Order,
@@ -46,7 +49,7 @@ import {
 } from '@iimb-trading/engine'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { randomUUID } from 'node:crypto'
-import { COMMISSION_RATE, MAINTENANCE_MARGIN_RATE, USD_INR } from './config'
+import { MAINTENANCE_MARGIN_RATE, USD_INR } from './config'
 
 type Severity = 'info' | 'warning' | 'error'
 const EPS = 1e-9
@@ -310,6 +313,10 @@ export class TradingService {
         if (Number.isFinite(persistedRate) && persistedRate > 0) {
           this.rounds.setUsdInrRate(persistedRate)
         }
+        const persistedCommission = Number(active!.commission_rate)
+        if (isValidCommissionRate(persistedCommission)) {
+          this.rounds.setCommissionRate(persistedCommission)
+        }
         reconciled++
         break
       }
@@ -330,6 +337,19 @@ export class TradingService {
       this.rounds.startNextRound(0)
       this.rounds.endCurrentRound(0)
       if (isEnded) reconciled++
+    }
+
+    // A rate pinned BETWEEN rounds is written onto the pending round's row
+    // ahead of time (see setUsdInrRate), so restore it here. Only when nothing
+    // is active — an active round already restored its own rate above, and that
+    // one wins because it is the rate settlement is currently using.
+    if (activeIdx < 0) {
+      const next = this.rounds.getSchedule().find((r) => r.status === 'pending')
+      const row = next ? rows.get(next.id) : undefined
+      const persisted = Number(row?.usd_inr_rate)
+      if (Number.isFinite(persisted) && persisted > 0) this.rounds.setUsdInrRate(persisted)
+      const persistedCommission = Number(row?.commission_rate)
+      if (isValidCommissionRate(persistedCommission)) this.rounds.setCommissionRate(persistedCommission)
     }
     return reconciled
   }
@@ -425,6 +445,7 @@ export class TradingService {
         duration_seconds: round.durationSeconds,
         commission_enabled: round.commissionEnabled,
         usd_inr_rate: round.usdInrRate,
+        commission_rate: round.commissionRate,
         status: 'active',
         started_at: new Date().toISOString(),
         ended_at: null,
@@ -545,27 +566,135 @@ export class TradingService {
   }
 
   /**
-   * Master control: pin a new USD→INR rate on the active round (or the next
-   * pending one), persisting it. Returns the round changed, or null if there is
-   * neither an active nor a pending round.
+   * The commission rate in force: the active round's, or the engine default
+   * between rounds. Read this rather than the DEFAULT_COMMISSION_RATE constant —
+   * the Master can change it per round and mid-round.
    */
-  async setUsdInrRate(rate: number): Promise<Round | null> {
-    const changed = this.rounds.setUsdInrRate(rate)
-    if (!changed) return null
-    // Only an already-started round has a row to update.
-    if (changed.status !== 'pending') {
-      const { error } = await this.db
-        .from('rounds')
-        .update({ usd_inr_rate: changed.usdInrRate })
-        .eq('id', changed.id)
-      if (error) throw error
+  commissionRate(): number {
+    return this.rounds.getCommissionRate() ?? DEFAULT_COMMISSION_RATE
+  }
+
+  /**
+   * Commission terms in force right now. `enabled` is DISPLAY-ONLY — it never
+   * affects what is charged, only whether teams see a Commission line. A round
+   * that should cost nothing has `rate === 0`.
+   */
+  private commissionTerms(): CommissionTerms {
+    return { enabled: this.rounds.isCommissionActive(), rate: this.commissionRate() }
+  }
+
+  /**
+   * Master control: set the commission rate on the ACTIVE round, or — when none
+   * is active — the next pending one. Allowed at any time, including mid-round,
+   * on the same forward-only model as the USD→INR rate: the charge on a fill is
+   * computed when the fill happens, so fills already charged keep the rate they
+   * were charged at and are never recomputed.
+   *
+   * Persisted immediately (creating the round's row early if it has not started)
+   * so a change made between rounds survives a restart.
+   */
+  async setCommissionRate(
+    caller: { accountId: string; role: string },
+    rate: number,
+  ): Promise<{ applied: boolean; reason?: string; changed: Round | null }> {
+    const refuse = (reason: string) => ({ applied: false, reason, changed: null })
+
+    if (caller.role !== 'master') return refuse('forbidden')
+    if (!isValidCommissionRate(rate)) {
+      return refuse('commissionRate must be a fraction between 0 and 1')
     }
-    await this.log(null, 'usd_inr_rate_changed', 'info', {
+
+    const previousRate = this.commissionRate()
+    const changed = this.rounds.setCommissionRate(rate)
+    if (!changed) return refuse('no pending round to set a commission rate on')
+
+    const { error } = await this.db.from('rounds').upsert(
+      {
+        id: changed.id,
+        index: changed.index,
+        mode: changed.mode,
+        duration_seconds: changed.durationSeconds,
+        commission_enabled: changed.commissionEnabled,
+        usd_inr_rate: changed.usdInrRate,
+        commission_rate: changed.commissionRate,
+        status: changed.status,
+      },
+      { onConflict: 'id' },
+    )
+    if (error) throw error
+
+    await this.log(caller.accountId, 'commission_rate_changed', 'info', {
+      roundId: changed.id,
+      index: changed.index,
+      commissionRate: changed.commissionRate,
+      previousRate,
+    })
+    return { applied: true, changed }
+  }
+
+  /**
+   * Master control: pin a new USD→INR rate on the ACTIVE round, or — when none is
+   * active — the next pending one. Allowed at any time, including mid-round.
+   *
+   * A mid-round change applies only going FORWARD: each fill records the rate it
+   * settled at (`trades.usd_inr_rate`) and a position's INR basis is fixed when
+   * it is opened, so trades that already settled keep their original rate and are
+   * never retroactively revalued. From the change onward, new fills settle at the
+   * new rate — which does mean a position opened before and closed after realizes
+   * the currency move as real P&L. That is the intended behaviour of this model,
+   * not a side effect.
+   *
+   * Unlike instrument prices, this is deliberately NOT locked during a round.
+   *
+   * The change is attributed to the master who made it in the audit log.
+   */
+  async setUsdInrRate(
+    caller: { accountId: string; role: string },
+    rate: number,
+  ): Promise<{ applied: boolean; reason?: string; changed: Round | null }> {
+    const refuse = (reason: string) => ({ applied: false, reason, changed: null })
+
+    // Defence in depth: the HTTP layer gates the master check too.
+    if (caller.role !== 'master') return refuse('forbidden')
+    if (typeof rate !== 'number' || !Number.isFinite(rate) || rate <= 0) {
+      return refuse('usdInrRate must be a positive number')
+    }
+
+    const previousRate = this.rateInr()
+    const changed = this.rounds.setUsdInrRate(rate)
+    if (!changed) return refuse('no pending round to set a rate on')
+
+    // Persist immediately, creating the round's row early if it has not started
+    // yet. Without this the rate would live only in the RoundController until
+    // startRound() wrote it, so a restart in between would silently revert the
+    // Master's rate to the config default.
+    //
+    // `status` is written explicitly rather than left to the column default,
+    // because startRoundInner's desync guard reads it — an absent status would
+    // read as "not pending" and refuse to start the round. It mirrors the
+    // controller, so this cannot downgrade a round's state. started_at /
+    // ended_at are left alone: startRound() owns those.
+    const { error } = await this.db.from('rounds').upsert(
+      {
+        id: changed.id,
+        index: changed.index,
+        mode: changed.mode,
+        duration_seconds: changed.durationSeconds,
+        commission_enabled: changed.commissionEnabled,
+        usd_inr_rate: changed.usdInrRate,
+        commission_rate: changed.commissionRate,
+        status: changed.status,
+      },
+      { onConflict: 'id' },
+    )
+    if (error) throw error
+    await this.log(caller.accountId, 'usd_inr_rate_changed', 'info', {
       roundId: changed.id,
       index: changed.index,
       usdInrRate: changed.usdInrRate,
+      previousRate,
     })
-    return changed
+    return { applied: true, changed }
   }
 
   /** Remaining seconds in the active round (wall-clock from started_at + duration), or null. */
@@ -584,6 +713,8 @@ export class TradingService {
     remainingSeconds: number | null
     /** USD→INR pinned for this round (or the base rate between rounds). */
     usdInrRate: number
+    /** Commission rate pinned for this round (or the default between rounds). */
+    commissionRate: number
   } {
     const cur = this.activeRoundId === null ? null : this.rounds.getCurrentRound()
     return {
@@ -594,6 +725,7 @@ export class TradingService {
       commissionEnabled: cur?.commissionEnabled ?? false,
       remainingSeconds: this.getRoundRemainingSeconds(),
       usdInrRate: this.rateInr(),
+      commissionRate: this.commissionRate(),
     }
   }
 
@@ -1320,13 +1452,16 @@ export class TradingService {
     // usd_inr_rate being recorded on the trade itself.
     const { data: roundRows } = await this.db
       .from('rounds')
-      .select('id, commission_enabled, usd_inr_rate')
-    const commissionByRound = new Map((roundRows ?? []).map((r) => [r.id as string, r.commission_enabled as boolean]))
+      .select('id, usd_inr_rate, commission_rate')
+    // NOTE: commission_enabled is deliberately NOT read here. It is display-only;
+    // commission is charged in every round, so the reconstruction must not gate
+    // on it or it would under-report what was actually taken.
     const rateByRound = new Map((roundRows ?? []).map((r) => [r.id as string, Number(r.usd_inr_rate)]))
+    const commissionRateByRound = new Map((roundRows ?? []).map((r) => [r.id as string, Number(r.commission_rate)]))
 
     const { data: trades, error: tErr } = await this.db
       .from('trades')
-      .select('price, qty, created_at, instrument_id, round_id, buy_order_id, sell_order_id, usd_inr_rate')
+      .select('price, qty, created_at, instrument_id, round_id, buy_order_id, sell_order_id, usd_inr_rate, commission_rate')
       .or(`buy_order_id.in.${inList},sell_order_id.in.${inList}`)
       .order('created_at', { ascending: true })
     if (tErr) throw tErr
@@ -1346,14 +1481,18 @@ export class TradingService {
         t.usd_inr_rate !== null && t.usd_inr_rate !== undefined
           ? Number(t.usd_inr_rate)
           : (rateByRound.get(t.round_id as string) ?? USD_INR)
+      // The commission rate this fill was CHARGED at. Stamped on the trade, so a
+      // later Master rate change never retroactively rewrites what was taken.
+      // Falls back to the round's rate, then the engine default, for rows written
+      // before the column existed.
+      const fillCommissionRate =
+        t.commission_rate !== null && t.commission_rate !== undefined
+          ? Number(t.commission_rate)
+          : (commissionRateByRound.get(t.round_id as string) ?? DEFAULT_COMMISSION_RATE)
       // Charged on the FULL fill notional, matching settleFill — not just the
-      // portion that closes, which differs when a fill flips through zero.
-      const commissionInr = commissionInrFor(
-        Number(t.qty),
-        price,
-        fillRate,
-        commissionByRound.get(t.round_id as string) ?? false,
-      )
+      // portion that closes, which differs when a fill flips through zero. Not
+      // gated on the round's toggle: commission is charged in every round.
+      const commissionInr = commissionInrFor(Number(t.qty), price, fillRate, fillCommissionRate)
 
       // Commission is charged per SIDE. If this account somehow sat on both sides
       // of one fill, settleFill charged it twice, so count it twice here.
@@ -1414,6 +1553,9 @@ export class TradingService {
     // The rate this fill settles at — pinned by the round, recorded on the trade
     // so history stays reproducible even if the Master changes it later.
     const rate = this.rateInr()
+    // Same reasoning for commission: stamp the rate actually charged, so a later
+    // Master change cannot retroactively rewrite this fill's cost.
+    const commissionTerms = this.commissionTerms()
 
     // DB assigns the trade's own uuid pk; the engine trade id is not stored.
     const { error: tErr } = await this.db.from('trades').insert({
@@ -1425,14 +1567,16 @@ export class TradingService {
       qty: trade.qty,
       aggressor,
       usd_inr_rate: rate,
+      commission_rate: commissionTerms.rate,
     })
     if (tErr) throw tErr
 
-    // Commission: charged to BOTH sides as a % of notional, but only while the
-    // active round has commission enabled. A cost, so it is deducted from each
-    // account's realized P&L at the time of the fill. INR, like everything else
-    // that settles.
-    const commissionInr = commissionInrFor(trade.qty, trade.price, rate, this.rounds.isCommissionActive())
+    // Commission: charged to BOTH sides as a % of notional on EVERY fill, in
+    // every round. The round's commission toggle does not gate this — it only
+    // controls whether teams are shown the line. A cost, so it is deducted from
+    // each account's realized P&L at the time of the fill. INR, like everything
+    // else that settles.
+    const commissionInr = commissionInrFor(trade.qty, trade.price, rate, commissionTerms.rate)
 
     // Buyer gains qty, seller loses qty — each valued at the execution price and
     // using ITS OWN order's leverage (matters only when the fill opens/flips).
@@ -1447,7 +1591,7 @@ export class TradingService {
 
     // Audit each side's commission.
     if (commissionInr > 0) {
-      const audit = { instrument: ticker, qty: trade.qty, price: trade.price, notional: trade.qty * trade.price, commissionRate: COMMISSION_RATE, usdInrRate: rate, commissionInr }
+      const audit = { instrument: ticker, qty: trade.qty, price: trade.price, notional: trade.qty * trade.price, commissionRate: commissionTerms.rate, usdInrRate: rate, commissionInr }
       await this.log(buyer.userId, 'commission_charged', 'info', { ...audit, side: 'buy' })
       await this.log(seller.userId, 'commission_charged', 'info', { ...audit, side: 'sell' })
     }

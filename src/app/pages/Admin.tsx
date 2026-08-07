@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, MOTION } from '../../lib/design-patterns'
+import { roundLabel } from '../../lib/format'
 import { supabase } from '../../lib/supabase'
 import {
   api,
@@ -87,6 +88,12 @@ function Admin() {
   // typing. The live value stays visible in its own column.
   const [priceDrafts, setPriceDrafts] = useState<Record<string, string>>({})
   const [savingPrices, setSavingPrices] = useState(false)
+  // Same seed-once rule as the price drafts: the 2s poll must not overwrite it.
+  const [rateDraft, setRateDraft] = useState('')
+  const [savingRate, setSavingRate] = useState(false)
+  // Commission rate is edited as a PERCENT ("0.30"), stored as a fraction (0.003).
+  const [commissionDraft, setCommissionDraft] = useState('')
+  const [savingCommission, setSavingCommission] = useState(false)
   const toastSeq = useRef(0)
   const ready = useRef(false)
   const draftsSeeded = useRef(false)
@@ -104,6 +111,12 @@ function Admin() {
     if (!draftsSeeded.current && b.instruments.length > 0) {
       draftsSeeded.current = true
       setPriceDrafts(Object.fromEntries(b.instruments.map((i) => [i.ticker, String(i.referencePrice)])))
+      // Seed from the round the rate would actually apply to. round.usdInrRate
+      // reads the ACTIVE round and falls back to the default between rounds, so
+      // it would show 83 even after the Master has pinned something else.
+      const tgt = s.schedule.find((r) => r.status === 'active') ?? s.schedule.find((r) => r.status === 'pending')
+      setRateDraft(String(tgt?.usdInrRate ?? b.round.usdInrRate))
+      setCommissionDraft(((tgt?.commissionRate ?? b.round.commissionRate) * 100).toFixed(2))
     }
   }, [])
 
@@ -160,7 +173,7 @@ function Admin() {
   })
   const doCommission = (enabled: boolean) => setPending({
     title: `Turn commission ${enabled ? 'ON' : 'OFF'}?`,
-    detail: `Sets commission_enabled = ${enabled} on the ${round.active ? 'current' : 'next'} round (${target?.id ?? '—'}).`,
+    detail: `Turns commission ${enabled ? 'on' : 'off'} for the ${round.active ? 'current' : 'next'} round (${target ? roundLabel(target.id) : '—'}).`,
     confirmLabel: enabled ? 'Enable' : 'Disable', tone: 'gold',
     run: async () => { try { await api.setCommission(enabled); await refresh(); toast(true, `Commission ${enabled ? 'enabled' : 'disabled'}`) } catch { toast(false, 'Failed to set commission') } },
   })
@@ -226,6 +239,88 @@ function Admin() {
     })
   }
 
+  // --- USD/INR settlement rate ---------------------------------------------
+  const parsedRate = (): number | null => {
+    const raw = rateDraft.trim()
+    if (raw === '') return null
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+  // The rate in force for the round this control targets. NOT round.usdInrRate,
+  // which reads the active round and reverts to the default between rounds.
+  const targetRate = target?.usdInrRate ?? round.usdInrRate
+  // Same rule for the commission rate: read the round this control targets, not
+  // the engine default. Displayed as a percentage.
+  const commissionRate = target?.commissionRate ?? round.commissionRate
+  const rateChanged = parsedRate() !== null && parsedRate() !== targetRate
+
+  const doSetRate = () => {
+    const rate = parsedRate()
+    if (rate === null) { toast(false, 'Enter a positive USD/INR rate'); return }
+    setPending({
+      title: `Set USD/INR to ${num(rate)}?`,
+      detail: round.active
+        ? `Sets ${num(rate)} on ${target ? roundLabel(target.id) : 'this round'}, replacing ${num(targetRate)}, with immediate effect. Fills from now on settle at the new rate; trades already closed keep the rate they settled at.`
+        : `Pins ${num(rate)} for ${target ? roundLabel(target.id) : 'the next round'}, replacing ${num(targetRate)}. Every fill in that round settles at this rate.`,
+      confirmLabel: 'Set Rate', tone: 'gold',
+      run: async () => {
+        setSavingRate(true)
+        try {
+          const res = await api.setUsdInrRate(rate)
+          analytics.capture('usd_inr_rate_set', { usdInrRate: rate })
+          // Read back the round that changed, not res.round — the latter reports
+          // the ACTIVE round's rate, which is the default between rounds.
+          setRateDraft(String(res.changed?.usdInrRate ?? rate))
+          await refresh()
+          toast(true, `USD/INR set to ${num(res.changed?.usdInrRate ?? rate)}`)
+        } catch (err) {
+          toast(false, err instanceof Error ? err.message : 'Failed to set rate')
+        } finally {
+          setSavingRate(false)
+        }
+      },
+    })
+  }
+
+  // --- Commission rate -------------------------------------------------------
+  // Entered as a percentage for legibility; the API takes a fraction.
+  const parsedCommission = (): number | null => {
+    const raw = commissionDraft.trim().replace(/%$/, '')
+    if (raw === '') return null
+    const pct = Number(raw)
+    if (!Number.isFinite(pct) || pct < 0 || pct > 100) return null
+    return pct / 100
+  }
+  const commissionChanged =
+    parsedCommission() !== null && Math.abs(parsedCommission()! - commissionRate) > 1e-12
+
+  const doSetCommissionRate = () => {
+    const rate = parsedCommission()
+    if (rate === null) { toast(false, 'Enter a commission rate between 0 and 100%'); return }
+    setPending({
+      title: `Set commission to ${(rate * 100).toFixed(2)}%?`,
+      detail: round.active
+        ? `Applies to ${target ? roundLabel(target.id) : 'this round'} immediately, replacing ${(commissionRate * 100).toFixed(2)}%. Fills from now on are charged at the new rate; fills already charged keep theirs.`
+        : `Pins ${(rate * 100).toFixed(2)}% for ${target ? roundLabel(target.id) : 'the next round'}, replacing ${(commissionRate * 100).toFixed(2)}%. Charged on every fill regardless of the display toggle.`,
+      confirmLabel: 'Set Rate', tone: 'gold',
+      run: async () => {
+        setSavingCommission(true)
+        try {
+          const res = await api.setCommissionRate(rate)
+          analytics.capture('commission_rate_set', { commissionRate: rate })
+          const applied = res.changed?.commissionRate ?? rate
+          setCommissionDraft((applied * 100).toFixed(2))
+          await refresh()
+          toast(true, `Commission set to ${(applied * 100).toFixed(2)}%`)
+        } catch (err) {
+          toast(false, err instanceof Error ? err.message : 'Failed to set commission rate')
+        } finally {
+          setSavingCommission(false)
+        }
+      },
+    })
+  }
+
   const doPush = () => {
     if (!title.trim()) { toast(false, 'Enter a title first'); return }
     const label = KINDS.find((x) => x.k === kind)!.label
@@ -266,7 +361,7 @@ function Admin() {
           </span>}
         >
           <div className="flex flex-wrap items-center gap-x-10 gap-y-3">
-            <Stat label="Round" value={round.active ? `#${(round.index ?? 0) + 1} · ${round.id}` : '—'} />
+            <Stat label="Round" value={round.active && round.id ? roundLabel(round.id) : '—'} />
             <Stat label="Mode" value={round.mode ? round.mode.replace(/_/g, ' ') : '—'} />
             <Stat label="Time Left" value={round.active && round.remainingSeconds != null ? mmss(round.remainingSeconds) : '—'} />
             <Stat label="Commission" value={round.active ? (round.commissionEnabled ? 'ON' : 'OFF') : '—'} tone={round.active && round.commissionEnabled ? 'gold' : undefined} />
@@ -292,7 +387,7 @@ function Admin() {
                 {schedule.map((r) => (
                   <tr key={r.id} className={`border-b border-white/[0.04] last:border-0 ${r.status === 'active' ? 'bg-up/[0.06]' : ''}`}>
                     <td className="px-3 py-2 text-subtle">{r.index + 1}</td>
-                    <td className="px-3 py-2 text-bright">{r.id}</td>
+                    <td className="px-3 py-2 text-bright">{roundLabel(r.id)}</td>
                     <td className="px-3 py-2 text-muted">{r.mode.replace(/_/g, ' ')}</td>
                     <td className={`px-3 py-2 ${r.commissionEnabled ? 'text-[#E8C46A]' : 'text-subtle'}`}>{r.commissionEnabled ? 'ON' : 'OFF'}</td>
                     <td className={`px-3 py-2 text-right uppercase ${r.status === 'active' ? 'text-up' : r.status === 'ended' ? 'text-subtle' : 'text-muted'}`}>{r.status}</td>
@@ -376,8 +471,47 @@ function Admin() {
           </div>
         </Panel>
 
+        {/* 3. Settlement rate. Sits next to prices because both are round
+             configuration, but unlike prices this one is NOT locked mid-round. */}
+        <Panel title="Settlement Rate (USD/INR)" delay={0.05}
+          right={<span className="font-mono text-[11px] text-muted">{round.active ? 'in force' : 'next round'} <span className="text-bright">{num(targetRate)}</span></span>}
+        >
+          {round.active && (
+            <p className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/[0.07] px-3 py-2 text-[12px] text-muted">
+              <span className="font-semibold text-amber-300">Round is live.</span>{' '}
+              Changing the rate now will affect settlement for trades from this point forward in this
+              round — trades already closed are unaffected.
+            </p>
+          )}
+          <p className="mb-4 text-[12px] leading-relaxed text-muted">
+            Sets the USD→INR rate. Every fill settles at this rate until changed again — it never
+            drifts on its own. Can be changed at any time, including mid-round; a position opened at
+            one rate and closed at another realizes the difference as real P&L.
+          </p>
+          <div className="flex items-end gap-3">
+            <label className="flex flex-col gap-1.5">
+              <span className="text-[10px] uppercase tracking-wider text-subtle">New rate (₹ per $1)</span>
+              <input
+                value={rateDraft}
+                onChange={(e) => setRateDraft(e.target.value)}
+                disabled={savingRate}
+                inputMode="decimal"
+                aria-label="New USD/INR rate"
+                className={`${INPUT} w-40 font-mono disabled:cursor-not-allowed disabled:opacity-40 ${rateDraft.trim() !== '' && parsedRate() === null ? 'border-destructive/60' : ''}`}
+              />
+            </label>
+            <button
+              onClick={doSetRate}
+              disabled={savingRate || !rateChanged}
+              className="rounded-lg border border-[#E8C46A]/40 bg-[#E8C46A]/10 px-4 py-2 text-sm font-medium text-[#E8C46A] transition-colors hover:bg-[#E8C46A]/20 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {savingRate ? 'Working…' : 'Set Rate'}
+            </button>
+          </div>
+        </Panel>
+
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-          {/* 3. Broadcast */}
+          {/* 4. Broadcast */}
           <Panel title="Broadcast" delay={0.05}>
             <div className="flex gap-1.5">
               {KINDS.map((x) => (
@@ -412,11 +546,11 @@ function Admin() {
             </div>
           </Panel>
 
-          {/* 4. Commission */}
+          {/* 5. Commission */}
           <Panel title="Commission" delay={0.1}>
             <p className="text-[12px] leading-relaxed text-muted">
-              Toggle commission for the <span className="text-bright">{round.active ? 'current' : 'next'}</span> round
-              {target ? <span className="font-mono text-subtle"> ({target.id})</span> : null}.
+              Show or hide the Commission line for the <span className="text-bright">{round.active ? 'current' : 'next'}</span> round
+              {target ? <span className="font-mono text-subtle"> ({roundLabel(target.id)})</span> : null}.
             </p>
             <div className="mt-4 grid grid-cols-2 gap-2">
               {[true, false].map((on) => (
@@ -426,13 +560,48 @@ function Admin() {
                 </button>
               ))}
             </div>
-            <p className="mt-4 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-[10px] leading-relaxed text-amber-300/80">
-              This sets and displays the commission flag. Commission charges are not yet applied to trade P&L — that's a separate follow-up.
+            <p className="mt-4 rounded-md border border-white/[0.08] bg-white/[0.02] px-3 py-2 text-[10px] leading-relaxed text-muted">
+              Commission is charged on <span className="text-bright">every fill</span> at the rate set below, to both
+              sides, and always deducted from realized P&L — every round, regardless of this toggle. This setting only
+              controls whether the Commission line is shown to teams in the trade confirmation popup.
+              To run a round at no cost, set the rate to <span className="font-mono text-bright">0%</span>.
             </p>
+
+            {/* Commission RATE — separate from the display toggle above. */}
+            <div className="mt-4 border-t border-white/[0.06] pt-4">
+              <div className="flex items-end gap-3">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[10px] uppercase tracking-wider text-subtle">Commission rate (%)</span>
+                  <input
+                    value={commissionDraft}
+                    onChange={(e) => setCommissionDraft(e.target.value)}
+                    disabled={savingCommission}
+                    inputMode="decimal"
+                    aria-label="Commission rate percent"
+                    className={`${INPUT} w-32 font-mono disabled:cursor-not-allowed disabled:opacity-40 ${commissionDraft.trim() !== '' && parsedCommission() === null ? 'border-destructive/60' : ''}`}
+                  />
+                </label>
+                <button
+                  onClick={doSetCommissionRate}
+                  disabled={savingCommission || !commissionChanged}
+                  className="rounded-lg border border-[#E8C46A]/40 bg-[#E8C46A]/10 px-4 py-2 text-sm font-medium text-[#E8C46A] transition-colors hover:bg-[#E8C46A]/20 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  {savingCommission ? 'Working…' : 'Set Rate'}
+                </button>
+                <span className="ml-auto font-mono text-[11px] text-muted">
+                  {round.active ? 'in force' : 'next round'}{' '}
+                  <span className="text-bright">{(commissionRate * 100).toFixed(2)}%</span>
+                </span>
+              </div>
+              <p className="mt-3 text-[10px] leading-relaxed text-subtle">
+                Changeable at any time, including mid-round. Forward-only: fills already charged keep the rate they
+                were charged at.
+              </p>
+            </div>
           </Panel>
         </div>
 
-        {/* 5. Teams */}
+        {/* 6. Teams */}
         <Panel title="Teams" delay={0.15} right={<span className="font-mono text-[10px] text-subtle">{teams.length}</span>}>
           <div className="overflow-x-auto">
             <table className="w-full text-[13px]">

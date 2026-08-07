@@ -266,8 +266,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const changed = await service.setCommission(b.enabled === true)
     return json(res, 200, { round: service.getRoundStatus(), changed })
   }
-  // The USD→INR rate is set by hand and pinned for the round — it never drifts,
-  // because under INR cash settlement a rate move realizes real P&L on close.
+  // The USD→INR rate is set by hand and pinned for the round — it never drifts on
+  // its own. The Master may change it at any time, including mid-round: the change
+  // applies to subsequent fills only, and already-settled trades keep their rate.
   if (method === 'POST' && path === '/api/round/rate') {
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
     const b = await readJson(req)
@@ -275,8 +276,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (!Number.isFinite(rate) || rate <= 0) {
       return json(res, 400, { error: 'usdInrRate must be a positive number' })
     }
-    const changed = await service.setUsdInrRate(rate)
-    return json(res, 200, { round: service.getRoundStatus(), changed })
+    const result = await service.setUsdInrRate({ accountId: caller.accountId, role: caller.role }, rate)
+    if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
+    return json(res, 200, { round: service.getRoundStatus(), changed: result.changed })
   }
   // Instrument starting prices. Usable before every round, not just the first —
   // see TradingService.setInstrumentPrices for why it writes both the reference
@@ -296,6 +298,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     )
     if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
     return json(res, 200, { applied: true, changes: result.changes, instruments: service.instrumentCatalogue() })
+  }
+  // Commission RATE (distinct from the on/off toggle above). Changeable at any
+  // time, including mid-round: forward-only, and each fill records the rate it
+  // was charged at.
+  if (method === 'POST' && path === '/api/round/commission-rate') {
+    if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
+    const b = await readJson(req)
+    const rate = Number(b.commissionRate ?? b.rate)
+    if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+      return json(res, 400, { error: 'commissionRate must be a fraction between 0 and 1' })
+    }
+    const result = await service.setCommissionRate({ accountId: caller.accountId, role: caller.role }, rate)
+    if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
+    return json(res, 200, { round: service.getRoundStatus(), changed: result.changed })
   }
   if (method === 'GET' && path === '/api/admin/teams') {
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })

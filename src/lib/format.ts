@@ -1,5 +1,5 @@
 /**
- * Money and percentage formatters.
+ * Display formatters — money, percentages, and round names.
  *
  * Split out of simulation.ts, which also exports a React hook that touches
  * `window` — importing a formatter from there dragged the whole browser module
@@ -44,4 +44,23 @@ export function usdAxis(v: number): string {
 export function pct(v: number): string {
   const sign = v > 0 ? '+' : v < 0 ? '−' : ''
   return `${sign}${Math.abs(v).toFixed(2)}%`
+}
+
+/**
+ * Plain-language name for an internal round id: `real-3` → "Round 3",
+ * `mock-1` → "Mock Round 1".
+ *
+ * Numbered from the id's own suffix, NOT from the schedule index — the mock
+ * round occupies index 0, so index-based numbering would call `real-3` "Round 4"
+ * and the mock round "Round 1". Every surface (Master and teams) uses this, so
+ * one round has exactly one name across the app.
+ *
+ * An id in an unrecognised shape is returned unchanged rather than hidden.
+ */
+export function roundLabel(id: string): string {
+  const mock = /^mock-(\d+)$/.exec(id)
+  if (mock) return `Mock Round ${mock[1]}`
+  const real = /^real-(\d+)$/.exec(id)
+  if (real) return `Round ${real[1]}`
+  return id
 }

@@ -12,7 +12,7 @@
  * The DB is an in-memory fake covering the query shapes the service uses.
  */
 import { describe, it, expect } from 'vitest'
-import { DEFAULT_USD_INR_RATE, RoundController, type EventConfig } from '@iimb-trading/engine'
+import { DEFAULT_COMMISSION_RATE, DEFAULT_USD_INR_RATE, RoundController, type EventConfig } from '@iimb-trading/engine'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { TradingService } from './tradingService'
 
@@ -170,6 +170,8 @@ class FakeDb {
 const AAPL = { id: 'i-aapl', ticker: 'AAPL', name: 'Apple', sector: 'Tech', reference_price: 230 }
 const A = 'acct-a' // buyer in most scenarios
 const B = 'acct-b' // counterparty
+/** Caller identity for master-gated controls (setUsdInrRate). */
+const MASTER = { accountId: 'acct-master', role: 'master' }
 const START_CASH = 10_000_000 // ₹1 crore each, so margin never binds unintentionally
 
 function schedule(rate: number): EventConfig {
@@ -179,8 +181,15 @@ function schedule(rate: number): EventConfig {
   ]
 }
 
-function harness(opts: { rate?: number; commission?: boolean } = {}) {
+/**
+ * `commission: true` means "this round charges commission", expressed as a
+ * non-zero RATE — the commissionEnabled flag is display-only and no longer gates
+ * the charge. Tests that don't care about commission get rate 0, so their P&L
+ * numbers stay free of it.
+ */
+function harness(opts: { rate?: number; commission?: boolean; commissionRate?: number } = {}) {
   const rate = opts.rate ?? DEFAULT_USD_INR_RATE
+  const charging = opts.commission ?? false
   const db = new FakeDb({
     instruments: [{ ...AAPL }],
     profiles: [
@@ -188,7 +197,11 @@ function harness(opts: { rate?: number; commission?: boolean } = {}) {
       { id: B, username: 'team02', team_name: 'B', role: 'team', starting_cash: START_CASH, realized_pnl: 0, realized_pnl_inr: 0 },
     ],
   })
-  const config = schedule(rate).map((r) => ({ ...r, commissionEnabled: opts.commission ?? false }))
+  const config = schedule(rate).map((r) => ({
+    ...r,
+    commissionEnabled: charging,
+    commissionRate: opts.commissionRate ?? (charging ? DEFAULT_COMMISSION_RATE : 0),
+  }))
   const rounds = new RoundController(config)
   const svc = new TradingService(db as unknown as SupabaseClient, rounds)
   return { db, rounds, svc, rate }
@@ -308,8 +321,8 @@ describe('service: SELL settles at the round rate in force AT SELL TIME', () => 
     await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
     expect(Number(db.position(A)!.notional_basis_inr)).toBeCloseTo(190_900, 6)
 
-    // Master repins the rate, then A closes at the SAME USD price.
-    await svc.setUsdInrRate(85)
+    // Master repins the rate mid-round, then A closes at the SAME USD price.
+    await svc.setUsdInrRate(MASTER, 85)
     await cross(svc, { buyer: B, seller: A, qty: 10, price: 230, leverage: 1 })
 
     // Pure FX gain: 10 × 230 × (85 − 83). Zero if the buy-time rate were used.
@@ -325,7 +338,7 @@ describe('service: SELL settles at the round rate in force AT SELL TIME', () => 
     await svc.loadInstruments()
     await svc.startRound(0)
     await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
-    await svc.setUsdInrRate(85)
+    await svc.setUsdInrRate(MASTER, 85)
     await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
 
     expect(Number(db.profile(A)!.realized_pnl_inr)).toBeCloseTo(13_100, 6) // 204,000 − 190,900
@@ -336,7 +349,7 @@ describe('service: SELL settles at the round rate in force AT SELL TIME', () => 
     await svc.loadInstruments()
     await svc.startRound(0)
     await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
-    await svc.setUsdInrRate(85)
+    await svc.setUsdInrRate(MASTER, 85)
     await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
 
     const rates = db.rows('trades').map((t) => Number(t.usd_inr_rate))
@@ -365,7 +378,7 @@ describe('service: PARTIAL sells realize proportionally', () => {
     await svc.startRound(0)
     await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
 
-    await svc.setUsdInrRate(85)
+    await svc.setUsdInrRate(MASTER, 85)
     await cross(svc, { buyer: B, seller: A, qty: 4, price: 240, leverage: 1 })
 
     expect(Number(db.profile(A)!.realized_pnl_inr)).toBeCloseTo(5_240, 6) // (20,400−19,090)×4
@@ -533,9 +546,9 @@ describe('service: portfolio has no unrealized P&L, and charges are real', () =>
     await svc.loadInstruments()
     await svc.startRound(0)
     await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
-    await svc.setUsdInrRate(85)
+    await svc.setUsdInrRate(MASTER, 85)
     await cross(svc, { buyer: B, seller: A, qty: 4, price: 240, leverage: 1 })
-    await svc.setUsdInrRate(90)
+    await svc.setUsdInrRate(MASTER, 90)
     await cross(svc, { buyer: B, seller: A, qty: 6, price: 250, leverage: 1 })
 
     const history = await svc.tradeHistory(A)
@@ -557,25 +570,93 @@ describe('service: the rate is pinned, persisted, and survives restart', () => {
     expect(svc.rateInr()).toBe(86)
   })
 
-  it('setUsdInrRate persists and logs the change', async () => {
+  it('setUsdInrRate logs the change, attributed to the master', async () => {
     const { db, svc } = harness({ rate: 83 })
     await svc.loadInstruments()
-    await svc.startRound(0)
 
-    await svc.setUsdInrRate(88.5)
+    // Set BETWEEN rounds — mid-round is refused (see the guard tests). It pins
+    // the NEXT round; rateInr() only reports it once that round starts.
+    const res = await svc.setUsdInrRate(MASTER, 88.5)
+    expect(res.applied).toBe(true)
+    expect(res.changed?.usdInrRate).toBe(88.5)
 
-    expect(Number(db.rows('rounds')[0].usd_inr_rate)).toBe(88.5)
-    expect(svc.rateInr()).toBe(88.5)
     const logged = db.rows('event_log').filter((e) => e.event_type === 'usd_inr_rate_changed')
     expect(logged).toHaveLength(1)
-    expect(logged[0].payload).toMatchObject({ roundId: 'r1', usdInrRate: 88.5 })
+    expect(logged[0].account_id).toBe(MASTER.accountId)
+    expect(logged[0].payload).toMatchObject({ roundId: 'r1', usdInrRate: 88.5, previousRate: 83 })
+  })
+
+  it('persists a between-rounds rate immediately, on a pending row', async () => {
+    const { db, svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+
+    await svc.setUsdInrRate(MASTER, 88.5)
+
+    // The row is created ahead of the round starting, so the rate is durable.
+    const row = db.rows('rounds').find((r) => r.id === 'r1')!
+    expect(row).toBeDefined()
+    expect(Number(row.usd_inr_rate)).toBe(88.5)
+    expect(row.status).toBe('pending')
+    expect(row.started_at ?? null).toBeNull()
+
+    await svc.startRound(0)
+    expect(Number(db.rows('rounds').find((r) => r.id === 'r1')!.usd_inr_rate)).toBe(88.5)
+  })
+
+  it('a between-rounds rate survives a restart BEFORE the round starts', async () => {
+    const { db, svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.setUsdInrRate(MASTER, 95)
+    // No startRound() — this is the window that used to lose the change.
+
+    const rounds2 = new RoundController(schedule(83))
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.getSchedule()[0].usdInrRate).toBe(95) // not the config default
+    await svc2.startRound(0)
+    expect(svc2.rateInr()).toBe(95)
+  })
+
+  it('restarting does not mark the pending round as run', async () => {
+    const { db, svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.setUsdInrRate(MASTER, 95)
+
+    const rounds2 = new RoundController(schedule(83))
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    const recovery = await svc2.rehydrate()
+
+    // The early row must not be mistaken for a round that already happened.
+    expect(recovery.roundsRestored).toBe(0)
+    expect(svc2.getSchedule()[0].status).toBe('pending')
+    expect(svc2.getRoundStatus().active).toBe(false)
+  })
+
+  it('an active round\'s own rate wins over a later pending row', async () => {
+    const { db, svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.setUsdInrRate(MASTER, 90)
+    await svc.startRound(0) // r1 active at 90
+    await svc.endRound(600)
+    await svc.setUsdInrRate(MASTER, 97) // pins r2
+    await svc.startRound(700) // r2 active at 97
+
+    const rounds2 = new RoundController(schedule(83))
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.rateInr()).toBe(97)
   })
 
   it('rehydrate restores the pinned rate, not the config default', async () => {
     const { db, svc } = harness({ rate: 83 })
     await svc.loadInstruments()
-    await svc.startRound(0)
-    await svc.setUsdInrRate(91)
+    await svc.setUsdInrRate(MASTER, 91)
+    await svc.startRound(0) // persists the pinned rate onto the round row
 
     // Fresh service over the same DB — simulating a restart mid-round.
     const rounds2 = new RoundController(schedule(83))
@@ -584,6 +665,148 @@ describe('service: the rate is pinned, persisted, and survives restart', () => {
     await svc2.rehydrate()
 
     expect(svc2.rateInr()).toBe(91) // the pinned rate, not 83
+  })
+
+  /**
+   * The guarantee behind allowing mid-round rate changes: the change is
+   * forward-only. Anything already settled keeps the rate it settled at and is
+   * never retroactively revalued.
+   */
+  it('a mid-round change leaves ALREADY-SETTLED trades untouched', async () => {
+    const { db, svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    // Fill 1 and fill 2 both settle at 83: open 10, then close 4.
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 4, price: 240, leverage: 1 })
+
+    const settledPnl = Number(db.profile(A)!.realized_pnl_inr)
+    const settledRates = db.rows('trades').map((t) => Number(t.usd_inr_rate))
+    expect(settledRates).toEqual([83, 83])
+    expect(settledPnl).toBeCloseTo((240 - 230) * 4 * 83, 6) // ₹3,320
+
+    // Master moves the rate mid-round.
+    expect((await svc.setUsdInrRate(MASTER, 95)).applied).toBe(true)
+
+    // Nothing already settled moved: same stored P&L, same recorded rates.
+    expect(Number(db.profile(A)!.realized_pnl_inr)).toBe(settledPnl)
+    expect(db.rows('trades').map((t) => Number(t.usd_inr_rate))).toEqual([83, 83])
+    // The open position's basis is still struck at the ORIGINAL rate.
+    expect(Number(db.position(A)!.notional_basis_inr)).toBeCloseTo(6 * 230 * 83, 6)
+
+    // Fill 3, after the change, settles at the NEW rate.
+    await cross(svc, { buyer: B, seller: A, qty: 6, price: 240, leverage: 1 })
+    expect(db.rows('trades').map((t) => Number(t.usd_inr_rate))).toEqual([83, 83, 95])
+
+    // Its P&L is basis-at-83 vs proceeds-at-95 — the currency move realized.
+    const finalPnl = Number(db.profile(A)!.realized_pnl_inr)
+    expect(finalPnl - settledPnl).toBeCloseTo(6 * (240 * 95 - 230 * 83), 6)
+  })
+
+  it('a mid-round change does not alter a closed round-trip settled earlier', async () => {
+    const { db, svc } = harness({ rate: 83 })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 }) // fully closed at 83
+
+    const closedPnl = Number(db.profile(A)!.realized_pnl_inr)
+    const historyBefore = await svc.tradeHistory(A)
+
+    await svc.setUsdInrRate(MASTER, 95)
+
+    expect(Number(db.profile(A)!.realized_pnl_inr)).toBe(closedPnl)
+    // The reconstruction replays each fill at ITS OWN recorded rate, so the
+    // history is byte-identical after the change.
+    expect(await svc.tradeHistory(A)).toEqual(historyBefore)
+  })
+
+  /**
+   * The commission rate is forward-only in exactly the way the FX rate is: the
+   * charge is computed at fill time and stamped onto the trade, so a later Master
+   * change can never rewrite what was already taken.
+   */
+  it('a mid-round COMMISSION RATE change leaves already-charged fills untouched', async () => {
+    const { db, svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    // Fill 1 charged at the default 0.30%.
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    const chargedFirst = 0.003 * 10 * 230 * 83 // ₹572.70 per side
+    expect(Number(db.profile(A)!.realized_pnl_inr)).toBeCloseTo(-chargedFirst, 6)
+    expect(db.rows('trades').map((t) => Number(t.commission_rate))).toEqual([0.003])
+
+    // Master doubles the rate mid-round.
+    expect((await svc.setCommissionRate(MASTER, 0.006)).applied).toBe(true)
+
+    // Nothing already charged moved.
+    expect(Number(db.profile(A)!.realized_pnl_inr)).toBeCloseTo(-chargedFirst, 6)
+    expect(db.rows('trades').map((t) => Number(t.commission_rate))).toEqual([0.003])
+
+    // Fill 2 is charged at the NEW rate, and stamped with it.
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+    expect(db.rows('trades').map((t) => Number(t.commission_rate))).toEqual([0.003, 0.006])
+
+    const chargedSecond = 0.006 * 10 * 240 * 83 // ₹1,195.20
+    expect(Number(db.profile(A)!.realized_pnl_inr)).toBeCloseTo(8_300 - chargedFirst - chargedSecond, 6)
+  })
+
+  it('trade history reports each fill at the rate it was CHARGED at', async () => {
+    const { svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await svc.setCommissionRate(MASTER, 0.006)
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    // The closing fill's commission uses 0.006, not the original 0.003.
+    const close = (await svc.tradeHistory(A))[0]
+    expect(close.commissionInr).toBeCloseTo(0.006 * 10 * 240 * 83, 6)
+  })
+
+  it('chargesInr still reconciles after a mid-round rate change', async () => {
+    const { db, svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await svc.setCommissionRate(MASTER, 0.006)
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    expect(Number(p.chargesInr)).toBeCloseTo(0.003 * 10 * 230 * 83 + 0.006 * 10 * 240 * 83, 6)
+    const summedGross = p.tradeHistory.reduce((s: number, h: any) => s + h.grossPnlInr, 0)
+    expect(summedGross - p.chargesInr).toBeCloseTo(Number(db.profile(A)!.realized_pnl_inr), 6)
+  })
+
+  it('a commission rate set between rounds survives a restart before the round starts', async () => {
+    const { db, svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.setCommissionRate(MASTER, 0.0045)
+
+    const rounds2 = new RoundController(schedule(83).map((r) => ({ ...r, commissionEnabled: true })))
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.getSchedule()[0].commissionRate).toBe(0.0045) // not the 0.003 default
+    await svc2.startRound(0)
+    expect(svc2.commissionRate()).toBe(0.0045)
+  })
+
+  it('a mid-round commission rate survives a restart', async () => {
+    const { db, svc } = harness({ rate: 83, commission: true })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    await svc.setCommissionRate(MASTER, 0.008)
+
+    const rounds2 = new RoundController(schedule(83).map((r) => ({ ...r, commissionEnabled: true })))
+    const svc2 = new TradingService(db as unknown as SupabaseClient, rounds2)
+    await svc2.loadInstruments()
+    await svc2.rehydrate()
+
+    expect(svc2.commissionRate()).toBe(0.008)
   })
 
   it('the rate does not move on its own between reads', async () => {
@@ -661,7 +884,36 @@ describe('service: trade history charges commission on the FULL fill', () => {
     expect(reduce.commissionInr).toBeCloseTo(0.003 * 4 * 240 * 83, 6)
   })
 
-  it('still charges nothing when the round has commission disabled', async () => {
+  it('charges even when the toggle is OFF — the toggle is display-only', async () => {
+    // Toggle off, but a real rate configured: the charge must still land.
+    const { db, svc } = harness({ rate: 83, commission: false, commissionRate: 0.003 })
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    expect(svc.getRoundStatus().commissionEnabled).toBe(false)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+    await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+
+    const charged = 0.003 * 10 * 230 * 83 + 0.003 * 10 * 240 * 83
+    expect(Number(db.profile(A)!.realized_pnl_inr)).toBeCloseTo(8_300 - charged, 6)
+    const p = (await svc.portfolio(A)) as Record<string, any>
+    expect(Number(p.chargesInr)).toBeCloseTo(charged, 6)
+  })
+
+  it('produces IDENTICAL settlement whether the toggle is on or off', async () => {
+    const run = async (commission: boolean) => {
+      const { db, svc } = harness({ rate: 83, commission, commissionRate: 0.003 })
+      await svc.loadInstruments()
+      await svc.startRound(0)
+      await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
+      await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
+      const p = (await svc.portfolio(A)) as Record<string, any>
+      return { pnl: Number(db.profile(A)!.realized_pnl_inr), charges: Number(p.chargesInr) }
+    }
+    expect(await run(false)).toEqual(await run(true))
+  })
+
+  it('charges nothing only when the RATE is zero', async () => {
     const { svc } = harness({ rate: 83, commission: false })
     await svc.loadInstruments()
     await svc.startRound(0)
@@ -872,7 +1124,7 @@ describe('service: chargesInr and tradeHistory measure different things', () => 
     await svc.loadInstruments()
     await svc.startRound(0)
     await cross(svc, { buyer: A, seller: B, qty: 10, price: 230, leverage: 1 })
-    await svc.setUsdInrRate(90)
+    await svc.setUsdInrRate(MASTER, 90)
     await cross(svc, { buyer: B, seller: A, qty: 10, price: 240, leverage: 1 })
 
     const p = (await svc.portfolio(A)) as Record<string, any>

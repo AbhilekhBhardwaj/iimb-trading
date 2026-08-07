@@ -236,16 +236,42 @@ export function applyCashFill(
 // ---------------------------------------------------------------------------
 
 /**
- * Commission charged on every executed fill, per side, as a fraction of trade
- * notional (qty × price) — applied only while the active round has commission
- * enabled. 0.003 = 0.30%, the middle of IIMB's 0.2–0.5% range. Change this one
- * line to set any rate (e.g. 0.002 for 0.2%, 0.005 for 0.5%).
+ * Fallback commission rate for a round whose config doesn't pin one: a fraction
+ * of trade notional (qty × price) charged per side. 0.003 = 0.30%, the middle of
+ * IIMB's 0.2–0.5% range.
+ *
+ * This is only the DEFAULT. The rate in force is pinned per round and the Master
+ * can change it at any time — see RoundController.setCommissionRate. Read it from
+ * the round, never from this constant.
  *
  * Lives in the engine rather than server/config.ts because both the settlement
  * path and the terminal's order-confirmation preview need it; server/config.ts
  * re-exports it so the two cannot drift apart.
  */
-export const COMMISSION_RATE = 0.003
+export const DEFAULT_COMMISSION_RATE = 0.003
+
+/** Widest rate the engine will accept, as a sanity bound (100% of notional). */
+export const MAX_COMMISSION_RATE = 1
+
+/**
+ * The commission terms in force for a fill.
+ *
+ * `enabled` is DISPLAY-ONLY. Commission is charged on every fill in every round
+ * regardless of it; the toggle decides solely whether teams are shown a
+ * Commission line in the confirmation popup. To run a round with no commission,
+ * set `rate` to 0.
+ */
+export interface CommissionTerms {
+  /** Show the Commission line to teams. Does NOT affect what is charged. */
+  enabled: boolean
+  /** Fraction of trade notional charged per side. 0.003 = 0.30%. 0 = free. */
+  rate: number
+}
+
+/** True when `rate` is a usable commission rate (0 up to and including 100%). */
+export function isValidCommissionRate(rate: number): boolean {
+  return typeof rate === 'number' && Number.isFinite(rate) && rate >= 0 && rate <= MAX_COMMISSION_RATE
+}
 
 /**
  * Commission in INR for a fill.
@@ -254,17 +280,21 @@ export const COMMISSION_RATE = 0.003
  * just the portion that closes a position. The two differ only when an order
  * flips through zero.
  *
- * When the round's commission toggle is off this is 0, because the toggle
- * governs whether commission is CHARGED, not merely whether it is displayed.
+ * ALWAYS charged, in every round. The round's commission toggle does not appear
+ * here on purpose: it governs only whether teams are SHOWN a Commission line.
+ * A round that should cost nothing is expressed as `commissionRate === 0`.
+ *
+ * The rate is supplied by the caller rather than read from a constant, so a
+ * Master rate change takes effect on the next fill.
  */
 export function commissionInrFor(
   fillQty: number,
   price: number,
   usdInrRate: number,
-  commissionEnabled: boolean,
+  commissionRate: number,
 ): number {
-  if (!commissionEnabled) return 0
-  return COMMISSION_RATE * Math.abs(fillQty) * price * usdInrRate
+  const rate = isValidCommissionRate(commissionRate) ? commissionRate : DEFAULT_COMMISSION_RATE
+  return rate * Math.abs(fillQty) * price * usdInrRate
 }
 
 /** Gross / commission / net split for a fill that closes or reduces a position. */
@@ -297,13 +327,13 @@ export function closingPnlBreakdown(
   price: number,
   usdInrRate: number,
   fillLeverage: number,
-  commissionEnabled: boolean,
+  commissionRate: number,
 ): ClosingPnlBreakdown | null {
   const outcome = applyCashFill(current, delta, price, usdInrRate, fillLeverage)
   if (outcome.closedQty === 0) return null
 
   const grossPnlInr = outcome.realizedPnlInr
-  const commissionInr = commissionInrFor(delta, price, usdInrRate, commissionEnabled)
+  const commissionInr = commissionInrFor(delta, price, usdInrRate, commissionRate)
   return {
     closedQty: outcome.closedQty,
     grossPnlInr,

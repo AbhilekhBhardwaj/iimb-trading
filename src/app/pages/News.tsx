@@ -5,6 +5,7 @@ import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, MOTION } from '../../lib/desi
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
 import { api, type Bootstrap, type InstrumentMeta, type Notification, type ScheduleRound } from '../../lib/api'
+import { roundLabel } from '../../lib/format'
 import { analytics } from '../../lib/analytics'
 
 // ---------------------------------------------------------------------------
@@ -185,7 +186,7 @@ function News() {
                         key={r.id}
                         disabled={!ended}
                         onClick={() => setArchiveId(r.id)}
-                        title={ended ? `View Round ${r.index + 1}` : 'Not yet unveiled'}
+                        title={ended ? `View ${roundLabel(r.id)}` : 'Not yet unveiled'}
                         className={`flex shrink-0 items-center justify-between rounded-lg border px-3 py-2 text-left transition-colors ${
                           sel ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10'
                             : ended ? 'border-white/10 hover:bg-white/[0.04]'
@@ -193,7 +194,7 @@ function News() {
                         }`}
                       >
                         <span className="flex min-w-0 flex-col">
-                          <span className={`font-mono text-[13px] ${sel ? 'text-[#E8C46A]' : ended ? 'text-foreground' : 'text-subtle'}`}>Round {r.index + 1}</span>
+                          <span className={`font-mono text-[13px] ${sel ? 'text-[#E8C46A]' : ended ? 'text-foreground' : 'text-subtle'}`}>{roundLabel(r.id)}</span>
                           <span className="truncate text-[10px] uppercase tracking-wide text-subtle">{r.mode.replace(/_/g, ' ')}</span>
                         </span>
                         {ended
@@ -212,7 +213,7 @@ function News() {
                     <p className="text-sm text-subtle">Select a past round on the left to read its news.</p>
                   ) : (
                     <>
-                      <div className="mb-3 font-mono text-[11px] text-subtle">Round {archiveRound.index + 1} · {archiveRound.mode.replace(/_/g, ' ')}</div>
+                      <div className="mb-3 font-mono text-[11px] text-subtle">{roundLabel(archiveRound.id)} · {archiveRound.mode.replace(/_/g, ' ')}</div>
                       {archiveNews.length === 0 ? (
                         <p className="text-sm text-subtle">No news was published for this round.</p>
                       ) : (

@@ -1,13 +1,13 @@
 /**
  * Commission scenario test against the live DB:
- *   A) commission ON  → every fill charges COMMISSION_RATE × notional to BOTH
+ *   A) commission ON  → every fill charges DEFAULT_COMMISSION_RATE × notional to BOTH
  *      sides, deducted from each account's realized P&L.
  *   B) commission OFF → a fill charges nothing (realized unchanged).
  *
  * Idempotent (wipes its own prior data at the start). Run: npx tsx server/commission-smoke.ts
  */
 import { RoundController } from '@iimb-trading/engine'
-import { COMMISSION_RATE, USD_INR } from './config'
+import { DEFAULT_COMMISSION_RATE, USD_INR } from './config'
 import { createAdminClient } from './supabaseAdmin'
 import { TradingService } from './tradingService'
 
@@ -50,11 +50,11 @@ async function main(): Promise<void> {
   ]))
   await svc.loadInstruments()
 
-  const expCommUsd = COMMISSION_RATE * 10 * 100 // 0.003 × 10 × 100 = 3.0 USD per side
+  const expCommUsd = DEFAULT_COMMISSION_RATE * 10 * 100 // 0.003 × 10 × 100 = 3.0 USD per side
   const expCommInr = expCommUsd * USD_INR
 
   // --- A) commission ON ---
-  console.log(`\nA. Commission ON (rate ${COMMISSION_RATE} = ${(COMMISSION_RATE * 100).toFixed(2)}%):`)
+  console.log(`\nA. Commission ON (rate ${DEFAULT_COMMISSION_RATE} = ${(DEFAULT_COMMISSION_RATE * 100).toFixed(2)}%):`)
   await svc.startRound(0)
   await svc.placeOrder({ accountId: B, ticker: TICKER, side: 'sell', type: 'limit', price: 100, qty: 10, leverage: 1 })
   await svc.placeOrder({ accountId: A, ticker: TICKER, side: 'buy', type: 'limit', price: 100, qty: 10, leverage: 1 })

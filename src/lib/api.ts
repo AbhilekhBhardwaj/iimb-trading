@@ -19,6 +19,8 @@ export interface RoundStatus {
   remainingSeconds: number | null
   /** USD→INR pinned for this round. Set by the Master; never auto-drifts. */
   usdInrRate: number
+  /** Commission rate pinned for this round, as a fraction of notional per side. */
+  commissionRate: number
 }
 
 export interface InstrumentMeta {
@@ -120,6 +122,10 @@ export interface ScheduleRound {
   status: 'pending' | 'active' | 'ended'
   startedAt: number | null
   endedAt: number | null
+  /** USD→INR pinned for this round. Set by the Master; never auto-drifts. */
+  usdInrRate: number
+  /** Commission rate pinned for this round, as a fraction of notional per side. */
+  commissionRate: number
 }
 
 export interface TeamOverview {
@@ -390,6 +396,22 @@ export const api = {
   roundStart: () => post<{ round: RoundStatus }>('/round/start', {}),
   roundEnd: () => post<{ round: RoundStatus }>('/round/end', {}),
   setCommission: (enabled: boolean) => post<{ round: RoundStatus }>('/round/commission', { enabled }),
+  /**
+   * Master-only. Pins the USD→INR settlement rate on the active round, or the
+   * next pending one when none is active. Allowed at any time, including
+   * mid-round: the change applies to subsequent fills only, and trades that have
+   * already settled keep the rate they settled at.
+   */
+  setUsdInrRate: (usdInrRate: number) =>
+    post<{ round: RoundStatus; changed: ScheduleRound | null }>('/round/rate', { usdInrRate }),
+  /**
+   * Master-only. Sets the commission rate (fraction of notional per side) on the
+   * active round, or the next pending one when none is active. Changeable at any
+   * time, including mid-round: forward-only, and each fill records the rate it
+   * was charged at, so already-settled fills are never recomputed.
+   */
+  setCommissionRate: (commissionRate: number) =>
+    post<{ round: RoundStatus; changed: ScheduleRound | null }>('/round/commission-rate', { commissionRate }),
   roundSchedule: () => get<{ schedule: ScheduleRound[] }>('/round/schedule'),
   notificationsList: () => get<{ notifications: Notification[] }>('/notifications'),
   pushNotification: (kind: Notification['kind'], title: string, body?: string) =>
