@@ -7,6 +7,7 @@ import {
   closingOrderFor,
   type MarketContext,
   type OrderTerms,
+  previewPrice,
 } from './orderFlow'
 
 const RATE = 83
@@ -333,5 +334,111 @@ describe('an ACCEPTED order still behaves exactly as before', () => {
       accepted: true, trades: [{ price: 190, qty: 5 }, { price: 188, qty: 5 }], bestPriceAtSubmit: 190,
     })
     expect(out.kind === 'dialog' && out.note).toContain('could have saved you $10.00')
+  })
+})
+
+describe('previewPrice — the confirm dialog must not preview at the last trade', () => {
+  /**
+   * The book has moved since the last print: it traded at $180, but the best
+   * ask is now $190 and the best bid $186. An LTP-based preview would quote
+   * $180 for a market order in either direction — a price nobody is offering.
+   */
+  const book = {
+    bids: [{ price: 186, qty: 50 }, { price: 185, qty: 40 }],
+    asks: [{ price: 190, qty: 30 }, { price: 191, qty: 60 }],
+  }
+  const STALE_LTP = 180
+
+  it('a market BUY previews at the best ASK, not the last trade', () => {
+    expect(previewPrice({ type: 'market', side: 'buy', limitPrice: Number.NaN, qty: 10, depth: book, ltp: STALE_LTP })).toBe(190)
+  })
+
+  it('a market SELL previews at the best BID, not the last trade', () => {
+    expect(previewPrice({ type: 'market', side: 'sell', limitPrice: Number.NaN, qty: 10, depth: book, ltp: STALE_LTP })).toBe(186)
+  })
+
+  it('the two sides differ by the spread — an LTP preview collapses that to one number', () => {
+    const buy = previewPrice({ type: 'market', side: 'buy', limitPrice: Number.NaN, qty: 10, depth: book, ltp: STALE_LTP })
+    const sell = previewPrice({ type: 'market', side: 'sell', limitPrice: Number.NaN, qty: 10, depth: book, ltp: STALE_LTP })
+    expect(buy - sell).toBe(4)
+  })
+
+  it('a LIMIT order still previews at its own limit price', () => {
+    expect(previewPrice({ type: 'limit', side: 'buy', limitPrice: 175, qty: 10, depth: book, ltp: STALE_LTP })).toBe(175)
+  })
+
+  it('takes the BEST level, not just the first one listed', () => {
+    expect(previewPrice({ type: 'market', side: 'buy', limitPrice: Number.NaN, qty: 10, depth: book, ltp: STALE_LTP })).toBe(book.asks[0].price)
+    expect(previewPrice({ type: 'market', side: 'sell', limitPrice: Number.NaN, qty: 10, depth: book, ltp: STALE_LTP })).toBe(book.bids[0].price)
+  })
+
+  it('falls back to LTP when that side of the book is empty', () => {
+    const oneSided = { bids: [{ price: 186, qty: 5 }], asks: [] }
+    expect(previewPrice({ type: 'market', side: 'buy', limitPrice: Number.NaN, qty: 10, depth: oneSided, ltp: STALE_LTP })).toBe(180)
+    expect(previewPrice({ type: 'market', side: 'sell', limitPrice: Number.NaN, qty: 10, depth: oneSided, ltp: STALE_LTP })).toBe(186)
+  })
+
+  it('falls back to LTP when depth has not been polled yet', () => {
+    expect(previewPrice({ type: 'market', side: 'buy', limitPrice: Number.NaN, qty: 10, depth: null, ltp: STALE_LTP })).toBe(180)
+  })
+
+  it('ignores a nonsense level rather than previewing at zero', () => {
+    const bad = { bids: [{ price: 0, qty: 10 }], asks: [{ price: -1, qty: 10 }] }
+    expect(previewPrice({ type: 'market', side: 'buy', limitPrice: Number.NaN, qty: 10, depth: bad, ltp: STALE_LTP })).toBe(180)
+  })
+})
+
+describe('the preview P&L follows the BOOK, not the last trade', () => {
+  const book = {
+    bids: [{ price: 186, qty: 50 }],
+    asks: [{ price: 190, qty: 30 }],
+  }
+  const STALE_LTP = 180
+
+  /** Long 10 @ $180 — bought exactly at the last print, so LTP says break-even. */
+  const priceFor = (side: 'buy' | 'sell') =>
+    previewPrice({ type: 'market', side, limitPrice: Number.NaN, qty: 10, depth: book, ltp: STALE_LTP })
+
+  it('closing a long previews the REAL gain at the best bid, not break-even at LTP', () => {
+    const lines = buildConfirmLines(
+      order({ side: 'sell', type: 'market', qty: 10, price: priceFor('sell') }),
+      ctx(),
+    )
+    // Best bid 186 vs entry 180 → (186−180) × 10 × 83 = ₹4,980 gross.
+    expect(valueOf(lines, 'Gross P&L')).toBe('+₹4,980')
+    expect(valueOf(lines, 'Net P&L')).toBe('+₹4,517')
+    // What the stale LTP would have shown instead:
+    const stale = buildConfirmLines(order({ side: 'sell', type: 'market', qty: 10, price: STALE_LTP }), ctx())
+    expect(valueOf(stale, 'Gross P&L')).toBe('₹0') // break-even — wrong
+  })
+
+  it('a book that has fallen shows a LOSS the LTP preview would have hidden', () => {
+    const fallen = { bids: [{ price: 172, qty: 50 }], asks: [{ price: 174, qty: 50 }] }
+    const px = previewPrice({ type: 'market', side: 'sell', limitPrice: Number.NaN, qty: 10, depth: fallen, ltp: STALE_LTP })
+    const lines = buildConfirmLines(order({ side: 'sell', type: 'market', qty: 10, price: px }), ctx())
+    // (172−180) × 10 × 83 = −₹6,640. The LTP preview said break-even.
+    expect(valueOf(lines, 'Gross P&L')).toBe('−₹6,640')
+    expect(valueOf(lines, 'Net P&L')).toBe('−₹7,068') // loss PLUS commission
+  })
+
+  it('the previewed Price row quotes the book, not the last trade', () => {
+    const lines = buildConfirmLines(order({ side: 'sell', type: 'market', qty: 10, price: priceFor('sell') }), ctx())
+    expect(valueOf(lines, 'Price')).toBe('~$186.00 at execution')
+  })
+
+  it('margin and liquidation are priced off the book too', () => {
+    // Opening a fresh long at 5x: margin must reflect the ask actually payable.
+    const px = priceFor('buy')
+    const lines = buildConfirmLines(
+      order({ side: 'buy', type: 'market', qty: 10, price: px, leverage: 5, requiredInr: (10 * px * 83) / 5, closes: false, liq: 152 }),
+      ctx({ position: null }),
+    )
+    expect(valueOf(lines, 'Margin Required')).toBe('₹31,540') // 10 × 190 × 83 ÷ 5
+  })
+
+  it('a LIMIT order is unaffected — its preview was never wrong', () => {
+    const lines = buildConfirmLines(order({ side: 'sell', type: 'limit', qty: 10, price: 190 }), ctx())
+    expect(valueOf(lines, 'Gross P&L')).toBe('+₹8,300')
+    expect(valueOf(lines, 'Price')).toBe('$190.00')
   })
 })

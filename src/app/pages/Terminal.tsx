@@ -16,7 +16,7 @@ import {
   leverageWarningText,
   selectLeverage,
 } from '../../lib/leverage'
-import { buildConfirmLines, buildTradeOutcome, type MarketContext } from '../../lib/orderFlow'
+import { buildConfirmLines, buildTradeOutcome, estimateFill, type MarketContext, previewPrice } from '../../lib/orderFlow'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
 import { ConfirmDialog, Overlay, RejectDialog, type RejectionResult, ResultDialog, type TradeResult } from '../components/OrderDialogs'
@@ -26,6 +26,7 @@ import { CANDLE_SPAN, DOWN, intervalOf, type TF, UP, usd } from './terminalShare
 import {
   api,
   type Bootstrap,
+  type DepthView,
   type InstrumentRow,
   type Notification,
   type OrderType,
@@ -174,14 +175,16 @@ function InstrumentList({ rows, selected, onSelect }: {
 // ---------------------------------------------------------------------------
 // Left 2 — order window (+ working orders + confirm popup)
 // ---------------------------------------------------------------------------
-interface PendingOrder { side: Side; type: OrderType; qty: number; price: number; leverage: number; requiredInr: number; liq: number | null; closes: boolean }
+interface PendingOrder { side: Side; type: OrderType; qty: number; price: number; leverage: number; requiredInr: number; liq: number | null; closes: boolean; fillableQty?: number }
 
 
-function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
+function OrderWindow({ ticker, row, roundActive, rate, depth, onConfirmPlace }: {
   ticker: string
   row: InstrumentRow | undefined
   roundActive: boolean
   rate: number
+  /** Live book for this instrument, with the account's own quantity marked. */
+  depth: DepthView | null
   onConfirmPlace: (o: PendingOrder) => void
 }) {
   const [side, setSide] = useState<Side>('buy')
@@ -213,12 +216,22 @@ function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
   // is treated as not-yet-filled rather than a valid zero.
   const qtyNum = qtyStr.trim() === '' ? NaN : Math.floor(Number(qtyStr))
   const priceNum = priceStr.trim() === '' ? NaN : Number(priceStr)
-  const px = type === 'limit' ? priceNum : ltp
+  // Preview off the BOOK, never the last traded price. A market order walks the
+  // visible depth for its own size, discounting quantity resting under this
+  // account (self-trade prevention will never fill it against itself). A limit
+  // order previews at its own price — that price is the instruction.
+  const est = type === 'market' ? estimateFill(depth, side, qtyNum) : null
+  const px = previewPrice({ type, side, limitPrice: priceNum, qty: qtyNum, depth, ltp })
+  // What will ACTUALLY trade. A market remainder is discarded by the engine, so
+  // a market order bigger than the book trades less than it asked for; a LIMIT
+  // remainder rests and still reserves margin, so limits stay at full size.
+  const bookKnown = type === 'market' && depth !== null && Number.isFinite(qtyNum) && qtyNum > 0
+  const fillableQty = est ? est.fillableQty : bookKnown ? 0 : qtyNum
   const existing = row?.position
     ? { qty: row.position.qty, avgPrice: row.position.avgPrice, leverage: row.position.leverage }
     : { qty: 0, avgPrice: 0, leverage }
-  const signedQty = side === 'buy' ? qtyNum : -qtyNum
-  const valid = Number.isFinite(qtyNum) && qtyNum > 0 && Number.isFinite(px) && px > 0
+  const signedQty = side === 'buy' ? fillableQty : -fillableQty
+  const valid = Number.isFinite(fillableQty) && fillableQty > 0 && Number.isFinite(px) && px > 0
   // Still computed for the confirm popup (not shown in this panel).
   const requiredInr = (valid ? requiredMargin(existing, signedQty, px, leverage) : 0) * rate
   const resulting = valid ? applyLeveredFill(existing, signedQty, px, leverage) : null
@@ -248,7 +261,7 @@ function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
       setAlertMsg('Price must be a number greater than 0.')
       return
     }
-    onConfirmPlace({ side, type, qty: qtyNum, price: px, leverage, requiredInr, liq, closes })
+    onConfirmPlace({ side, type, qty: qtyNum, price: px, leverage, requiredInr, liq, closes, fillableQty })
   }
 
   function dismissAlert() {
@@ -330,7 +343,7 @@ function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
                 <label className="flex-1">
                   <span className="mb-0.5 block text-[9px] uppercase tracking-[0.14em] text-subtle">Price</span>
                   <input ref={priceInputRef} type="number" step="0.01" disabled={type === 'market'}
-                    value={type === 'market' ? (ltp > 0 ? ltp.toFixed(2) : '') : priceStr}
+                    value={type === 'market' ? (px > 0 ? px.toFixed(2) : '') : priceStr}
                     onChange={(e) => { edited.current = true; setPriceStr(e.target.value) }}
                     className={`${INPUT} font-mono tabular-nums disabled:opacity-50`} style={{ paddingTop: 4, paddingBottom: 4, color: priceColor }} />
                 </label>
@@ -819,7 +832,7 @@ function Terminal() {
         <div className="grid min-h-0 grid-rows-[minmax(0,1.35fr)_auto_minmax(0,0.9fr)] gap-4">
           <InstrumentList rows={rows} selected={selected} onSelect={setSelected} />
           <OrderWindow ticker={selected} row={row} roundActive={roundActive}
-            rate={snap?.rate ?? 83} onConfirmPlace={setPending} />
+            rate={snap?.rate ?? 83} depth={snap?.depth ?? null} onConfirmPlace={setPending} />
           <Screener row={row} />
         </div>
 

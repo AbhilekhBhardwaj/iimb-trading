@@ -47,7 +47,19 @@ export interface Trade {
 /** One aggregated price level in the depth ladder. */
 export interface DepthLevel {
   price: number
+  /** TOTAL resting quantity at this price, across every account. */
   qty: number
+  /**
+   * The portion of `qty` resting under the account `getDepth` was called for.
+   *
+   * Present only when a viewer was named. It exists because self-trade
+   * prevention means a taker can never match its OWN resting orders: that
+   * quantity is visible liquidity for everyone else, but not for its owner. A
+   * price preview must subtract it or it will promise a fill against the
+   * trader's own order. The level is MARKED rather than reduced so the depth
+   * ladder can still show traders their own working orders.
+   */
+  ownQty?: number
 }
 
 export interface Depth {
@@ -181,10 +193,10 @@ export class OrderBook {
    * Aggregated depth ladder: quantity summed per price level, bids high→low,
    * asks low→high, excluding any level whose aggregated quantity is zero.
    */
-  getDepth(): Depth {
+  getDepth(forUserId?: string): Depth {
     return {
-      bids: aggregate(this.bids).sort((a, b) => b.price - a.price),
-      asks: aggregate(this.asks).sort((a, b) => a.price - b.price),
+      bids: aggregate(this.bids, forUserId).sort((a, b) => b.price - a.price),
+      asks: aggregate(this.asks, forUserId).sort((a, b) => a.price - b.price),
     }
   }
 
@@ -246,16 +258,24 @@ export class OrderBook {
   }
 }
 
-/** Sum remaining quantity per price level, dropping empty levels. */
-function aggregate(orders: readonly Order[]): DepthLevel[] {
+/**
+ * Sum remaining quantity per price level, dropping empty levels. When `ownerId`
+ * is given, each level also reports how much of it belongs to that account.
+ */
+function aggregate(orders: readonly Order[], ownerId?: string): DepthLevel[] {
   const byPrice = new Map<number, number>()
+  const ownByPrice = new Map<number, number>()
   for (const o of orders) {
     const price = o.price as number
     byPrice.set(price, (byPrice.get(price) ?? 0) + o.remainingQty)
+    if (ownerId !== undefined && o.userId === ownerId) {
+      ownByPrice.set(price, (ownByPrice.get(price) ?? 0) + o.remainingQty)
+    }
   }
   const levels: DepthLevel[] = []
   for (const [price, qty] of byPrice) {
-    if (qty > 0) levels.push({ price, qty })
+    if (qty <= 0) continue
+    levels.push(ownerId === undefined ? { price, qty } : { price, qty, ownQty: ownByPrice.get(price) ?? 0 })
   }
   return levels
 }
@@ -297,7 +317,7 @@ export class MatchingEngine {
     this.bookFor(order.instrument).restResting(order)
   }
 
-  getDepth(instrument: string): Depth {
-    return this.bookFor(instrument).getDepth()
+  getDepth(instrument: string, forUserId?: string): Depth {
+    return this.bookFor(instrument).getDepth(forUserId)
   }
 }

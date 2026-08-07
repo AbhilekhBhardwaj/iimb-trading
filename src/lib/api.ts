@@ -66,7 +66,14 @@ export interface InstrumentRow {
 
 export interface DepthLevel {
   price: number
+  /** TOTAL resting quantity at this price, across every account. */
   qty: number
+  /**
+   * How much of `qty` is THIS account's own resting quantity. Self-trade
+   * prevention means it can never fill against itself, so a price preview must
+   * subtract it. The ladder still displays the full `qty`.
+   */
+  ownQty?: number
 }
 export interface RestingOrder {
   orderId: string

@@ -1327,12 +1327,19 @@ export class TradingService {
   depthView(
     ticker: string,
     includeResting: boolean,
+    /**
+     * The account this view is FOR. Each level then reports how much of it is
+     * that account's own resting quantity — liquidity it can never trade
+     * against, because self-trade prevention skips a taker's own orders. Omit
+     * for a neutral, account-agnostic view.
+     */
+    forAccountId?: string,
   ): {
     bids: Depth['bids']
     asks: Depth['asks']
     restingOrders?: { orderId: string; accountId: string; side: Side; price: number; remainingQty: number; leverage: number }[]
   } {
-    const depth = this.engine.getDepth(ticker)
+    const depth = this.engine.getDepth(ticker, forAccountId)
     if (!includeResting) return { bids: depth.bids, asks: depth.asks }
     const restingOrders: { orderId: string; accountId: string; side: Side; price: number; remainingQty: number; leverage: number }[] = []
     for (const o of this.orders.values()) {
@@ -1509,7 +1516,7 @@ export class TradingService {
       round: this.getRoundStatus(),
       account,
       instruments,
-      depth: ticker ? this.depthView(ticker, role === 'market_maker') : null,
+      depth: ticker ? this.depthView(ticker, role === 'market_maker', accountId) : null,
       myOrders: ticker ? this.myRestingOrders(accountId, ticker) : [],
       trades,
       prices,
