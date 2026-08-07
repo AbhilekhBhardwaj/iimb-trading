@@ -81,8 +81,15 @@ function Admin() {
   const [kind, setKind] = useState<Notification['kind']>('announcement')
   const [title, setTitle] = useState('')
   const [body, setBody] = useState('')
+  // Draft price per ticker, as a raw string so the field can be genuinely empty
+  // while typing. Seeded ONCE from the catalogue — never re-seeded by the 2s
+  // poll, which would otherwise wipe whatever the Master is halfway through
+  // typing. The live value stays visible in its own column.
+  const [priceDrafts, setPriceDrafts] = useState<Record<string, string>>({})
+  const [savingPrices, setSavingPrices] = useState(false)
   const toastSeq = useRef(0)
   const ready = useRef(false)
+  const draftsSeeded = useRef(false)
 
   const toast = useCallback((ok: boolean, text: string) => {
     const id = ++toastSeq.current
@@ -93,6 +100,11 @@ function Admin() {
   const refresh = useCallback(async () => {
     const [b, s, t, n] = await Promise.all([api.bootstrap(), api.roundSchedule(), api.adminTeams(), api.notificationsList()])
     setBoot(b); setSchedule(s.schedule); setTeams(t.teams); setNotifications(n.notifications)
+    // First catalogue we see seeds the price fields; later polls must not.
+    if (!draftsSeeded.current && b.instruments.length > 0) {
+      draftsSeeded.current = true
+      setPriceDrafts(Object.fromEntries(b.instruments.map((i) => [i.ticker, String(i.referencePrice)])))
+    }
   }, [])
 
   useEffect(() => {
@@ -152,6 +164,68 @@ function Admin() {
     confirmLabel: enabled ? 'Enable' : 'Disable', tone: 'gold',
     run: async () => { try { await api.setCommission(enabled); await refresh(); toast(true, `Commission ${enabled ? 'enabled' : 'disabled'}`) } catch { toast(false, 'Failed to set commission') } },
   })
+  // --- Instrument prices ---------------------------------------------------
+  // A draft counts as a change only when it parses to a positive number that
+  // differs from the live value, so untouched rows are never resubmitted.
+  const parsedDraft = (ticker: string): number | null => {
+    const raw = (priceDrafts[ticker] ?? '').trim()
+    if (raw === '') return null
+    const n = Number(raw)
+    return Number.isFinite(n) && n > 0 ? n : null
+  }
+  const isChanged = (ticker: string, current: number): boolean => {
+    const n = parsedDraft(ticker)
+    return n !== null && n !== current
+  }
+  const changedTickers = boot.instruments.filter((i) => isChanged(i.ticker, i.referencePrice)).map((i) => i.ticker)
+
+  const applyPrices = async (updates: { ticker: string; price: number }[]) => {
+    if (updates.length === 0) { toast(false, 'No price changes to apply'); return }
+    setSavingPrices(true)
+    try {
+      const res = await api.setInstrumentPrices(updates)
+      analytics.capture('instrument_prices_set', { count: res.changes.length })
+      // Resync the drafts for exactly what changed, so the fields show the
+      // committed values rather than the Master's now-stale typing.
+      setPriceDrafts((prev) => ({
+        ...prev,
+        ...Object.fromEntries(res.changes.map((c) => [c.ticker, String(c.newPrice)])),
+      }))
+      await refresh()
+      toast(true, res.changes.length === 1
+        ? `${res.changes[0].ticker} set to ${num(res.changes[0].newPrice)}`
+        : `${res.changes.length} prices updated`)
+    } catch (err) {
+      // The server's reason (round active, unknown ticker, bad price) comes
+      // through the thrown message.
+      toast(false, err instanceof Error ? err.message : 'Failed to set prices')
+    } finally {
+      setSavingPrices(false)
+    }
+  }
+
+  const doSetOne = (ticker: string, current: number) => {
+    const price = parsedDraft(ticker)
+    if (price === null) { toast(false, `Enter a positive price for ${ticker}`); return }
+    setPending({
+      title: `Set ${ticker} to $${num(price)}?`,
+      detail: `Teams will see $${num(price)} as the starting price for the next round, replacing $${num(current)}.`,
+      confirmLabel: 'Update', tone: 'gold',
+      run: () => applyPrices([{ ticker, price }]),
+    })
+  }
+
+  const doSetAll = () => {
+    const updates = changedTickers.map((t) => ({ ticker: t, price: parsedDraft(t)! }))
+    if (updates.length === 0) { toast(false, 'No price changes to apply'); return }
+    setPending({
+      title: `Set ${updates.length} price${updates.length === 1 ? '' : 's'}?`,
+      detail: updates.map((u) => `${u.ticker} → $${num(u.price)}`).join(', ') + '. Applied together; if any is rejected none are.',
+      confirmLabel: 'Set Prices', tone: 'gold',
+      run: () => applyPrices(updates),
+    })
+  }
+
   const doPush = () => {
     if (!title.trim()) { toast(false, 'Enter a title first'); return }
     const label = KINDS.find((x) => x.k === kind)!.label
@@ -229,8 +303,81 @@ function Admin() {
           </div>
         </Panel>
 
+        {/* 2. Instrument starting prices */}
+        <Panel title="Instrument Starting Prices" delay={0.03}
+          right={
+            <button
+              onClick={doSetAll}
+              disabled={round.active || savingPrices || changedTickers.length === 0}
+              className="rounded-lg border border-[#E8C46A]/40 bg-[#E8C46A]/10 px-4 py-1.5 text-[12px] font-medium text-[#E8C46A] transition-colors hover:bg-[#E8C46A]/20 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {savingPrices ? 'Working…' : `Set Prices${changedTickers.length > 0 ? ` (${changedTickers.length})` : ''}`}
+            </button>
+          }
+        >
+          {round.active ? (
+            <p className="mb-4 rounded-lg border border-destructive/30 bg-destructive/[0.07] px-3 py-2 text-[12px] text-muted">
+              <span className="font-semibold text-destructive">Locked while a round is live.</span>{' '}
+              The last price drives margin valuation and the liquidation mark, so moving it mid-round
+              could liquidate open positions. End the round to set prices for the next one.
+            </p>
+          ) : (
+            <p className="mb-4 text-[12px] text-muted">
+              Sets what teams see as the starting price for the next round. Usable before every round —
+              this overrides any price left behind by previous trading.
+            </p>
+          )}
+
+          <div className="overflow-hidden rounded-lg border border-white/[0.06]">
+            <table className="w-full text-[12px]">
+              <thead>
+                <tr className="border-b border-white/[0.08] text-[10px] uppercase tracking-wider text-subtle">
+                  <th className="px-3 py-2 text-left font-medium">Ticker</th>
+                  <th className="px-3 py-2 text-left font-medium">Name</th>
+                  <th className="px-3 py-2 text-right font-medium">Current</th>
+                  <th className="px-3 py-2 text-right font-medium">New Price</th>
+                  <th className="px-3 py-2 text-right font-medium">Action</th>
+                </tr>
+              </thead>
+              <tbody className="font-mono">
+                {boot.instruments.map((it) => {
+                  const changed = isChanged(it.ticker, it.referencePrice)
+                  const raw = (priceDrafts[it.ticker] ?? '').trim()
+                  const invalid = raw !== '' && parsedDraft(it.ticker) === null
+                  return (
+                    <tr key={it.ticker} className={`border-b border-white/[0.04] last:border-0 ${changed ? 'bg-[#E8C46A]/[0.05]' : ''}`}>
+                      <td className="px-3 py-2 text-bright">{it.ticker}</td>
+                      <td className="px-3 py-2 font-sans text-muted">{it.name}</td>
+                      <td className="px-3 py-2 text-right text-muted">${num(it.referencePrice)}</td>
+                      <td className="px-3 py-2 text-right">
+                        <input
+                          value={priceDrafts[it.ticker] ?? ''}
+                          onChange={(e) => setPriceDrafts((p) => ({ ...p, [it.ticker]: e.target.value }))}
+                          disabled={round.active || savingPrices}
+                          inputMode="decimal"
+                          aria-label={`New price for ${it.ticker}`}
+                          className={`${INPUT} w-28 text-right font-mono disabled:cursor-not-allowed disabled:opacity-40 ${invalid ? 'border-destructive/60' : ''}`}
+                        />
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          onClick={() => doSetOne(it.ticker, it.referencePrice)}
+                          disabled={round.active || savingPrices || !changed}
+                          className="rounded-md border border-white/10 px-3 py-1 text-[11px] text-muted transition-colors hover:bg-white/[0.06] hover:text-bright disabled:cursor-not-allowed disabled:opacity-30"
+                        >
+                          Update
+                        </button>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+
         <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
-          {/* 2. Broadcast */}
+          {/* 3. Broadcast */}
           <Panel title="Broadcast" delay={0.05}>
             <div className="flex gap-1.5">
               {KINDS.map((x) => (
@@ -265,7 +412,7 @@ function Admin() {
             </div>
           </Panel>
 
-          {/* 3. Commission */}
+          {/* 4. Commission */}
           <Panel title="Commission" delay={0.1}>
             <p className="text-[12px] leading-relaxed text-muted">
               Toggle commission for the <span className="text-bright">{round.active ? 'current' : 'next'}</span> round
@@ -285,7 +432,7 @@ function Admin() {
           </Panel>
         </div>
 
-        {/* 4. Teams */}
+        {/* 5. Teams */}
         <Panel title="Teams" delay={0.15} right={<span className="font-mono text-[10px] text-subtle">{teams.length}</span>}>
           <div className="overflow-x-auto">
             <table className="w-full text-[13px]">

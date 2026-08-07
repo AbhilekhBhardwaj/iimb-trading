@@ -603,6 +603,79 @@ export class TradingService {
   }
 
   /**
+   * Master control: set instrument starting prices before a round.
+   *
+   * Writes `instruments.reference_price` AND overwrites the in-memory last price.
+   * Both are required: `ltp()` reads `lastPrice ?? referencePrice`, and once any
+   * trade has printed, `lastPrice` is populated — so updating the reference alone
+   * would persist to the DB and change nothing teams can see. Overwriting the
+   * last price is what makes this usable before EVERY round rather than only
+   * before the first one.
+   *
+   * Refused while a round is active: the last price feeds market-order valuation
+   * and liquidation checks, so moving it mid-round could liquidate open positions
+   * out from under teams. Between rounds it is safe and repeatable.
+   *
+   * All-or-nothing — the batch is validated in full before any row is written, so
+   * one bad ticker cannot leave prices half-applied.
+   */
+  async setInstrumentPrices(
+    caller: { accountId: string; role: string },
+    updates: { ticker: string; price: number }[],
+  ): Promise<{
+    applied: boolean
+    reason?: string
+    changes: { ticker: string; oldPrice: number; newPrice: number; oldReferencePrice: number }[]
+  }> {
+    const refuse = (reason: string) => ({ applied: false, reason, changes: [] })
+
+    // Defence in depth: the HTTP layer gates this too, but the method that writes
+    // prices and stamps the audit log should not depend on that alone.
+    if (caller.role !== 'master') return refuse('forbidden')
+    if (this.activeRoundId !== null && this.rounds.getMode() !== null) {
+      return refuse('cannot set prices while a round is active')
+    }
+    if (updates.length === 0) return refuse('no price updates supplied')
+
+    // --- Validate the whole batch first --------------------------------------
+    const seen = new Set<string>()
+    for (const u of updates) {
+      if (!this.tickerToId.has(u.ticker)) return refuse(`unknown instrument: ${u.ticker}`)
+      if (seen.has(u.ticker)) return refuse(`duplicate instrument: ${u.ticker}`)
+      seen.add(u.ticker)
+      if (typeof u.price !== 'number' || !Number.isFinite(u.price) || u.price <= 0) {
+        return refuse(`price must be a positive number for ${u.ticker}`)
+      }
+    }
+
+    // --- Apply ----------------------------------------------------------------
+    const changes: { ticker: string; oldPrice: number; newPrice: number; oldReferencePrice: number }[] = []
+    for (const u of updates) {
+      const meta = this.instrumentMeta.get(u.ticker)!
+      const oldReferencePrice = meta.referencePrice
+      const oldPrice = this.ltp(u.ticker) // what teams actually see right now
+
+      const { error } = await this.db
+        .from('instruments')
+        .update({ reference_price: u.price })
+        .eq('id', this.tickerToId.get(u.ticker)!)
+      if (error) throw error
+
+      this.instrumentMeta.set(u.ticker, { ...meta, referencePrice: u.price })
+      this.lastPrice.set(u.ticker, u.price) // the part that makes it visible
+
+      await this.log(caller.accountId, 'instrument_price_set', 'info', {
+        instrument: u.ticker,
+        oldPrice,
+        newPrice: u.price,
+        oldReferencePrice,
+      })
+      changes.push({ ticker: u.ticker, oldPrice, newPrice: u.price, oldReferencePrice })
+    }
+    return { applied: true, changes }
+  }
+
+  /**
    * Master control: set commission on the active round (or next pending if none
    * active). Persists to the DB only for the active round (pending rounds have no
    * row until started). NOTE: this flips/stores the flag and updates displays —

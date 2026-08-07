@@ -278,6 +278,25 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const changed = await service.setUsdInrRate(rate)
     return json(res, 200, { round: service.getRoundStatus(), changed })
   }
+  // Instrument starting prices. Usable before every round, not just the first —
+  // see TradingService.setInstrumentPrices for why it writes both the reference
+  // price and the in-memory last price.
+  if (method === 'POST' && path === '/api/instruments/price') {
+    if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
+    const b = await readJson(req)
+    // Accept either a batch ({ prices: [...] }) or a single { ticker, price }.
+    const raw = Array.isArray(b.prices) ? b.prices : b.ticker !== undefined ? [b] : []
+    const updates = (raw as Record<string, unknown>[]).map((u) => ({
+      ticker: String(u.ticker ?? ''),
+      price: Number(u.price),
+    }))
+    const result = await service.setInstrumentPrices(
+      { accountId: caller.accountId, role: caller.role },
+      updates,
+    )
+    if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
+    return json(res, 200, { applied: true, changes: result.changes, instruments: service.instrumentCatalogue() })
+  }
   if (method === 'GET' && path === '/api/admin/teams') {
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
     return json(res, 200, { teams: await service.teamsOverview() })

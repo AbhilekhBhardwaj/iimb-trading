@@ -238,6 +238,23 @@ export interface PlaceOrderInput {
   leverage: number
 }
 
+/** One instrument's before/after from a Master price reset. */
+export interface InstrumentPriceChange {
+  ticker: string
+  /** What teams actually saw before — the last traded price, if there was one. */
+  oldPrice: number
+  newPrice: number
+  /** The stored seed price before the change, which may differ from oldPrice. */
+  oldReferencePrice: number
+}
+
+export interface SetInstrumentPricesResult {
+  applied: boolean
+  changes: InstrumentPriceChange[]
+  /** The full catalogue after the change, so the caller can resync. */
+  instruments: InstrumentMeta[]
+}
+
 export interface PlaceOrderResult {
   accepted: boolean
   reason?: string
@@ -348,7 +365,15 @@ async function post<T>(path: string, body: unknown): Promise<T> {
     }
     if (res.status === 401) { forceLogin(); throw new Error(`POST ${path} → 401`) }
   }
-  if (!res.ok) throw new Error(`POST ${path} → ${res.status}`)
+  if (!res.ok) {
+    // Surface the server's own reason when it sends one ({ error: '...' }), so
+    // callers can show a real explanation instead of a bare status code.
+    const reason = await res
+      .json()
+      .then((b) => (b as { error?: string } | null)?.error)
+      .catch(() => undefined)
+    throw new Error(reason ? String(reason) : `POST ${path} → ${res.status}`)
+  }
   return res.json() as Promise<T>
 }
 
@@ -370,4 +395,11 @@ export const api = {
   pushNotification: (kind: Notification['kind'], title: string, body?: string) =>
     post<{ ok: boolean }>('/notifications', { kind, title, body }),
   adminTeams: () => get<{ teams: TeamOverview[] }>('/admin/teams'),
+  /**
+   * Master-only. Sets instrument starting prices for the upcoming round. Usable
+   * before every round, not just the first. Rejects (throwing the server's
+   * reason) while a round is active, and is all-or-nothing across the batch.
+   */
+  setInstrumentPrices: (prices: { ticker: string; price: number }[]) =>
+    post<SetInstrumentPricesResult>('/instruments/price', { prices }),
 }

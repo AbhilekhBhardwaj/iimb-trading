@@ -28,7 +28,7 @@ import {
   type CashPosition,
   type ClosingPnlBreakdown,
 } from '@iimb-trading/engine'
-import { inrSigned } from './simulation'
+import { inrSigned } from './format'
 
 /** One key/value row in the confirmation dialog. */
 export interface ConfirmLine {

@@ -17,7 +17,7 @@
  *   - An unfilled order produces nothing: with no fills there is no average.
  */
 
-import { usd } from './simulation'
+import { usd } from './format'
 
 type Side = 'buy' | 'sell'
 type OrderType = 'market' | 'limit'
