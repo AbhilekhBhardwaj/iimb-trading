@@ -236,6 +236,9 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       qty: Number(b.qty),
       leverage: b.leverage === undefined ? 1 : Number(b.leverage),
       markPrice: type === 'market' ? service.ltp(ticker) : undefined,
+      // Drives the market maker's buying-power exemption. Taken from the verified
+      // token, never from the request body.
+      role: caller.role,
     })
     return json(res, 200, result)
   }

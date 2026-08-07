@@ -35,8 +35,13 @@ import { teamUsername, usernameToEmail, type AppRole } from '../src/lib/accounts
 // ===========================================================================
 const TEAM_NAMES: string[] = Array.from({ length: 20 }, (_, i) => `Team ${i + 1}`)
 
-// Market makers get 10x a team's capital so they can quote both sides at size.
-const MARKET_MAKER_CASH = 10_000_000
+// The market maker is exempt from the buying-power gate entirely (see
+// UNLIMITED_BUYING_POWER in server/tradingService.ts) — that exemption, not this
+// number, is what lets it quote at any size. This balance exists purely so its
+// Portfolio shows a sensible positive figure instead of drifting negative as
+// margin is posted: cash is derived as opening + realized − margin − reserved.
+// ₹100 crore covers roughly 52,000 units of a $230 instrument at 1x.
+const MARKET_MAKER_CASH = 1_000_000_000
 
 // Exactly one market maker and one master account, alongside the teams.
 // startingCash is optional — omit it to use the DB default (1,000,000).

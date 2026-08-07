@@ -3,8 +3,8 @@ import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { applyLeveredFill, DEFAULT_COMMISSION_RATE, liquidationPrice, requiredMargin } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
-import { orderPnlLines, toCashPosition } from '../../lib/orderConfirm'
-import { averageFillPrice, slippageNudge } from '../../lib/slippage'
+import { toCashPosition } from '../../lib/orderConfirm'
+import { buildConfirmLines, buildTradeOutcome, type MarketContext } from '../../lib/orderFlow'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
 import { Panel } from '../components/Panel'
@@ -31,8 +31,6 @@ import { analytics } from '../../lib/analytics'
 // ---------------------------------------------------------------------------
 // Formatters
 // ---------------------------------------------------------------------------
-const inrFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 })
-const inr = (v: number) => inrFmt.format(v)
 const clockHMS = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { hour12: false })
 function mmss(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds))
@@ -165,15 +163,6 @@ function InstrumentList({ rows, selected, onSelect }: {
 // ---------------------------------------------------------------------------
 interface PendingOrder { side: Side; type: OrderType; qty: number; price: number; leverage: number; requiredInr: number; liq: number | null; closes: boolean }
 
-// A position-reducing order frees margin (requiredMargin < 0); never show that as
-// a negative "required" figure. A closing order leaves no position, hence no liq.
-const marginLabel = (requiredInr: number) => (requiredInr > 1 ? inr(requiredInr) : '— (frees margin)')
-// liq === 0 is mathematically correct and unique to a fully-collateralized 1×
-// long (E·(1 − 1/1) = 0): it can only be liquidated if the stock itself hits $0.
-// Show that explicitly rather than a bare "$0.00" that reads like a bug. Every
-// other case (5×/10×/20× longs, and shorts at any leverage) has a real liq > 0.
-const liqLabel = (closes: boolean, liq: number | null) =>
-  closes ? 'Flat after close' : liq === null ? '—' : liq <= 0 ? 'N/A — fully collateralized' : usd(liq)
 
 function OrderWindow({ ticker, row, roundActive, rate, onConfirmPlace }: {
   ticker: string
@@ -720,57 +709,44 @@ function Terminal() {
   const row = rows.find((r) => r.ticker === selected)
   const roundActive = !!snap?.round.active
 
+  /**
+   * The market/account context both dialogs read. Captured fresh at each use so
+   * the post-trade figures are measured against the position as it stood BEFORE
+   * the fill — the snapshot poll would otherwise have already moved on.
+   */
+  function marketContext(): MarketContext {
+    return {
+      position: toCashPosition(row?.position),
+      usdInrRate: snap?.rate ?? 83,
+      commission: {
+        enabled: snap?.round.commissionEnabled ?? false,
+        rate: snap?.round.commissionRate ?? DEFAULT_COMMISSION_RATE,
+      },
+      slippageEnabled: snap?.round.slippageEnabled ?? true,
+    }
+  }
+
   async function doPlace(o: PendingOrder) {
     setPending(null)
     analytics.capture('order_placed', { ticker: selected, side: o.side, type: o.type, qty: o.qty, leverage: o.leverage })
-    // Snapshot the inputs the post-trade popup needs BEFORE the fill mutates
-    // them: P&L has to be measured against the position as it stood going in.
-    const prePosition = toCashPosition(row?.position)
-    const rate = snap?.rate ?? 83
-    const commission = {
-      enabled: snap?.round.commissionEnabled ?? false,
-      rate: snap?.round.commissionRate ?? DEFAULT_COMMISSION_RATE,
-    }
+    // Capture BEFORE the fill mutates the position.
+    const ctx = marketContext()
     try {
       const res = await api.placeOrder({ ticker: selected, side: o.side, type: o.type, price: o.type === 'limit' ? o.price : undefined, qty: o.qty, leverage: o.leverage })
       if (!res.accepted) {
         analytics.capture('order_rejected', { ticker: selected, side: o.side, type: o.type, qty: o.qty, reason: res.reason })
         pushToast(false, 'Order rejected', res.reason); return
       }
-      const fills = res.trades ?? []
-      const filled = fills.reduce((a, t) => a + t.qty, 0)
+      const filled = (res.trades ?? []).reduce((a, t) => a + t.qty, 0)
       if (filled > 0) analytics.capture('order_filled', { ticker: selected, side: o.side, type: o.type, qty: o.qty, filledQty: filled })
-      if (filled === 0) { pushToast(true, 'Order resting', `${o.qty} @ ${usd(o.price)} on the book`); return }
 
-      // Everything below is measured on what ACTUALLY filled — the average across
-      // however many levels the order touched, and only the quantity that traded.
-      const avg = averageFillPrice(fills)
-      const pnlLines = avg
-        ? orderPnlLines(prePosition, o.side === 'buy' ? avg.filledQty : -avg.filledQty, avg.avgFillPrice, rate, o.leverage, commission)
-        : []
-      const nudge = slippageNudge({
-        orderType: o.type, side: o.side, bestPrice: res.bestPriceAtSubmit, fills,
-        enabled: snap?.round.slippageEnabled ?? true,
-      })
-      if (nudge) analytics.capture('slippage_nudge_shown', { ticker: selected, side: o.side, qty: filled })
-
-      // A clean fill with nothing to teach stays a toast; the dialog only opens
-      // when there is a realized breakdown or a slippage nudge to show.
-      if (pnlLines.length === 0 && !nudge) {
-        pushToast(true, filled < o.qty ? 'Partial fill' : 'Order filled', `${filled} @ avg ${usd(avg?.avgFillPrice ?? o.price)}`)
-        return
-      }
-      setResult({
-        title: filled < o.qty ? 'Partial Fill' : 'Order Filled',
-        lines: [
-          { k: 'Instrument', v: selected },
-          { k: 'Side', v: o.side.toUpperCase(), tone: o.side === 'buy' ? 'up' : 'destructive' },
-          { k: 'Filled', v: filled < o.qty ? `${filled} of ${o.qty}` : String(filled) },
-          { k: 'Avg Fill', v: usd(avg?.avgFillPrice ?? o.price) },
-          ...pnlLines,
-        ],
-        note: nudge,
-      })
+      // The rest vs toast vs dialog decision, the realized breakdown and the
+      // slippage nudge all live in lib/orderFlow, so the Portfolio's Close
+      // action produces exactly this outcome from exactly this code.
+      const outcome = buildTradeOutcome({ ...o, ticker: selected }, ctx, res)
+      if (outcome.kind === 'toast') { pushToast(true, outcome.title, outcome.detail); return }
+      if (outcome.note) analytics.capture('slippage_nudge_shown', { ticker: selected, side: o.side, qty: outcome.filledQty })
+      setResult({ title: outcome.title, lines: outcome.lines, note: outcome.note })
     } catch {
       // A POST is not auto-retried (it may have landed). Flag the connection and
       // tell the user to check the book before resubmitting, so we never risk a
@@ -831,30 +807,9 @@ function Terminal() {
           confirmLabel={`Confirm ${pending.side.toUpperCase()}`}
           onCancel={() => setPending(null)}
           onConfirm={() => doPlace(pending)}
-          lines={[
-            { k: 'Instrument', v: selected },
-            { k: 'Side', v: pending.side.toUpperCase(), tone: pending.side === 'buy' ? 'up' : 'destructive' },
-            { k: 'Type', v: pending.type.toUpperCase() },
-            { k: 'Quantity', v: String(pending.qty) },
-            // A market order has no guaranteed price; show the current mark as an
-            // estimate rather than the bare word "MARKET". If it walks the book
-            // the real average lands in the post-trade dialog, with the nudge.
-            { k: 'Price', v: pending.type === 'market' ? `~${usd(pending.price)} at execution` : usd(pending.price) },
-            { k: 'Leverage', v: `${pending.leverage}x` },
-            { k: 'Margin Required', v: marginLabel(pending.requiredInr) },
-            { k: 'Est. Liquidation', v: liqLabel(pending.closes, pending.liq) },
-            // Realized-P&L preview. Closing or reducing shows Gross / Commission /
-            // Net; an opening fill shows the commission alone. Commission appears
-            // only while the round charges it. Empty otherwise, so nothing renders.
-            ...orderPnlLines(
-              toCashPosition(row?.position),
-              pending.side === 'buy' ? pending.qty : -pending.qty,
-              pending.price,
-              snap?.rate ?? 83,
-              pending.leverage,
-              { enabled: snap?.round.commissionEnabled ?? false, rate: snap?.round.commissionRate ?? DEFAULT_COMMISSION_RATE },
-            ),
-          ]}
+          // Built in lib/orderFlow so the Portfolio's Close action renders the
+          // identical dialog from the identical code.
+          lines={buildConfirmLines({ ...pending, ticker: selected }, marketContext())}
         />
       )}
       {result && (

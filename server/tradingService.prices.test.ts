@@ -1292,6 +1292,195 @@ describe('resetEvent: wipes trading state and leaves the platform usable', () =>
   })
 })
 
+describe('market maker has unlimited buying power; teams do not', () => {
+  const MM = 'acct-mm'
+  /** Far beyond ₹1 crore of starting cash: 2,000 × $230 × 83 = ₹3.82 crore. */
+  const HUGE = { ticker: 'AAPL', side: 'buy' as const, type: 'limit' as const, price: 230, qty: 2_000, leverage: 1 }
+
+  /** Matches provisioning: ₹100 crore, for display only — the exemption is the mechanism. */
+  const MM_CASH = 1_000_000_000
+
+  function withMarketMaker(startingCash = MM_CASH) {
+    const h = harness()
+    h.db.rows('profiles').push({
+      id: MM, username: 'marketmaker', team_name: null, role: 'market_maker',
+      starting_cash: startingCash, realized_pnl: 0, realized_pnl_inr: 0,
+    })
+    return h
+  }
+
+  it('a TEAM is rejected for insufficient margin on an oversized order', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    const res = await svc.placeOrder({ accountId: A, role: 'team', ...HUGE })
+    expect(res.accepted).toBe(false)
+    expect(res.reason).toBe('insufficient_margin')
+  })
+
+  it('the MARKET MAKER places the SAME order successfully', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    const res = await svc.placeOrder({ accountId: MM, role: 'market_maker', ...HUGE })
+    expect(res.accepted).toBe(true)
+    expect(res.reason).toBeUndefined()
+  })
+
+  it('the exemption is not a bigger cap — 100× larger still goes through', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    const res = await svc.placeOrder({ accountId: MM, role: 'market_maker', ...HUGE, qty: 200_000 })
+    expect(res.accepted).toBe(true)
+  })
+
+  it('quotes both sides without either leg being capped', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    const bid = await svc.placeOrder({ accountId: MM, role: 'market_maker', ticker: 'AAPL', side: 'buy', type: 'limit', price: 225, qty: 5_000, leverage: 1 })
+    const ask = await svc.placeOrder({ accountId: MM, role: 'market_maker', ticker: 'AAPL', side: 'sell', type: 'limit', price: 235, qty: 5_000, leverage: 1 })
+    expect(bid.accepted).toBe(true)
+    expect(ask.accepted).toBe(true)
+
+    const depth = svc.depthView('AAPL', true)
+    expect(depth.bids[0]).toMatchObject({ price: 225, qty: 5_000 })
+    expect(depth.asks[0]).toMatchObject({ price: 235, qty: 5_000 })
+  })
+
+  it('an exempt fill still settles normally — basis, P&L and commission are real', async () => {
+    const { db, svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await svc.placeOrder({ accountId: MM, role: 'market_maker', ticker: 'AAPL', side: 'sell', type: 'limit', price: 230, qty: 10, leverage: 1 })
+    await svc.placeOrder({ accountId: A, role: 'team', ticker: 'AAPL', side: 'buy', type: 'limit', price: 230, qty: 10, leverage: 1 })
+
+    const mmPos = db.rows('positions').find((p) => p.account_id === MM)!
+    expect(Number(mmPos.qty)).toBe(-10) // short from providing the offer
+    expect(Number(mmPos.notional_basis_inr)).toBeCloseTo(-10 * 230 * 83, 6)
+  })
+
+  // --- the balance is cosmetic; the exemption is the mechanism --------------
+
+  it('its Portfolio shows a POSITIVE cash figure after quoting at size', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    // Quote both sides heavily, then get hit on the offer.
+    await svc.placeOrder({ accountId: MM, role: 'market_maker', ticker: 'AAPL', side: 'buy', type: 'limit', price: 225, qty: 5_000, leverage: 1 })
+    await svc.placeOrder({ accountId: MM, role: 'market_maker', ticker: 'AAPL', side: 'sell', type: 'limit', price: 230, qty: 5_000, leverage: 1 })
+    await svc.placeOrder({ accountId: A, role: 'team', ticker: 'AAPL', side: 'buy', type: 'limit', price: 230, qty: 500, leverage: 1 })
+
+    const p = (await svc.portfolio(MM)) as Record<string, any>
+    expect(Number(p.openingBalanceInr)).toBe(MM_CASH)
+    expect(Number(p.cashInr)).toBeGreaterThan(0) // the whole point of the bump
+    expect(Number(p.marginUsedInr)).toBeGreaterThan(0) // real margin still posted
+  })
+
+  it('WITHOUT the bump the same activity would show negative cash', async () => {
+    // Documents why the balance exists: the exemption alone lets margin exceed
+    // cash, and cash is derived, so it goes negative on a team-sized balance.
+    const { svc } = withMarketMaker(START_CASH)
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await svc.placeOrder({ accountId: MM, role: 'market_maker', ticker: 'AAPL', side: 'sell', type: 'limit', price: 230, qty: 5_000, leverage: 1 })
+    await svc.placeOrder({ accountId: A, role: 'team', ticker: 'AAPL', side: 'buy', type: 'limit', price: 230, qty: 500, leverage: 1 })
+
+    const p = (await svc.portfolio(MM)) as Record<string, any>
+    expect(Number(p.cashInr)).toBeLessThan(0)
+  })
+
+  it('the bump does not put the market maker on the leaderboard', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+
+    const board = await svc.leaderboard()
+    expect(board.some((r) => r.username === 'marketmaker')).toBe(false)
+    const overview = await svc.teamsOverview()
+    expect(overview.some((t) => t.username === 'marketmaker')).toBe(false)
+  })
+
+  // --- the exemption must not leak to anyone else ---------------------------
+
+  it('TEAM rules are completely unchanged — a normal order still works', async () => {
+    const { db, svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    await cross(svc, { buyer: A, seller: B, qty: 10, price: 230 })
+    const pos = db.rows('positions').find((p) => p.account_id === A)!
+    expect(Number(pos.qty)).toBe(10)
+    expect(Number(pos.notional_basis_inr)).toBeCloseTo(10 * 230 * 83, 6)
+  })
+
+  it('a team is still capped at exactly its buying power', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+
+    // ₹1 crore / (230 × 83) = 523.9 units affordable at 1×.
+    const ok = await svc.placeOrder({ accountId: A, role: 'team', ticker: 'AAPL', side: 'buy', type: 'limit', price: 230, qty: 500, leverage: 1 })
+    expect(ok.accepted).toBe(true)
+    const tooBig = await svc.placeOrder({ accountId: B, role: 'team', ticker: 'AAPL', side: 'buy', type: 'limit', price: 230, qty: 600, leverage: 1 })
+    expect(tooBig.accepted).toBe(false)
+    expect(tooBig.reason).toBe('insufficient_margin')
+  })
+
+  it('MASTER is NOT exempt', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    const res = await svc.placeOrder({ accountId: 'acct-master', role: 'master', ...HUGE })
+    expect(res.accepted).toBe(false)
+    expect(res.reason).toBe('insufficient_margin')
+  })
+
+  it('an ABSENT role is treated as a normal account, not exempt', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    const res = await svc.placeOrder({ accountId: A, ...HUGE }) // no role supplied
+    expect(res.accepted).toBe(false)
+    expect(res.reason).toBe('insufficient_margin')
+  })
+
+  it('a spoofed unknown role is not exempt', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+    await svc.startRound(0)
+    const res = await svc.placeOrder({ accountId: A, role: 'MARKET_MAKER', ...HUGE }) // wrong case
+    expect(res.accepted).toBe(false)
+    expect(res.reason).toBe('insufficient_margin')
+  })
+
+  it('every other gate still applies to the market maker', async () => {
+    const { svc } = withMarketMaker()
+    await svc.loadInstruments()
+
+    // No active round: exempt from margin, not from the round gate.
+    const gated = await svc.placeOrder({ accountId: MM, role: 'market_maker', ...HUGE })
+    expect(gated.accepted).toBe(false)
+    expect(gated.reason).toBe('no active round')
+
+    await svc.startRound(0)
+    const badQty = await svc.placeOrder({ accountId: MM, role: 'market_maker', ...HUGE, qty: 0 })
+    expect(badQty.accepted).toBe(false)
+    expect(badQty.reason).toBe('qty must be positive')
+
+    const unknown = await svc.placeOrder({ accountId: MM, role: 'market_maker', ...HUGE, ticker: 'NOPE' })
+    expect(unknown.accepted).toBe(false)
+    expect(unknown.reason).toBe('unknown instrument: NOPE')
+  })
+})
+
 describe('setInstrumentPrices: audit log', () => {
   it('logs one instrument_price_set per instrument, attributed to the master', async () => {
     const { db, svc } = harness()

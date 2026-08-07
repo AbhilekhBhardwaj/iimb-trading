@@ -54,6 +54,20 @@ import { MAINTENANCE_MARGIN_RATE, USD_INR } from './config'
 type Severity = 'info' | 'warning' | 'error'
 const EPS = 1e-9
 
+/**
+ * Roles exempt from the buying-power gate.
+ *
+ * Only the market maker: it quotes both sides to keep the book liquid and is not
+ * scored, so a cash cap would throttle liquidity rather than model risk. Teams
+ * and the Master remain fully subject to the gate.
+ */
+const UNLIMITED_BUYING_POWER: ReadonlySet<string> = new Set(['market_maker'])
+
+/** Whether this role skips the buying-power check. Unknown/absent roles do not. */
+function hasUnlimitedBuyingPower(role: string | undefined): boolean {
+  return role !== undefined && UNLIMITED_BUYING_POWER.has(role)
+}
+
 /** One closed (or reduced) position, reconstructed from the trades table. */
 interface TradeHistoryEntry {
   ticker: string
@@ -81,6 +95,11 @@ export interface PlaceOrderInput {
   leverage?: number
   /** Reference price for valuing a MARKET order's margin (limit orders use price). */
   markPrice?: number
+  /**
+   * The caller's role, used only for the buying-power exemption below. Omitted
+   * means "treat as a normal account" — the gate applies.
+   */
+  role?: string
 }
 
 export interface PlaceOrderResult {
@@ -1048,14 +1067,21 @@ export class TradingService {
     // correctly still needs the cash to absorb it.
     const projected = applyCashFill(existing, signedQty, valuationPrice, rate, leverage)
     const requiredInr = -projected.cashFlowInr
-    const availableInr = await this.availableCashInr(input.accountId)
-    if (requiredInr > availableInr + EPS) {
-      return this.reject(input, 'insufficient_margin', {
-        requiredMarginInr: requiredInr,
-        availableMarginInr: availableInr,
-        leverage,
-        usdInrRate: rate,
-      })
+    // The market maker exists to quote both sides and absorb flow, not to compete
+    // on P&L — a buying-power cap would make it stop providing liquidity exactly
+    // when the book needs it most. Exempt by ROLE rather than by handing it a huge
+    // starting_cash: a large balance is still a finite cap, and provisioning
+    // rewrites starting_cash, so the exemption would silently disappear.
+    if (!hasUnlimitedBuyingPower(input.role)) {
+      const availableInr = await this.availableCashInr(input.accountId)
+      if (requiredInr > availableInr + EPS) {
+        return this.reject(input, 'insufficient_margin', {
+          requiredMarginInr: requiredInr,
+          availableMarginInr: availableInr,
+          leverage,
+          usdInrRate: rate,
+        })
+      }
     }
 
     const roundId = this.activeRoundId
