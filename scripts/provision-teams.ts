@@ -33,7 +33,7 @@ import { teamUsername, usernameToEmail, type AppRole } from '../src/lib/accounts
 // ===========================================================================
 // ROSTER — swap this list for IIMB's real team names later (one-line change).
 // ===========================================================================
-const TEAM_NAMES: string[] = Array.from({ length: 20 }, (_, i) => `Team ${i + 1}`)
+const TEAM_NAMES: string[] = Array.from({ length: 50 }, (_, i) => `Team ${i + 1}`)
 
 // The market maker is exempt from the buying-power gate entirely (see
 // UNLIMITED_BUYING_POWER in server/tradingService.ts) — that exemption, not this
@@ -96,6 +96,14 @@ if (!SERVICE_ROLE_KEY) {
   process.exit(1)
 }
 
+/**
+ * `--dry-run` reports exactly what WOULD happen and writes nothing: no auth
+ * users, no profile upserts, no event_log rows, no CSV. Worth having because
+ * this script is normally run against the live event database, where "let us
+ * just try it and see" is not available.
+ */
+const DRY_RUN = process.argv.includes('--dry-run')
+
 // Admin client: service-role key, no session persistence (one-shot script).
 const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
@@ -136,14 +144,65 @@ function csvField(value: string): string {
 
 type CsvRow = { username: string; password: string; teamName: string; role: AppRole }
 
-function writeCsv(rows: CsvRow[]): void {
+/** Split one CSV line, honouring "" quoting. */
+function parseCsvLine(line: string): string[] {
+  const out: string[] = []
+  let cur = ''
+  let quoted = false
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]
+    if (quoted) {
+      if (c === '"' && line[i + 1] === '"') { cur += '"'; i++ } else if (c === '"') quoted = false
+      else cur += c
+    } else if (c === '"') quoted = true
+    else if (c === ',') { out.push(cur); cur = '' } else cur += c
+  }
+  out.push(cur)
+  return out
+}
+
+/** Read the existing sheet so previously-issued passwords survive a re-run. */
+function readExistingCsv(): CsvRow[] {
+  if (!existsSync(OUTPUT_PATH)) return []
+  const lines = readFileSync(OUTPUT_PATH, 'utf8').split(/\r?\n/).filter((l) => l.trim() !== '')
+  return lines.slice(1).map((l) => {
+    const [username, password, teamName, role] = parseCsvLine(l)
+    return { username, password, teamName: teamName ?? '', role: role as AppRole }
+  })
+}
+
+/** team01..team50 first, in numeric order; then the special accounts. */
+function sortRows(rows: CsvRow[]): CsvRow[] {
+  const num = (u: string) => {
+    const m = /^team(\d+)$/.exec(u)
+    return m ? Number(m[1]) : Number.MAX_SAFE_INTEGER
+  }
+  return [...rows].sort((a, b) => num(a.username) - num(b.username) || a.username.localeCompare(b.username))
+}
+
+/**
+ * Write the sheet as existing rows PLUS the newly created ones.
+ *
+ * Deliberately a merge, not a replace. A password cannot be read back out of
+ * Supabase — it is hashed — so writing only `created` would permanently destroy
+ * the credentials of every account provisioned on an earlier run. Growing the
+ * roster from 20 to 50 is exactly when that would have happened, and the 20
+ * teams already playing would have been locked out with no way to recover.
+ *
+ * Existing rows always win on a username clash: whatever was handed out stays.
+ */
+function writeCsv(created: CsvRow[]): void {
   mkdirSync(OUTPUT_DIR, { recursive: true })
-  // Never clobber an existing sheet silently — back it up first.
+  const byUsername = new Map<string, CsvRow>()
+  for (const r of readExistingCsv()) byUsername.set(r.username, r)
+  for (const r of created) if (!byUsername.has(r.username)) byUsername.set(r.username, r)
+
+  // Keep a timestamped copy before rewriting, so a bad run is always recoverable.
   if (existsSync(OUTPUT_PATH)) {
     renameSync(OUTPUT_PATH, resolve(OUTPUT_DIR, `credentials.${Date.now()}.bak.csv`))
   }
   const header = 'username,password,team_name,role'
-  const body = rows.map((r) =>
+  const body = sortRows([...byUsername.values()]).map((r) =>
     [r.username, r.password, r.teamName, r.role].map(csvField).join(','),
   )
   writeFileSync(OUTPUT_PATH, [header, ...body].join('\n') + '\n', 'utf8')
@@ -194,11 +253,18 @@ async function main(): Promise<void> {
 
     if (userId) {
       // Auth user already exists — skip creation. We can't recover its password,
-      // so it won't appear in the CSV. Still upsert the profile to self-heal any
-      // partial previous run.
-      await upsertProfile(userId, t)
+      // so it keeps whatever row the CSV already holds. Still upsert the profile
+      // to self-heal any partial previous run; startingCash is omitted for teams,
+      // so an existing balance is never overwritten.
+      if (!DRY_RUN) await upsertProfile(userId, t)
       console.log(`  • skip    ${t.username.padEnd(12)} (already exists)`)
       skipped++
+      continue
+    }
+
+    if (DRY_RUN) {
+      console.log(`  + would create  ${t.username.padEnd(12)} ${t.role}`)
+      created.push({ username: t.username, password: '(dry-run)', teamName: t.teamName ?? '', role: t.role })
       continue
     }
 
@@ -230,16 +296,22 @@ async function main(): Promise<void> {
 
   console.log(`\nDone: ${created.length} created, ${skipped} skipped.`)
 
-  if (created.length > 0) {
-    writeCsv(created)
-    console.log(`Credentials written to: ${OUTPUT_PATH}`)
-    console.log('(gitignored — this file contains real passwords, never commit it)\n')
-  } else {
-    console.log(
-      'No new accounts created — existing passwords cannot be retrieved, ' +
-        'so no CSV was written.\n',
-    )
+  // Always rewrite the sheet. It is a MERGE of whatever was already there with
+  // whatever was just created, so it ends up complete either way, and rows from
+  // an earlier run keep their original passwords — those cannot be read back
+  // out of Supabase.
+  if (DRY_RUN) {
+    const merged = new Set(readExistingCsv().map((r) => r.username))
+    for (const r of created) merged.add(r.username)
+    console.log(`DRY RUN - nothing was written. The sheet would end up with ${merged.size} rows.`)
+    return
   }
+  writeCsv(created)
+  console.log(`Credentials sheet: ${OUTPUT_PATH} (${readExistingCsv().length} rows)`)
+  if (skipped > 0) {
+    console.log(`  ${skipped} pre-existing account(s) kept their original passwords.`)
+  }
+  console.log('(gitignored — this file contains real passwords, never commit it)\n')
 }
 
 /**
