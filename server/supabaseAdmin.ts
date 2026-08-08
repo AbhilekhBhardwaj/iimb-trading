@@ -34,9 +34,17 @@ function loadDotEnv(): void {
 
 export function createAdminClient(): SupabaseClient {
   loadDotEnv()
-  const url = process.env.SUPABASE_URL
+  // Accept the legacy VITE_-prefixed name as a FALLBACK. Reading it here, on the
+  // server, exposes nothing — the exposure risk is Vite inlining VITE_* into the
+  // browser bundle at build time, which is a build-config concern, not this one.
+  // The fallback exists because dropping it during the auth rewrite crash-looped
+  // production: a rename that only lands in code and not in the deploy
+  // environment must degrade, not take the server down.
+  const url = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-  if (!url) throw new Error('Missing SUPABASE_URL in .env')
+  if (!url) {
+    throw new Error('Missing SUPABASE_URL (or legacy VITE_SUPABASE_URL) in the environment')
+  }
   if (!serviceKey) throw new Error('Missing SUPABASE_SERVICE_ROLE_KEY in .env')
 
   return createClient(url, serviceKey, {

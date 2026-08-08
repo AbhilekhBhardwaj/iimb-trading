@@ -32,11 +32,21 @@ const PORT = Number(process.env.API_PORT ?? process.env.PORT ?? 8787)
 
 // createAdminClient() loads .env; do it first so the anon vars are available.
 const admin = createAdminClient()
-const SUPABASE_URL = process.env.SUPABASE_URL!
-const ANON_KEY = process.env.SUPABASE_ANON_KEY
-if (!ANON_KEY) {
-  console.error('✖ Missing SUPABASE_ANON_KEY in .env (needed to verify user tokens)')
+const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL
+const ANON_KEY = process.env.SUPABASE_ANON_KEY ?? process.env.VITE_SUPABASE_ANON_KEY
+if (!SUPABASE_URL || !ANON_KEY) {
+  console.error('✖ Missing SUPABASE_URL / SUPABASE_ANON_KEY in the environment.')
+  console.error('  The server needs both to verify user tokens.')
+  console.error('  Set them WITHOUT the VITE_ prefix in the deploy environment.')
   process.exit(1)
+}
+// If the process is running on the legacy names, the frontend build almost
+// certainly still has them too — and Vite inlines any VITE_* into the browser
+// bundle, which would undo the removal of Supabase credentials from the client.
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_ANON_KEY) {
+  console.warn('⚠ Falling back to VITE_SUPABASE_* env vars. The server is fine, but if')
+  console.warn('  those are set at BUILD time Vite inlines the anon key into the browser')
+  console.warn('  bundle. Set SUPABASE_URL / SUPABASE_ANON_KEY and remove the VITE_ ones.')
 }
 const anon = createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false } })
 
