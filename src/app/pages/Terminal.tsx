@@ -536,57 +536,38 @@ function FundamentalsModal({ row, onClose }: { row: InstrumentRow; onClose: () =
 
 function Screener({ row }: { row: InstrumentRow | undefined }) {
   const [expanded, setExpanded] = useState(false)
-  const metrics = [
-    { k: 'Market Cap', v: '—' },
-    { k: 'P/E (TTM)', v: '—' },
-    { k: 'EPS', v: '—' },
-    { k: 'Div. Yield', v: '—' },
-    { k: '52W Range', v: '—' },
-    { k: 'Beta', v: '—' },
-  ]
   return (
     <Panel
       title="Main Share Reports (Screener)"
       delay={0.12}
-      // The toggle lives in the header, so the panel's body — and therefore the
-      // whole terminal grid — keeps exactly the size it had at rest.
-      right={
-        row ? (
-          <button
-            onClick={() => setExpanded(true)}
-            className="rounded border border-[#E8C46A]/40 bg-[#E8C46A]/10 px-2 py-0.5 text-[9px] uppercase tracking-wider text-[#E8C46A] transition-colors hover:bg-[#E8C46A]/20"
-          >
-            Expand
-          </button>
-        ) : undefined
-      }
     >
-      {/* Laid out for height, not decoration: six metrics in TWO rows of three
-          rather than three rows of two, and a single-line placeholder note.
-          That buys back more room than the panel gained from the grid split,
-          without costing any other panel a pixel. */}
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+      {/* At rest this panel says one thing: which instrument, and how to read
+          its fundamentals. It previously showed six metrics that were permanent
+          em-dashes and a banner claiming fundamentals were not wired — which
+          stopped being true once they were. Everything real lives in the modal,
+          so the idle card is a label and a door, nothing more.
+
+          No overflow: one line cannot scroll. `items-center` keeps it centred in
+          the panel's existing height rather than pinned above empty space — the
+          panel keeps exactly the size and position it had. */}
+      <div className="flex min-h-0 flex-1 items-center px-4">
         {row ? (
-          <>
-            <div className="flex items-baseline gap-2">
+          <div className="flex w-full items-baseline justify-between gap-4">
+            <span className="truncate">
               <span className="font-mono text-lg font-semibold text-bright">{row.ticker}</span>
-              <span className="text-[11px] text-subtle">{row.name} · {row.sector}</span>
-            </div>
-            <div className="mt-2 grid grid-cols-3 gap-px overflow-hidden rounded-lg bg-white/[0.06]">
-              {metrics.map((m) => (
-                <div key={m.k} className="bg-background/60 px-3 py-2">
-                  <div className="truncate text-[9px] uppercase tracking-[0.14em] text-subtle">{m.k}</div>
-                  <div className="mt-0.5 font-mono text-[13px] tabular-nums text-muted">{m.v}</div>
-                </div>
-              ))}
-            </div>
-            <p className="mt-2 truncate rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-1.5 text-[10px] leading-none text-amber-300/80"
-              title="Illustrative placeholder — real fundamentals are not wired yet and these figures are not final.">
-              Illustrative placeholder — fundamentals not wired yet.
-            </p>
-          </>
+              <span className="ml-2 text-[12px] text-subtle">· {row.name}</span>
+            </span>
+            {/* Same setExpanded, same modal — only the trigger moved here from
+                the panel header, so there is one control rather than two. */}
+            <button
+              onClick={() => setExpanded(true)}
+              className="shrink-0 text-[11px] text-[#E8C46A] transition-colors hover:text-[#F0D68C]"
+            >
+              Expand to view →
+            </button>
+          </div>
         ) : (
-          <div className="py-6 text-center text-xs text-subtle">Select an instrument.</div>
+          <div className="w-full text-center text-xs text-subtle">Select an instrument.</div>
         )}
       </div>
 
