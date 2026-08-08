@@ -183,3 +183,45 @@ describe('the neutral view is unchanged', () => {
     expect(view.asks[0].ownQty).toBe(0)
   })
 })
+
+
+describe('the portfolio payload always carries workingOrders as an array', () => {
+  it('an account with NO working orders gets [], never undefined', async () => {
+    const { svc } = await harness()
+    const p = await svc.portfolio(A)
+    expect(Array.isArray(p.workingOrders)).toBe(true)
+    expect(p.workingOrders).toEqual([])
+  })
+
+  it('the key is PRESENT, not merely undefined-valued', async () => {
+    const { svc } = await harness()
+    const p = await svc.portfolio(A)
+    expect(Object.keys(p)).toContain('workingOrders')
+    expect(JSON.parse(JSON.stringify(p))).toHaveProperty('workingOrders')
+  })
+
+  it('an account WITH working orders gets them listed', async () => {
+    const { svc } = await harness()
+    await rest(svc, A, 'buy', 180, 10)
+    const p = await svc.portfolio(A)
+    const wo = p.workingOrders as { ticker: string; remainingQty: number }[]
+    expect(wo).toHaveLength(1)
+    expect(wo[0].ticker).toBe('AAPL')
+    expect(wo[0].remainingQty).toBe(10)
+  })
+
+  it("one account's orders never leak into another's payload", async () => {
+    const { svc } = await harness()
+    await rest(svc, A, 'buy', 180, 10)
+    expect(await svc.portfolio(B).then((p) => p.workingOrders)).toEqual([])
+  })
+
+  it('survives JSON serialisation the way the API sends it', async () => {
+    const { svc } = await harness()
+    await rest(svc, A, 'buy', 180, 10)
+    const wire = JSON.parse(JSON.stringify(await svc.portfolio(A)))
+    expect(Array.isArray(wire.workingOrders)).toBe(true)
+    expect(Array.isArray(wire.inventory)).toBe(true)
+    expect(Array.isArray(wire.tradeHistory)).toBe(true)
+  })
+})

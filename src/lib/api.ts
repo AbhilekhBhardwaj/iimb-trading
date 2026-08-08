@@ -449,13 +449,35 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   return res.json() as Promise<T>
 }
 
+/**
+ * Guarantee the Portfolio's array fields are arrays.
+ *
+ * `get<Portfolio>` ends in `as T` — a compile-time CAST with no runtime check —
+ * so TypeScript's promise that `workingOrders` exists is worth nothing against
+ * an actual response. A server running a build older than the field (a process
+ * that did not restart on deploy, say) returns JSON without it, and the page
+ * dies on `.length` before it renders a single row.
+ *
+ * Normalising here means one place decides, instead of every consumer having to
+ * remember. All three arrays are covered, not just the one that crashed:
+ * `inventory` and `tradeHistory` are read exactly the same way.
+ */
+export function normalizePortfolio(p: Portfolio): Portfolio {
+  return {
+    ...p,
+    inventory: Array.isArray(p?.inventory) ? p.inventory : [],
+    workingOrders: Array.isArray(p?.workingOrders) ? p.workingOrders : [],
+    tradeHistory: Array.isArray(p?.tradeHistory) ? p.tradeHistory : [],
+  }
+}
+
 export const api = {
   bootstrap: () => get<Bootstrap>('/bootstrap'),
   snapshot: (ticker: string | null, priceWindowSec: number) =>
     get<Snapshot>(`/snapshot?ticker=${encodeURIComponent(ticker ?? '')}&priceWindowSec=${priceWindowSec}`),
   placeOrder: (input: PlaceOrderInput) => post<PlaceOrderResult>('/orders', input),
   cancelOrder: (orderId: string) => post<{ cancelled: boolean }>('/orders/cancel', { orderId }),
-  portfolio: () => get<Portfolio>('/portfolio'),
+  portfolio: async () => normalizePortfolio(await get<Portfolio>('/portfolio')),
   leaderboard: () => get<{ leaderboard: LeaderboardEntry[] }>('/leaderboard'),
 
   // Master Terminal

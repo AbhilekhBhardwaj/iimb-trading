@@ -103,7 +103,9 @@ function Portfolio() {
     return <div className="flex min-h-screen items-center justify-center bg-background text-subtle">Loading portfolio…</div>
   }
 
-  const holdings = data.inventory.filter((r) => r.qty != null)
+  // Normalised in api.portfolio(); `?? []` is a second line of defence so a
+  // malformed payload degrades to an empty section instead of a blank page.
+  const holdings = (data.inventory ?? []).filter((r) => r.qty != null)
   const gain = data.totalPnlInr
 
   // ---------------------------------------------------------------------------
@@ -257,10 +259,25 @@ function Portfolio() {
               whether the confirmation popup itemises it. The history table below
               lists closing fills only, so its Charges column sums to less than
               this figure whenever an opening fill was charged. */}
-          <div className="mt-8 grid max-w-lg grid-cols-2 gap-8">
+          <div className="mt-8 grid grid-cols-2 gap-x-8 gap-y-6 sm:grid-cols-4">
             <div>
               <div className="text-[10px] uppercase tracking-[0.16em] text-subtle">Cash Available</div>
               <div className="mt-1 font-mono text-2xl tabular-nums text-bright">{inr(data.cashInr)}</div>
+            </div>
+            {/* Margin is the reason the top-line value never equals cash. Both
+                figures were already in the payload and shown nowhere, which made
+                a portfolio with most of its money committed look unexplainable:
+                large total, small cash, no visible reason. Muted rather than
+                bright because this is real money that cannot be spent. */}
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.16em] text-subtle">Margin Used</div>
+              <div className="mt-1 font-mono text-2xl tabular-nums text-muted">{inr(data.marginUsedInr)}</div>
+              <div className="mt-1.5 text-[10px] leading-relaxed text-subtle">Posted by open positions.</div>
+            </div>
+            <div>
+              <div className="text-[10px] uppercase tracking-[0.16em] text-subtle">Margin Reserved</div>
+              <div className="mt-1 font-mono text-2xl tabular-nums text-muted">{inr(data.marginReservedInr)}</div>
+              <div className="mt-1.5 text-[10px] leading-relaxed text-subtle">Locked by working orders.</div>
             </div>
             <div>
               <div className="text-[10px] uppercase tracking-[0.16em] text-subtle">Commission Charged</div>
@@ -272,6 +289,11 @@ function Portfolio() {
               </div>
             </div>
           </div>
+
+          <p className="mt-6 max-w-2xl text-[11px] leading-relaxed text-subtle">
+            Total Portfolio Value = Cash + Margin Used + Margin Reserved. Margin is not lost — it
+            returns when a position closes or an order is cancelled.
+          </p>
         </section>
 
         {/* SECTION 1 — Open Positions.
@@ -280,7 +302,12 @@ function Portfolio() {
             market-value column here: nothing about an open position changes until
             it is closed. P&L appears in Trade History, on close. */}
         <section className="mt-14">
-          <h2 className="mb-1 text-sm font-medium text-bright">Open Positions</h2>
+          <div className="mb-1 flex items-baseline justify-between gap-4">
+            <h2 className="text-sm font-medium text-bright">Open Positions</h2>
+            <span className="text-[11px] text-subtle">
+              Margin Used <span className="font-mono tabular-nums text-muted">{inr(data.marginUsedInr)}</span>
+            </span>
+          </div>
           <p className="mb-4 text-[11px] text-subtle">
             Cost basis is fixed at entry. P&amp;L is realised when you close — see Trade History.
           </p>
@@ -339,13 +366,18 @@ function Portfolio() {
             that is the lifecycle order: what you hold, what is still working,
             what has closed. */}
         <section className="mt-12 border-t border-white/[0.06] pt-10">
-          <h2 className="mb-1 text-sm font-medium text-bright">Working Orders</h2>
+          <div className="mb-1 flex items-baseline justify-between gap-4">
+            <h2 className="text-sm font-medium text-bright">Working Orders</h2>
+            <span className="text-[11px] text-subtle">
+              Margin Reserved <span className="font-mono tabular-nums text-muted">{inr(data.marginReservedInr)}</span>
+            </span>
+          </div>
           <p className="mb-4 text-[11px] text-subtle">
             Orders resting on the book. Cancelling releases the margin they reserve; anything already filled stays
             filled.
           </p>
 
-          {data.workingOrders.length === 0 ? (
+          {(data.workingOrders ?? []).length === 0 ? (
             <p className="text-sm text-subtle">No working orders</p>
           ) : (
             <div className={`${CARD} overflow-hidden`} style={{ boxShadow: CARD_SHADOW }}>
@@ -363,7 +395,7 @@ function Portfolio() {
                   </tr>
                 </thead>
                 <tbody className="font-mono tabular-nums">
-                  {data.workingOrders.map((o) => (
+                  {(data.workingOrders ?? []).map((o) => (
                     <tr key={o.orderId} className="border-b border-white/[0.04] last:border-0">
                       <td className="px-5 py-3 text-left font-semibold text-bright">{o.ticker}</td>
                       <td className={`px-3 py-3 text-left ${o.side === 'buy' ? 'text-up' : 'text-destructive'}`}>
@@ -399,7 +431,7 @@ function Portfolio() {
         <section className="mt-12 border-t border-white/[0.06] pt-10">
           <h2 className="mb-4 text-sm font-medium text-bright">Trade History</h2>
 
-          {data.tradeHistory.length === 0 ? (
+          {(data.tradeHistory ?? []).length === 0 ? (
             <p className="text-sm text-subtle">No closed trades yet</p>
           ) : (
             <div className={`${CARD} overflow-hidden`} style={{ boxShadow: CARD_SHADOW }}>
@@ -416,7 +448,7 @@ function Portfolio() {
                   </tr>
                 </thead>
                 <tbody className="font-mono tabular-nums">
-                  {data.tradeHistory.map((h, i) => (
+                  {(data.tradeHistory ?? []).map((h, i) => (
                     <tr key={`${h.ticker}-${h.closedAt}-${i}`} className="border-b border-white/[0.04] last:border-0">
                       <td className="px-5 py-3 text-left">
                         <span className="font-semibold text-bright">{h.ticker}</span>
