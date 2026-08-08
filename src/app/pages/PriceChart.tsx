@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { chartAction } from '../../lib/chartSync'
+import { buildCandles, chartAction, visibleRange } from '../../lib/chartSync'
 import {
   CandlestickSeries,
   ColorType,
@@ -22,33 +22,26 @@ import { DOWN, intervalOf, TIMEFRAMES, type TF, UP, usd } from './terminalShared
 const VOL_UP = 'rgba(34,197,94,0.5)'
 const VOL_DOWN = 'rgba(212,24,61,0.5)'
 
-/** Aggregate raw trade points into OHLC candles + volume bars per interval. */
-function buildCandles(
-  points: { t: number; price: number; qty: number }[],
-  intervalSec: number,
-): { candles: CandlestickData[]; volumes: HistogramData[] } {
-  const byBucket = new Map<number, { o: number; h: number; l: number; c: number; v: number }>()
-  for (const p of points) {
-    const bucket = Math.floor(p.t / 1000 / intervalSec) * intervalSec // epoch seconds
-    const b = byBucket.get(bucket)
-    if (!b) byBucket.set(bucket, { o: p.price, h: p.price, l: p.price, c: p.price, v: p.qty })
-    else {
-      b.h = Math.max(b.h, p.price)
-      b.l = Math.min(b.l, p.price)
-      b.c = p.price // points arrive ascending, so the last write is the close
-      b.v += p.qty
-    }
+/**
+ * Candles come from lib/chartSync, which owns every time concern the chart has:
+ * bucketing, the update-vs-redraw decision, and the visible range. This module
+ * used to carry its own untested copy of the bucketing, which is how a
+ * timeframe bug could go unnoticed. Colour is applied here because it is
+ * presentation, not time.
+ */
+function seriesFor(points: { t: number; price: number; qty: number }[], intervalSec: number): {
+  candles: CandlestickData[]
+  volumes: HistogramData[]
+} {
+  const { candles, volumes } = buildCandles(points, intervalSec)
+  return {
+    candles: candles.map((c) => ({ ...c, time: c.time as UTCTimestamp })),
+    volumes: volumes.map((v, i) => ({
+      time: v.time as UTCTimestamp,
+      value: v.value,
+      color: candles[i].close >= candles[i].open ? VOL_UP : VOL_DOWN,
+    })),
   }
-  const times = [...byBucket.keys()].sort((a, b) => a - b)
-  const candles = times.map((t) => {
-    const b = byBucket.get(t)!
-    return { time: t as UTCTimestamp, open: b.o, high: b.h, low: b.l, close: b.c }
-  })
-  const volumes = times.map((t) => {
-    const b = byBucket.get(t)!
-    return { time: t as UTCTimestamp, value: b.v, color: b.c >= b.o ? VOL_UP : VOL_DOWN }
-  })
-  return { candles, volumes }
 }
 
 export default function PriceChart({ snap, ticker, ltp, tf, onTf }: {
@@ -128,7 +121,7 @@ export default function PriceChart({ snap, ticker, ltp, tf, onTf }: {
     const c = candleRef.current
     const v = volRef.current
     if (!chart || !c || !v) return
-    const { candles, volumes } = buildCandles(snap?.prices ?? [], intervalSec)
+    const { candles, volumes } = seriesFor(snap?.prices ?? [], intervalSec)
     const shape = `${ticker}|${intervalSec}`
 
     // Full reset on a ticker/timeframe change or a non-incremental change (first
@@ -163,23 +156,16 @@ export default function PriceChart({ snap, ticker, ltp, tf, onTf }: {
     // Track what the series has ACTUALLY been given, so the next tick can tell
     // forwards from backwards without inferring it from candle counts.
     lastTimeRef.current = newestTime
-    const grewByOne = candles.length === prevLen + 1
 
-    // Auto-fit the visible time range to the data — only on a structural change
-    // or a brand-new candle (not every intra-bucket tick). With little history,
-    // center the candles at a capped width so they fill a reasonable portion with
-    // margin on BOTH sides (never pinned to the right of an empty canvas); once
-    // there are enough candles to fill the width, fit them edge-to-edge.
-    if (candles.length > 0 && (structural || grewByOne)) {
+    // Keep the newest candle in view. This used to run only on a structural
+    // change or a brand-new candle, so once a book went quiet the view stayed
+    // wherever it had last been left — showing a stale slice while newer data
+    // sat off-screen. visibleRange always anchors on the latest bar: it centres
+    // a short series, and scrolls a long one so the newest bars are flush right.
+    if (candles.length > 0) {
       const width = containerRef.current?.clientWidth || 600
-      const barsAtMaxWidth = width / 24 // 24px = maxBarSpacing
-      const ts = chart.timeScale()
-      if (candles.length >= barsAtMaxWidth - 2) {
-        ts.fitContent()
-      } else {
-        const pad = (barsAtMaxWidth - candles.length) / 2
-        ts.setVisibleLogicalRange({ from: -pad, to: candles.length - 1 + pad })
-      }
+      const range = visibleRange(candles.length, width / 24) // 24px = maxBarSpacing
+      if (range) chart.timeScale().setVisibleLogicalRange(range)
     }
     // snap?.ticker is a dependency in its own right: a payload can arrive with
     // the same prices array identity but for a different instrument, and the

@@ -300,3 +300,64 @@ describe('1. still correct alongside tonight changes', () => {
     expect(Number(db.rows('positions').find((p) => p.account_id === A)!.qty)).toBe(-10)
   })
 })
+
+
+describe('the price chart is CONTINUOUS across round boundaries', () => {
+  /**
+   * Trades and positions carry forward across rounds, so the chart must too.
+   * priceHistory filters only by instrument and a trailing TIME window — there
+   * is no round_id in the query — and nothing deletes trades at a boundary.
+   */
+  it('trades from round 1 are still returned during round 2', async () => {
+    const { svc } = await harness()
+    await rest(svc, A, 'sell', 200, 5)
+    await rest(svc, B, 'buy', 200, 5) // a real fill in round 1
+    const inRound1 = await svc.priceHistory('AAPL', 3600)
+    expect(inRound1.length).toBeGreaterThan(0)
+
+    await svc.endRound(600)
+    await svc.startRound(0)
+
+    const inRound2 = await svc.priceHistory('AAPL', 3600)
+    expect(inRound2.length).toBe(inRound1.length) // nothing was dropped
+    expect(inRound2[0].price).toBe(200)
+  })
+
+  it('ending a round deletes no trades', async () => {
+    const { db, svc } = await harness()
+    await rest(svc, A, 'sell', 200, 5)
+    await rest(svc, B, 'buy', 200, 5)
+    const before = db.rows('trades').length
+    expect(before).toBe(1)
+
+    await svc.endRound(600)
+    expect(db.rows('trades').length).toBe(before)
+    await svc.startRound(0)
+    expect(db.rows('trades').length).toBe(before)
+  })
+
+  it('a round-2 trade EXTENDS the same series rather than starting a new one', async () => {
+    const { svc } = await harness()
+    await rest(svc, A, 'sell', 200, 5)
+    await rest(svc, B, 'buy', 200, 5)
+    await svc.endRound(600)
+    await svc.startRound(0)
+    await rest(svc, A, 'sell', 210, 5)
+    await rest(svc, B, 'buy', 210, 5)
+
+    const points = await svc.priceHistory('AAPL', 3600)
+    const prices = points.map((p) => p.price)
+    expect(prices).toContain(200) // round 1
+    expect(prices).toContain(210) // round 2, same series
+    expect(points.length).toBe(2)
+  })
+
+  it('positions also carry forward, so the chart matches the book', async () => {
+    const { db, svc } = await harness()
+    await rest(svc, A, 'sell', 200, 5)
+    await rest(svc, B, 'buy', 200, 5)
+    await svc.endRound(600)
+    await svc.startRound(0)
+    expect(Number(db.rows('positions').find((p) => p.account_id === A)!.qty)).toBe(-5)
+  })
+})
