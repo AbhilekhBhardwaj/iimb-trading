@@ -317,3 +317,26 @@ describe('5. the popup is fed the rate currently in force', () => {
     expect(quoted).toBeCloseTo(1660, 6)
   })
 })
+
+
+describe('the snapshot names the instrument it is FOR', () => {
+  it('carries the ticker, so the chart can reject a stale payload', async () => {
+    const { svc } = await harness()
+    const snap = await svc.snapshot(A, 'team', 'AAPL')
+    expect(snap.ticker).toBe('AAPL')
+  })
+
+  it('is null when no instrument is selected', async () => {
+    const { svc } = await harness()
+    expect((await svc.snapshot(A, 'team', null)).ticker).toBeNull()
+  })
+
+  it('always matches the per-ticker fields in the same payload', async () => {
+    const { svc } = await harness()
+    await cross(svc, 10, 200)
+    const snap = await svc.snapshot(A, 'team', 'AAPL')
+    expect(snap.ticker).toBe('AAPL')
+    expect(snap.depth).not.toBeNull()
+    expect(Array.isArray(snap.prices)).toBe(true)
+  })
+})

@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { chartAction } from '../../lib/chartSync'
 import {
   CandlestickSeries,
   ColorType,
@@ -63,6 +64,8 @@ export default function PriceChart({ snap, ticker, ltp, tf, onTf }: {
   const volRef = useRef<ISeriesApi<'Histogram'> | null>(null)
   const shapeRef = useRef('') // `${ticker}|${interval}` — a change forces a full setData
   const lenRef = useRef(0)
+  /** Newest time actually pushed into the series; null before the first draw. */
+  const lastTimeRef = useRef<number | null>(null)
 
   // Create the chart once; autoSize keeps it filling the panel via ResizeObserver.
   useEffect(() => {
@@ -132,18 +135,35 @@ export default function PriceChart({ snap, ticker, ltp, tf, onTf }: {
     // load, or the trailing window added/dropped more than one bucket). Otherwise
     // update just the latest bar so intra-bucket ~1s polls don't refit the view.
     const prevLen = lenRef.current
-    const grewByOne = candles.length === prevLen + 1
-    const sameLen = candles.length === prevLen
-    const structural = shape !== shapeRef.current || !(sameLen || grewByOne)
+    const newestTime = candles.length > 0 ? (candles[candles.length - 1].time as number) : null
+    const action = chartAction({
+      snapTicker: snap?.ticker ?? null,
+      ticker,
+      shape,
+      prevShape: shapeRef.current,
+      candleCount: candles.length,
+      prevCount: prevLen,
+      newestTime,
+      lastPushedTime: lastTimeRef.current,
+    })
+    // A snapshot belonging to another instrument is not ours to draw. Leave the
+    // series and every ref untouched and wait one poll.
+    if (action === 'skip') return
+
+    const structural = action === 'setData'
     if (structural) {
       c.setData(candles)
       v.setData(volumes)
-    } else if (candles.length > 0) {
+    } else {
       c.update(candles[candles.length - 1])
       v.update(volumes[volumes.length - 1])
     }
     shapeRef.current = shape
     lenRef.current = candles.length
+    // Track what the series has ACTUALLY been given, so the next tick can tell
+    // forwards from backwards without inferring it from candle counts.
+    lastTimeRef.current = newestTime
+    const grewByOne = candles.length === prevLen + 1
 
     // Auto-fit the visible time range to the data — only on a structural change
     // or a brand-new candle (not every intra-bucket tick). With little history,
@@ -161,7 +181,10 @@ export default function PriceChart({ snap, ticker, ltp, tf, onTf }: {
         ts.setVisibleLogicalRange({ from: -pad, to: candles.length - 1 + pad })
       }
     }
-  }, [snap?.prices, ticker, intervalSec])
+    // snap?.ticker is a dependency in its own right: a payload can arrive with
+    // the same prices array identity but for a different instrument, and the
+    // skip decision must be re-evaluated when it does.
+  }, [snap?.prices, snap?.ticker, ticker, intervalSec])
 
   return (
     <Panel

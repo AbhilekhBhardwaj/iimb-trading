@@ -259,6 +259,11 @@ export interface Snapshot {
   round: RoundStatus
   account: AccountState
   instruments: InstrumentRow[]
+  /**
+   * The instrument this payload's per-ticker fields (depth, trades, prices,
+   * myOrders) belong to. Undefined from a server older than this field.
+   */
+  ticker?: string | null
   depth: DepthView | null
   myOrders: MyOrder[]
   trades: TapeTrade[]

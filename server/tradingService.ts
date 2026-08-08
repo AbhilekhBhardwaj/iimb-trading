@@ -1747,6 +1747,12 @@ export class TradingService {
       round: this.getRoundStatus(),
       account,
       instruments,
+      // The instrument this payload's per-ticker fields belong to. The chart
+      // needs it: `selected` flips the instant a team clicks, while the poll
+      // still holds the previous one, and drawing those candles under the new
+      // ticker both flashes the wrong series and breaks the chart's monotonic
+      // time guard.
+      ticker,
       depth: ticker ? this.depthView(ticker, role === 'market_maker', accountId) : null,
       myOrders: ticker ? this.myRestingOrders(accountId, ticker) : [],
       trades,
