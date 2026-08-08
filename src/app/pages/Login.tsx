@@ -2,8 +2,9 @@ import { useState, type FormEvent } from 'react'
 import { useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, MOTION } from '../../lib/design-patterns'
-import { supabase } from '../../lib/supabase'
-import { usernameToEmail, type AppRole } from '../../lib/accounts'
+import { api } from '../../lib/api'
+import * as session from '../../lib/session'
+import { type AppRole } from '../../lib/accounts'
 import { analytics } from '../../lib/analytics'
 
 /** Where each role lands after a successful sign-in. */
@@ -37,40 +38,24 @@ function Login() {
 
     setLoading(true)
     try {
-      // Accounts are pre-provisioned: convert the username to its synthetic
-      // email and use Supabase's normal password sign-in.
-      const { data, error: signInError } = await supabase.auth.signInWithPassword({
-        email: usernameToEmail(trimmed),
-        password,
-      })
-      if (signInError || !data.user) {
-        setError(INVALID_MESSAGE)
-        return
-      }
+      // The browser holds no Supabase key. Credentials go to OUR backend, which
+      // signs in against Supabase, reads the role, and returns tokens. The
+      // username-to-email mapping and the profile lookup both moved server-side.
+      const s = await api.login(trimmed, password)
+      session.save(s)
 
-      // Read the role to decide the destination. RLS lets a user read their own
-      // profile row.
-      const { data: profile, error: profileError } = await supabase
-        .from('profiles')
-        .select('role')
-        .eq('id', data.user.id)
-        .single()
+      analytics.identify(s.accountId, { role: s.role })
+      analytics.capture('login', { role: s.role })
 
-      if (profileError || !profile) {
-        // Authenticated but no profile — treat as a bad login rather than
-        // stranding the user in a half-signed-in state.
-        await supabase.auth.signOut()
-        setError(INVALID_MESSAGE)
-        return
-      }
-
-      analytics.identify(data.user.id, { role: profile.role })
-      analytics.capture('login', { role: profile.role })
-
-      const destination = ROLE_DESTINATION[profile.role as AppRole] ?? '/terminal'
+      const destination = ROLE_DESTINATION[s.role as AppRole] ?? '/terminal'
       navigate(destination, { replace: true })
-    } catch {
-      setError('Something went wrong. Please try again.')
+    } catch (err) {
+      // The backend answers a bad credential with 401 + { error: 'invalid
+      // credentials' }, which post() rethrows as that message. Anything else is
+      // a genuine fault. Both render the same generic copy to the user; only
+      // the fallback wording differs.
+      const msg = err instanceof Error ? err.message : ''
+      setError(/invalid credentials|username and password/i.test(msg) ? INVALID_MESSAGE : 'Something went wrong. Please try again.')
     } finally {
       setLoading(false)
     }

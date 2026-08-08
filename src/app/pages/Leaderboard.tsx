@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, MOTION } from '../../lib/design-patterns'
-import { supabase } from '../../lib/supabase'
+import * as session from '../../lib/session'
 import { api, type LeaderboardEntry } from '../../lib/api'
 import { analytics } from '../../lib/analytics'
 
@@ -76,8 +76,7 @@ function Leaderboard() {
     let alive = true
     let id: number | undefined
     ;(async () => {
-      const { data } = await supabase.auth.getSession()
-      if (!data.session) { navigate('/login', { replace: true }); return }
+      if (!session.isAuthenticated()) { navigate('/login', { replace: true }); return }
       // One-time: who am I? (to highlight my own row). Failure is non-fatal.
       try { const b = await api.bootstrap(); if (alive) setMyUsername(b.username) } catch { /* board still works */ }
 

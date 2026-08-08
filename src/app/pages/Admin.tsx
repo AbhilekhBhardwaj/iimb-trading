@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, MOTION } from '../../lib/design-patterns'
 import { roundLabel } from '../../lib/format'
-import { supabase } from '../../lib/supabase'
+import * as session from '../../lib/session'
 import {
   api,
   type Bootstrap,
@@ -12,6 +12,7 @@ import {
   type ScheduleRound,
   type TeamOverview,
 } from '../../lib/api'
+import { signOut } from '../../lib/signOut'
 import { analytics } from '../../lib/analytics'
 
 const inrFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 })
@@ -129,8 +130,7 @@ function Admin() {
     let alive = true
     let id: number | undefined
     ;(async () => {
-      const { data } = await supabase.auth.getSession()
-      if (!data.session) { navigate('/login', { replace: true }); return }
+      if (!session.isAuthenticated()) { navigate('/login', { replace: true }); return }
       try {
         const b = await api.bootstrap()
         if (!alive) return
@@ -401,7 +401,7 @@ function Admin() {
         <div className="flex items-center gap-4 font-mono text-[11px]">
           <span className="text-muted">{boot.username}</span>
           <Link to="/terminal" className="text-subtle transition-colors hover:text-bright">Terminal</Link>
-          <button onClick={async () => { await supabase.auth.signOut(); analytics.reset(); navigate('/login', { replace: true }) }} className="text-subtle transition-colors hover:text-destructive">sign out</button>
+          <button onClick={async () => { await signOut(); analytics.reset(); navigate('/login', { replace: true }) }} className="text-subtle transition-colors hover:text-destructive">sign out</button>
         </div>
       </header>
 

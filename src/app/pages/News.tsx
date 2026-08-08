@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, MOTION } from '../../lib/design-patterns'
-import { supabase } from '../../lib/supabase'
+import * as session from '../../lib/session'
 import { NotificationStrip } from '../components/NotificationStrip'
 import { api, type Bootstrap, type InstrumentMeta, type Notification, type ScheduleRound } from '../../lib/api'
 import { roundLabel } from '../../lib/format'
@@ -86,8 +86,7 @@ function News() {
     let alive = true
     let id: number | undefined
     ;(async () => {
-      const { data } = await supabase.auth.getSession()
-      if (!data.session) { navigate('/login', { replace: true }); return }
+      if (!session.isAuthenticated()) { navigate('/login', { replace: true }); return }
       const tick = async () => {
         try {
           const [b, s, n] = await Promise.all([api.bootstrap(), api.roundSchedule(), api.notificationsList()])

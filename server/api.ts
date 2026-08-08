@@ -23,6 +23,7 @@ import { extname, join, normalize, resolve } from 'node:path'
 // pinned per round and only the Master changes it (POST /api/round/rate).
 import { createAdminClient } from './supabaseAdmin'
 import { TradingService } from './tradingService'
+import { usernameToEmail } from '../src/lib/accounts'
 import { JSON_HEADERS } from './httpHeaders'
 
 // API_PORT wins in local dev (Vite proxies /api → 8787); on Railway/PaaS the
@@ -31,10 +32,10 @@ const PORT = Number(process.env.API_PORT ?? process.env.PORT ?? 8787)
 
 // createAdminClient() loads .env; do it first so the anon vars are available.
 const admin = createAdminClient()
-const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL!
-const ANON_KEY = process.env.VITE_SUPABASE_ANON_KEY ?? process.env.SUPABASE_ANON_KEY
+const SUPABASE_URL = process.env.SUPABASE_URL!
+const ANON_KEY = process.env.SUPABASE_ANON_KEY
 if (!ANON_KEY) {
-  console.error('✖ Missing VITE_SUPABASE_ANON_KEY / SUPABASE_ANON_KEY in .env (needed to verify user tokens)')
+  console.error('✖ Missing SUPABASE_ANON_KEY in .env (needed to verify user tokens)')
   process.exit(1)
 }
 const anon = createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false, autoRefreshToken: false } })
@@ -176,6 +177,81 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     // round's duration has elapsed and closes it if so, so the round ends on
     // schedule even if the Master never clicks "end". No-op when nothing is due.
     await service.maybeAutoEndRound()
+
+    // -- AUTH: the only routes reachable WITHOUT a token ---------------------
+    // The browser no longer holds a Supabase key, so sign-in, refresh and
+    // sign-out all happen here. Credentials are exchanged for tokens by the
+    // server; nothing about Supabase is visible to the client.
+    //
+    // Never log a request body on these routes: it contains a plaintext
+    // password.
+    if (method === 'POST' && path === '/api/auth/login') {
+      const b = await readJson(req)
+      const username = String(b.username ?? '').trim()
+      const password = String(b.password ?? '')
+      if (!username || !password) return json(res, 400, { error: 'username and password are required' })
+
+      const { data, error } = await anon.auth.signInWithPassword({
+        email: usernameToEmail(username),
+        password,
+      })
+      // Deliberately one generic message for both a bad username and a bad
+      // password, so this cannot be used to enumerate accounts.
+      if (error || !data.user || !data.session) return json(res, 401, { error: 'invalid credentials' })
+
+      // The role read that used to happen in the browser against profiles.
+      const { data: profile } = await admin
+        .from('profiles')
+        .select('role, username')
+        .eq('id', data.user.id)
+        .single()
+      // Authenticated but no profile row: refuse rather than leaving a
+      // half-signed-in session, exactly as the old client-side flow did.
+      if (!profile) return json(res, 401, { error: 'invalid credentials' })
+
+      return json(res, 200, {
+        accessToken: data.session.access_token,
+        refreshToken: data.session.refresh_token,
+        expiresAt: data.session.expires_at ? data.session.expires_at * 1000 : Date.now() + 3_600_000,
+        accountId: data.user.id,
+        role: profile.role as string,
+        username: profile.username as string,
+      })
+    }
+
+    if (method === 'POST' && path === '/api/auth/refresh') {
+      const b = await readJson(req)
+      const refreshToken = String(b.refreshToken ?? '')
+      if (!refreshToken) return json(res, 400, { error: 'refreshToken is required' })
+
+      const { data, error } = await anon.auth.refreshSession({ refresh_token: refreshToken })
+      if (error || !data.session) return json(res, 401, { error: 'invalid refresh token' })
+
+      // Supabase ROTATES the refresh token: the one returned here replaces the
+      // one just spent. Returning it is not optional — a client that keeps
+      // re-sending the old token is logged out on its second refresh.
+      return json(res, 200, {
+        accessToken: data.session.access_token,
+        refreshToken: data.session.refresh_token,
+        expiresAt: data.session.expires_at ? data.session.expires_at * 1000 : Date.now() + 3_600_000,
+      })
+    }
+
+    if (method === 'POST' && path === '/api/auth/logout') {
+      // Best-effort revocation. The client clears its own storage regardless,
+      // so a failure here must never leave someone unable to sign out.
+      const header = req.headers['authorization']
+      const token = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice(7) : null
+      if (token) {
+        callerCache.delete(token)
+        try {
+          await admin.auth.admin.signOut(token)
+        } catch {
+          /* already expired or revoked — signing out is still a success */
+        }
+      }
+      return json(res, 200, { ok: true })
+    }
 
     const caller = await authenticate(req)
     if (!caller) return json(res, 401, { error: 'unauthorized' })

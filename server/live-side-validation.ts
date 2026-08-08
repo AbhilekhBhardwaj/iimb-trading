@@ -42,7 +42,7 @@ const row = lines('scripts/output/credentials.csv').find((l) => l.startsWith('ma
 const username = row[0].trim()
 const password = row[1].trim()
 
-const sb = createClient(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_ANON_KEY)
+const sb = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY)
 const { data: auth, error } = await sb.auth.signInWithPassword({
   email: usernameToEmail(username),
   password,

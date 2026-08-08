@@ -3,7 +3,7 @@
  * /api via the Vite dev proxy. Every call attaches the logged-in user's Supabase
  * access token; the server verifies it and derives the account + role.
  */
-import { supabase } from './supabase'
+import * as session from './session'
 
 export type Role = 'team' | 'market_maker' | 'master'
 export type Side = 'buy' | 'sell'
@@ -370,8 +370,7 @@ export interface PlaceOrderResult {
 }
 
 async function authHeaders(): Promise<Record<string, string>> {
-  const { data } = await supabase.auth.getSession()
-  const token = data.session?.access_token
+  const token = session.accessToken()
   return token ? { authorization: `Bearer ${token}`, 'content-type': 'application/json' } : { 'content-type': 'application/json' }
 }
 
@@ -402,9 +401,23 @@ let refreshInFlight: Promise<boolean> | null = null
  */
 function tryRefresh(): Promise<boolean> {
   if (refreshInFlight) return refreshInFlight
-  refreshInFlight = supabase.auth
-    .refreshSession()
-    .then(({ data, error }) => !error && !!data.session)
+  const token = session.refreshToken()
+  if (!token) return Promise.resolve(false)
+  refreshInFlight = fetch('/api/auth/refresh', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    cache: 'no-store',
+    body: JSON.stringify({ refreshToken: token }),
+  })
+    .then(async (r) => {
+      if (!r.ok) return false
+      const t = (await r.json()) as session.TokenPair
+      if (!t?.accessToken || !t?.refreshToken) return false
+      // Supabase ROTATES the refresh token: persist the new pair, or the next
+      // refresh spends a token the server has already invalidated.
+      session.saveTokens(t)
+      return true
+    })
     .catch(() => false)
   void refreshInFlight.finally(() => { refreshInFlight = null })
   return refreshInFlight
@@ -501,6 +514,12 @@ export function normalizePortfolio(p: Portfolio): Portfolio {
 }
 
 export const api = {
+  /** Exchange credentials for tokens. The browser holds no Supabase key. */
+  login: (username: string, password: string) =>
+    post<session.Session>('/auth/login', { username, password }),
+  /** Best-effort server-side revoke; the caller clears local storage regardless. */
+  logout: () => post<{ ok: true }>('/auth/logout', {}),
+
   bootstrap: () => get<Bootstrap>('/bootstrap'),
   snapshot: (ticker: string | null, priceWindowSec: number) =>
     get<Snapshot>(`/snapshot?ticker=${encodeURIComponent(ticker ?? '')}&priceWindowSec=${priceWindowSec}`),

@@ -7,7 +7,7 @@ import { toCashPosition } from '../../lib/orderConfirm'
 import { depthCountLabel, spreadScrollTop } from '../../lib/depthLadder'
 import { buildLiquidationLines, closingSide, hasCrossed, liquidationWarning, pastLabel } from '../../lib/liquidationPanel'
 import { buildConfirmLines, buildTradeOutcome, estimateFill, type MarketContext, previewPrice } from '../../lib/orderFlow'
-import { supabase } from '../../lib/supabase'
+import * as session from '../../lib/session'
 import { NotificationStrip } from '../components/NotificationStrip'
 import { ConfirmDialog, Overlay, RejectDialog, type RejectionResult, ResultDialog, type TradeResult } from '../components/OrderDialogs'
 import { Panel } from '../components/Panel'
@@ -25,6 +25,7 @@ import {
   type Side,
   type Snapshot,
 } from '../../lib/api'
+import { signOut } from '../../lib/signOut'
 import { analytics } from '../../lib/analytics'
 
 // PriceChart is imported EAGERLY (not React.lazy) — once a team is in /terminal
@@ -734,8 +735,7 @@ function Terminal() {
     analytics.pageview('/terminal')
     let alive = true
     ;(async () => {
-      const { data } = await supabase.auth.getSession()
-      if (!data.session) { navigate('/login', { replace: true }); return }
+      if (!session.isAuthenticated()) { navigate('/login', { replace: true }); return }
       try {
         const b = await api.bootstrap()
         if (!alive) return
@@ -898,7 +898,7 @@ function Terminal() {
           <p className="mt-3 text-sm text-muted">{error}</p>
           <div className="mt-6 flex gap-2">
             <button onClick={() => window.location.reload()} className="flex-1 rounded-full py-2.5 text-sm font-medium text-bright" style={{ background: GOLD.solid, color: '#0a0a0a' }}>Retry</button>
-            <button onClick={async () => { await supabase.auth.signOut(); analytics.reset(); navigate('/login', { replace: true }) }} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Sign out</button>
+            <button onClick={async () => { await signOut(); analytics.reset(); navigate('/login', { replace: true }) }} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Sign out</button>
           </div>
         </div>
       </div>
@@ -911,7 +911,7 @@ function Terminal() {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-background text-foreground">
-      <RoundBar snap={snap} username={boot.username} role={boot.role} live={live} onSignOut={async () => { await supabase.auth.signOut(); analytics.reset(); navigate('/login', { replace: true }) }} />
+      <RoundBar snap={snap} username={boot.username} role={boot.role} live={live} onSignOut={async () => { await signOut(); analytics.reset(); navigate('/login', { replace: true }) }} />
 
       <div className="grid min-h-0 flex-1 grid-cols-2 gap-4 p-4">
         {/* LEFT column: instruments / order / screener */}

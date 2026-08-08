@@ -3,7 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { DEFAULT_COMMISSION_RATE } from '@iimb-trading/engine'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, INPUT } from '../../lib/design-patterns'
-import { supabase } from '../../lib/supabase'
+import * as session from '../../lib/session'
 import { api, type InventoryRow, type OrderType, type Portfolio as PortfolioData, type WorkingOrder } from '../../lib/api'
 import { ConfirmDialog, Overlay, RejectDialog, type RejectionResult, ResultDialog, type TradeResult } from '../components/OrderDialogs'
 import { toCashPosition } from '../../lib/orderConfirm'
@@ -67,8 +67,7 @@ function Portfolio() {
     let alive = true
     let id: number | undefined
     ;(async () => {
-      const { data: session } = await supabase.auth.getSession()
-      if (!session.session) { navigate('/login', { replace: true }); return }
+      if (!session.isAuthenticated()) { navigate('/login', { replace: true }); return }
       const tick = async () => {
         try {
           const p = await api.portfolio()

@@ -44,7 +44,7 @@ for (const line of L('.env')) {
 }
 const row = L('scripts/output/credentials.csv').find((l) => l.startsWith('master,'))!.split(',')
 
-const sb = createClient(env.VITE_SUPABASE_URL, env.VITE_SUPABASE_ANON_KEY)
+const sb = createClient(env.SUPABASE_URL, env.SUPABASE_ANON_KEY)
 const { data: auth, error } = await sb.auth.signInWithPassword({
   email: usernameToEmail(row[0].trim()),
   password: row[1].trim(),

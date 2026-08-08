@@ -79,11 +79,11 @@ function loadEnv(): void {
 
 loadEnv()
 
-const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL
+const SUPABASE_URL = process.env.SUPABASE_URL
 const SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY
 
 if (!SUPABASE_URL) {
-  console.error('✖ Missing SUPABASE_URL (or VITE_SUPABASE_URL) in .env')
+  console.error('✖ Missing SUPABASE_URL in .env')
   process.exit(1)
 }
 if (!SERVICE_ROLE_KEY) {

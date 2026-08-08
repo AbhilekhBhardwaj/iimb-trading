@@ -18,8 +18,8 @@ const BASE = process.env.API_BASE ?? 'http://localhost:8787'
 const HERE = dirname(fileURLToPath(import.meta.url))
 
 createAdminClient() // side effect: loads .env
-const SUPABASE_URL = process.env.SUPABASE_URL ?? process.env.VITE_SUPABASE_URL!
-const ANON = process.env.VITE_SUPABASE_ANON_KEY!
+const SUPABASE_URL = process.env.SUPABASE_URL!
+const ANON = process.env.SUPABASE_ANON_KEY!
 
 function masterPassword(): string {
   const csv = readFileSync(resolve(HERE, '..', 'scripts', 'output', 'credentials.csv'), 'utf8')
