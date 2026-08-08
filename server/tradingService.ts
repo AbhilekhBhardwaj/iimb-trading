@@ -683,6 +683,9 @@ export class TradingService {
    * Run a round transition with exclusive access, queued behind any in-flight
    * one. Failures don't poison the chain — later transitions still run.
    */
+  /** One promise chain per account, so an account's own orders never interleave. */
+  private readonly accountOps = new Map<string, Promise<unknown>>()
+
   private serializeRoundOp<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.roundOps.then(fn, fn)
     this.roundOps = run.then(
@@ -1123,7 +1126,46 @@ export class TradingService {
   // Orders
   // -------------------------------------------------------------------------
 
+  /**
+   * Place an order, serialized per account.
+   *
+   * The margin gate reads available margin, awaits, then places. Two requests
+   * from one account interleaving in that window both read the same pre-trade
+   * balance and both pass — which is how two 45-lot buys settled 93 shares of
+   * exposure onto a Rs 10L account. The position write has the same shape: read,
+   * await, write, so concurrent fills also lost updates against each other.
+   *
+   * Serializing the whole check-and-place sequence per account_id closes both.
+   * The lock is per ACCOUNT, so different teams never wait on one another —
+   * only an account's own orders queue, and only for as long as one takes.
+   */
   async placeOrder(input: PlaceOrderInput): Promise<PlaceOrderResult> {
+    return this.serializeAccountOp(input.accountId, () => this.placeOrderInner(input))
+  }
+
+  /**
+   * Chain one account's mutating operations so they can never interleave.
+   *
+   * Mirrors serializeRoundOp, but keyed: a rejection never poisons the next
+   * operation (both branches of `then` run it), and the tail is dropped from the
+   * map once it is the last one, so the map does not grow with every account
+   * that has ever traded.
+   */
+  private serializeAccountOp<T>(accountId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.accountOps.get(accountId) ?? Promise.resolve()
+    const run = prev.then(fn, fn)
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.accountOps.set(accountId, tail)
+    void tail.then(() => {
+      if (this.accountOps.get(accountId) === tail) this.accountOps.delete(accountId)
+    })
+    return run
+  }
+
+  private async placeOrderInner(input: PlaceOrderInput): Promise<PlaceOrderResult> {
     // 1. Round gate — no active round means no trading.
     if (this.rounds.getMode() === null || this.activeRoundId === null) {
       return this.reject(input, 'no active round', { code: 'no_active_round' })
