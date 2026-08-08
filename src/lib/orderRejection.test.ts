@@ -10,6 +10,7 @@ const ALL_CODES: RejectionCode[] = [
   'no_active_round',
   'unknown_instrument',
   'invalid_qty',
+  'invalid_side',
   'invalid_leverage',
   'missing_limit_price',
   'no_reference_price',
@@ -95,7 +96,8 @@ describe('every other rejection reason the backend returns', () => {
   const cases: { code: RejectionCode; reason: string; expectTitle: string; expectDetail: RegExp }[] = [
     { code: 'no_active_round', reason: 'no active round', expectTitle: 'Order rejected — no active round', expectDetail: /Trading is closed until the next round/ },
     { code: 'unknown_instrument', reason: 'unknown instrument: ZZZZ', expectTitle: 'Order rejected — unknown instrument', expectDetail: /not trading in this event/ },
-    { code: 'invalid_qty', reason: 'qty must be positive', expectTitle: 'Order rejected — invalid quantity', expectDetail: /whole number greater than zero/ },
+    { code: 'invalid_qty', reason: 'qty must be positive', expectTitle: 'Order rejected — invalid quantity', expectDetail: /whole number of at least 1/ },
+    { code: 'invalid_side', reason: 'invalid side: hold', expectTitle: 'Order rejected — invalid side', expectDetail: /must be a buy or a sell/ },
     { code: 'invalid_leverage', reason: 'invalid_leverage', expectTitle: 'Order rejected — invalid leverage', expectDetail: /at least 1x/ },
     { code: 'missing_limit_price', reason: 'limit order requires a price', expectTitle: 'Order rejected — no limit price', expectDetail: /needs a price/ },
     { code: 'no_reference_price', reason: 'no_reference_price', expectTitle: 'Order rejected — no price available', expectDetail: /no reference price yet/ },

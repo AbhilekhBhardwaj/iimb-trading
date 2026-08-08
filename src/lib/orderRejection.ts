@@ -20,6 +20,7 @@ export type RejectionCode =
   | 'no_active_round'
   | 'unknown_instrument'
   | 'invalid_qty'
+  | 'invalid_side'
   | 'invalid_leverage'
   | 'missing_limit_price'
   | 'no_reference_price'
@@ -108,7 +109,13 @@ export function rejectionMessage(res: {
       return {
         code,
         title: 'Order rejected — invalid quantity',
-        detail: 'Quantity must be a whole number greater than zero. Nothing was placed.',
+        detail: 'Quantity must be a whole number of at least 1 — fractional lots cannot be traded. Nothing was placed.',
+      }
+    case 'invalid_side':
+      return {
+        code,
+        title: 'Order rejected — invalid side',
+        detail: 'An order must be a buy or a sell. Nothing was placed.',
       }
     case 'invalid_leverage':
       return {

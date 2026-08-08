@@ -127,6 +127,7 @@ export type RejectionCode =
   | 'no_active_round'
   | 'unknown_instrument'
   | 'invalid_qty'
+  | 'invalid_side'
   | 'invalid_leverage'
   | 'missing_limit_price'
   | 'no_reference_price'
@@ -1170,11 +1171,22 @@ export class TradingService {
     if (this.rounds.getMode() === null || this.activeRoundId === null) {
       return this.reject(input, 'no active round', { code: 'no_active_round' })
     }
+    // Side is validated HERE, not at the API layer, so every caller gets the
+    // same guarantee. The API used to coerce with `b.side === 'sell' ? 'sell' :
+    // 'buy'`, which silently turned a typo — or "hold", or any garbage — into a
+    // BUY and opened a position nobody asked for.
+    if (input.side !== 'buy' && input.side !== 'sell') {
+      return this.reject(input, `invalid side: ${String(input.side)}`, { code: 'invalid_side' })
+    }
     // 2. Instrument must be known.
     const instrumentId = this.tickerToId.get(input.ticker)
     if (!instrumentId) return this.reject(input, `unknown instrument: ${input.ticker}`, { code: 'unknown_instrument', ticker: input.ticker })
     // 3. Basic validation.
-    if (!(input.qty > 0)) return this.reject(input, 'qty must be positive', { code: 'invalid_qty' })
+    // Whole lots only. `qty > 0` alone let 2.5 through, and a fractional order
+    // rests on the book and settles against an engine that assumes integers.
+    if (!Number.isInteger(input.qty) || input.qty < 1) {
+      return this.reject(input, 'qty must be a whole number of at least 1', { code: 'invalid_qty' })
+    }
     const leverage = input.leverage ?? 1
     if (!(leverage >= 1)) return this.reject(input, 'invalid_leverage', { code: 'invalid_leverage' })
     if (input.type === 'limit' && (input.price === undefined || Number.isNaN(input.price))) {

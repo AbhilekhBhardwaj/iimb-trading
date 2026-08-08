@@ -337,6 +337,7 @@ export type RejectionCode =
   | 'no_active_round'
   | 'unknown_instrument'
   | 'invalid_qty'
+  | 'invalid_side'
   | 'invalid_leverage'
   | 'missing_limit_price'
   | 'no_reference_price'

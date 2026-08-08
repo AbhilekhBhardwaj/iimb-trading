@@ -1473,7 +1473,7 @@ describe('market maker has unlimited buying power; teams do not', () => {
     await svc.startRound(0)
     const badQty = await svc.placeOrder({ accountId: MM, role: 'market_maker', ...HUGE, qty: 0 })
     expect(badQty.accepted).toBe(false)
-    expect(badQty.reason).toBe('qty must be positive')
+    expect(badQty.reason).toBe('qty must be a whole number of at least 1')
 
     const unknown = await svc.placeOrder({ accountId: MM, role: 'market_maker', ...HUGE, ticker: 'NOPE' })
     expect(unknown.accepted).toBe(false)

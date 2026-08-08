@@ -13,7 +13,7 @@
  * Run: npx tsx server/api.ts   (or `npm run api`)
  */
 
-import { createEventConfig, RoundController } from '@iimb-trading/engine'
+import { createEventConfig, RoundController, type Side } from '@iimb-trading/engine'
 import { createClient, type SupabaseClient } from '@supabase/supabase-js'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { createReadStream, existsSync, statSync } from 'node:fs'
@@ -226,7 +226,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const result = await service.placeOrder({
       accountId: caller.accountId,
       ticker,
-      side: b.side === 'sell' ? 'sell' : 'buy',
+      // Passed through UNCOERCED. Defaulting anything-not-'sell' to 'buy' meant
+      // a typo executed as a real buy; placeOrder rejects anything that is not
+      // exactly 'buy' or 'sell'.
+      side: b.side as Side,
       type,
       price: b.price === undefined || b.price === null ? undefined : Number(b.price),
       qty: Number(b.qty),
