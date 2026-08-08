@@ -754,17 +754,32 @@ function Terminal() {
   useEffect(() => {
     if (!boot || !selected) return
     let alive = true
+    // api.snapshot retries up to 3x with 200ms then 400ms backoff, so a
+    // struggling request can resolve ~2-3s late — after newer ones have already
+    // landed. Two guards keep that from showing as chart stutter:
+    //   inFlight  — setInterval fires regardless of whether the last tick
+    //               finished, so skip a tick while one is still running rather
+    //               than letting retries stack up.
+    //   issued/applied — only accept a response if it is the newest one issued.
+    //               Without this a late reply overwrites fresh data with older
+    //               data, and the chart visibly jumps backward then forward.
+    let inFlight = false
+    let issued = 0
+    let applied = 0
     const tick = async () => {
+      if (inFlight) return
+      inFlight = true
+      const seq = ++issued
       try {
-        // api.snapshot already retries transient blips internally; if it still
-        // throws, the connection is genuinely down for now.
         const s = await api.snapshot(selected, windowSec)
-        if (alive) { setSnap(s); setLive(true) } // recovered / healthy
+        if (alive && seq > applied) { applied = seq; setSnap(s); setLive(true) } // recovered / healthy
       } catch {
         // Keep the last-known snapshot on screen and flag "Reconnecting…"; the
         // next tick (1s) retries. We never blank the terminal or bounce to an
         // error screen mid-event over a transient hiccup.
         if (alive) setLive(false)
+      } finally {
+        inFlight = false
       }
     }
     tick()
