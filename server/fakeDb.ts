@@ -13,6 +13,19 @@ type Row = Record<string, any>
 // Fake Supabase client
 // ---------------------------------------------------------------------------
 
+/**
+ * Order two cell values the way Postgres would for a range filter: dates
+ * compare as time, everything else as-is.
+ */
+function cmp(v: unknown): number | string {
+  if (v instanceof Date) return v.getTime()
+  if (typeof v === 'string') {
+    const t = Date.parse(v)
+    if (!Number.isNaN(t)) return t
+  }
+  return typeof v === 'number' ? v : String(v)
+}
+
 export class FakeQuery implements PromiseLike<{ data: unknown; error: null }> {
   private op: 'select' | 'insert' | 'update' | 'upsert' = 'select'
   private payload: Row | Row[] = {}
@@ -55,6 +68,24 @@ export class FakeQuery implements PromiseLike<{ data: unknown; error: null }> {
     this.filters.push((r) => r[col] !== val)
     return this
   }
+  /** Timestamp/number range filters, as priceHistory and the round reads use. */
+  gte(col: string, val: unknown): this {
+    this.filters.push((r) => cmp(r[col]) >= cmp(val))
+    return this
+  }
+  lte(col: string, val: unknown): this {
+    this.filters.push((r) => cmp(r[col]) <= cmp(val))
+    return this
+  }
+  gt(col: string, val: unknown): this {
+    this.filters.push((r) => cmp(r[col]) > cmp(val))
+    return this
+  }
+  lt(col: string, val: unknown): this {
+    this.filters.push((r) => cmp(r[col]) < cmp(val))
+    return this
+  }
+
   in(col: string, vals: unknown[]): this {
     this.filters.push((r) => vals.includes(r[col]))
     return this
