@@ -1,10 +1,11 @@
-import { type CashPosition, DEFAULT_COMMISSION_RATE } from '@iimb-trading/engine'
+import { type CashPosition, DEFAULT_COMMISSION_RATE, liquidationPrice } from '@iimb-trading/engine'
 import { describe, expect, it } from 'vitest'
 import {
   buildCancelLines,
   buildConfirmLines,
   buildTradeOutcome,
   closingOrderFor,
+  liqLabel,
   type MarketContext,
   type OrderTerms,
   previewPrice,
@@ -440,5 +441,65 @@ describe('the preview P&L follows the BOOK, not the last trade', () => {
     const lines = buildConfirmLines(order({ side: 'sell', type: 'limit', qty: 10, price: 190 }), ctx())
     expect(valueOf(lines, 'Gross P&L')).toBe('+₹8,300')
     expect(valueOf(lines, 'Price')).toBe('$190.00')
+  })
+})
+
+
+describe('Est. Liquidation at 1x — shown only where it can happen', () => {
+  it('is OMITTED for a long: at 1x it liquidates at zero, so the row can never say anything', () => {
+    const lines = buildConfirmLines(
+      order({ side: 'buy', qty: 10, price: 190, closes: false, liq: 0, requiredInr: 157_700 }),
+      ctx({ position: null }),
+    )
+    expect(lines.map((l) => l.k)).not.toContain('Est. Liquidation')
+    expect(liqLabel(false, 0)).toBeNull()
+  })
+
+  it('is SHOWN for a short: at 1x it liquidates if the price doubles', () => {
+    // liquidationPrice({qty: -10, avgPrice: 190, leverage: 1}) = 190 x (1 + 1/1) = 380
+    const lines = buildConfirmLines(
+      order({ side: 'sell', qty: 10, price: 190, closes: false, liq: 380, requiredInr: 157_700 }),
+      ctx({ position: null }),
+    )
+    expect(valueOf(lines, 'Est. Liquidation')).toBe('$380.00')
+  })
+
+  it('the short figure matches the engine exactly', () => {
+    const liq = liquidationPrice({ qty: -10, avgPrice: 190, leverage: 1 })!
+    expect(liq).toBe(380)
+    expect(liqLabel(false, liq)).toBe('$380.00')
+  })
+
+  it('a long at 1x really does compute to zero — the reason it is omitted', () => {
+    expect(liquidationPrice({ qty: 10, avgPrice: 190, leverage: 1 })).toBe(0)
+  })
+
+  it('still says "Flat after close" on a full close', () => {
+    expect(liqLabel(true, null)).toBe('Flat after close')
+    expect(valueOf(buildConfirmLines(order(), ctx()), 'Est. Liquidation')).toBe('Flat after close')
+  })
+
+  it('omits the row rather than printing a bare dash when there is no estimate', () => {
+    expect(liqLabel(false, null)).toBeNull()
+    const lines = buildConfirmLines(order({ closes: false, liq: null }), ctx())
+    expect(lines.map((l) => l.k)).not.toContain('Est. Liquidation')
+  })
+
+  it('a negative estimate is treated as unreachable, not printed', () => {
+    expect(liqLabel(false, -5)).toBeNull()
+  })
+})
+
+describe('the order window is 1x only', () => {
+  it('the confirm dialog reports 1x', () => {
+    expect(valueOf(buildConfirmLines(order({ leverage: 1 }), ctx()), 'Leverage')).toBe('1x')
+  })
+
+  it('margin at 1x is the full notional — no leverage relief', () => {
+    const lines = buildConfirmLines(
+      order({ side: 'buy', qty: 10, price: 200, leverage: 1, closes: false, requiredInr: 10 * 200 * 83, liq: 0 }),
+      ctx({ position: null }),
+    )
+    expect(valueOf(lines, 'Margin Required')).toBe('₹1,66,000')
   })
 })

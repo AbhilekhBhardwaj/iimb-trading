@@ -70,11 +70,20 @@ export interface PlacementResult {
 export const marginLabel = (requiredInr: number): string =>
   requiredInr > 1 ? inr(requiredInr) : '— (frees margin)'
 
-// liq === 0 is mathematically correct and unique to a fully-collateralized 1×
-// long (E·(1 − 1/1) = 0): it can only be liquidated if the stock itself hits $0.
-// Show that explicitly rather than a bare "$0.00" that reads like a bug.
-export const liqLabel = (closes: boolean, liq: number | null): string =>
-  closes ? 'Flat after close' : liq === null ? '—' : liq <= 0 ? 'N/A — fully collateralized' : usd(liq)
+/**
+ * The liquidation row, or null to omit it entirely.
+ *
+ * Now that the platform is 1x-only, a LONG can never be liquidated: the engine
+ * puts it at E·(1 − 1/1) = 0, reachable only if the stock itself hits zero. A
+ * permanent "N/A — fully collateralized" on every long order is noise, so the
+ * row is dropped rather than displayed empty.
+ *
+ * A SHORT is a different matter and the row stays: at 1x it liquidates at
+ * E·(1 + 1/1), i.e. if the price doubles. That is a real, reachable risk and
+ * the one case where this number earns its place.
+ */
+export const liqLabel = (closes: boolean, liq: number | null): string | null =>
+  closes ? 'Flat after close' : liq === null || liq <= 0 ? null : usd(liq)
 
 /**
  * The order that would close a position: SELL a long, BUY a short, for its full
@@ -217,6 +226,7 @@ export function buildConfirmLines(o: OrderTerms, ctx: MarketContext): ConfirmLin
   // loss, and the engine will simply discard the difference.
   const fillable = o.fillableQty ?? o.qty
   const short = fillable < o.qty
+  const liqValue = liqLabel(o.closes, o.liq)
   return [
     { k: 'Instrument', v: o.ticker },
     { k: 'Side', v: o.side.toUpperCase(), tone: o.side === 'buy' ? 'up' : 'destructive' },
@@ -235,7 +245,7 @@ export function buildConfirmLines(o: OrderTerms, ctx: MarketContext): ConfirmLin
     { k: 'Price', v: o.type === 'market' ? `~${usd(o.price)} at execution` : usd(o.price) },
     { k: 'Leverage', v: `${o.leverage}x` },
     { k: 'Margin Required', v: marginLabel(o.requiredInr) },
-    { k: 'Est. Liquidation', v: liqLabel(o.closes, o.liq) },
+    ...(liqValue === null ? [] : [{ k: 'Est. Liquidation', v: liqValue }]),
     // Realized-P&L preview. Closing or reducing shows Gross / Commission / Net;
     // an opening fill shows the commission alone. Empty otherwise.
     ...orderPnlLines(

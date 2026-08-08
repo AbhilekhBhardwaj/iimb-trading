@@ -39,17 +39,11 @@ function Rows({ lines }: { lines: ConfirmLine[] }) {
 }
 
 /** Pre-trade confirmation. Rows come from buildConfirmLines. */
-export function ConfirmDialog({ title, lines, confirmLabel, tone, note, onConfirm, onCancel }: {
+export function ConfirmDialog({ title, lines, confirmLabel, tone, onConfirm, onCancel }: {
   title: string
   lines: ConfirmLine[]
   confirmLabel: string
   tone: 'up' | 'destructive'
-  /**
-   * Optional prose beneath the rows — used by the leverage warning to explain
-   * the mechanism the numbers imply. Rendered in the same bordered block
-   * ResultDialog uses for its slippage note, so the two read alike.
-   */
-  note?: string
   onConfirm: () => void
   onCancel: () => void
 }) {
@@ -57,9 +51,6 @@ export function ConfirmDialog({ title, lines, confirmLabel, tone, note, onConfir
     <Overlay onClose={onCancel}>
       <h3 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>{title}</h3>
       <Rows lines={lines} />
-      {note && (
-        <p className="mt-4 rounded-lg border border-white/10 bg-white/[0.03] p-3 text-[12px] leading-relaxed text-muted">{note}</p>
-      )}
       <div className="mt-6 flex gap-2">
         <button onClick={onCancel} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Cancel</button>
         <button onClick={onConfirm}

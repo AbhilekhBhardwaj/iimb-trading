@@ -5,17 +5,6 @@ import { applyLeveredFill, DEFAULT_COMMISSION_RATE, liquidationPrice, requiredMa
 import { CARD, CARD_SHADOW, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
 import { toCashPosition } from '../../lib/orderConfirm'
 import { depthCountLabel, spreadScrollTop } from '../../lib/depthLadder'
-import {
-  cancelLeverage,
-  confirmLeverage,
-  INITIAL_LEVERAGE,
-  isDangerLeverage,
-  LEVERAGE_LEVELS,
-  type LeverageSelection,
-  leverageWarningLines,
-  leverageWarningText,
-  selectLeverage,
-} from '../../lib/leverage'
 import { buildConfirmLines, buildTradeOutcome, estimateFill, type MarketContext, previewPrice } from '../../lib/orderFlow'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
@@ -195,12 +184,10 @@ function OrderWindow({ ticker, row, roundActive, rate, depth, onConfirmPlace }: 
   const [qtyStr, setQtyStr] = useState('10')
   const [priceStr, setPriceStr] = useState('')
   const [alertMsg, setAlertMsg] = useState<string | null>(null)
-  // Leverage lives as {applied, pending}: 1x-5x apply on click, 6x/7x stage a
-  // pending choice that only becomes `applied` once the warning is confirmed.
-  // Everything below reads `applied`, so an order placed while the warning is
-  // open still goes out at the OLD leverage.
-  const [lev, setLev] = useState<LeverageSelection>(INITIAL_LEVERAGE)
-  const leverage = lev.applied
+  // The platform trades at 1x only. Leverage stays a first-class concept below
+  // the UI — DB columns, margin math and liquidation formulas are intact and
+  // tested — but no control exposes it, so every order goes out unlevered.
+  const leverage = 1
 
   const qtyInputRef = useRef<HTMLInputElement>(null)
   const priceInputRef = useRef<HTMLInputElement>(null)
@@ -298,35 +285,6 @@ function OrderWindow({ ticker, row, roundActive, rate, depth, onConfirmPlace }: 
             })}
           </div>
 
-          {/* Leverage. A sibling of the Qty/Price block, NOT inside it — the
-              stretched Limit/Market column depends on that container's exact
-              geometry. 6x/7x carry a red tint at rest to mark the tier before
-              anyone clicks, and STAY red when selected: an armed dangerous
-              level must never read as a normal, safe state. */}
-          <div className="pt-0.5">
-            <span className="block text-[9px] uppercase leading-none tracking-[0.14em] text-subtle">Leverage</span>
-            <div className="mt-1 grid grid-cols-7 gap-1">
-              {LEVERAGE_LEVELS.map((lv) => {
-                const on = leverage === lv
-                const danger = isDangerLeverage(lv)
-                const cls = danger
-                  ? on
-                    ? 'border-destructive/60 bg-destructive/15 text-destructive'
-                    : 'border-destructive/30 bg-destructive/[0.06] text-destructive/70 hover:bg-destructive/10'
-                  : on
-                    ? 'border-[#E8C46A]/50 bg-[#E8C46A]/10 text-[#E8C46A]'
-                    : 'border-white/10 bg-white/[0.02] text-muted hover:bg-white/[0.04]'
-                return (
-                  <button key={lv} onClick={() => setLev((prev) => selectLeverage(prev, lv))}
-                    aria-pressed={on}
-                    className={`rounded-md border py-1 font-mono text-[10px] leading-none tabular-nums transition-colors ${cls}`}>
-                    {lv}x
-                  </button>
-                )
-              })}
-            </div>
-          </div>
-
           {/* Qty/Price and the submit button share a left column so the
               Limit/Market toggles can stretch down the full height of BOTH rows
               rather than just the input row — which also pulls the submit button
@@ -372,20 +330,6 @@ function OrderWindow({ ticker, row, roundActive, rate, depth, onConfirmPlace }: 
           </div>
         </div>
       </Panel>
-
-      {/* Danger-zone gate. Until Confirm is pressed `lev.applied` is untouched,
-          so cancelling genuinely reverts rather than merely hiding the dialog. */}
-      {lev.pending !== null && (
-        <ConfirmDialog
-          title="High Leverage Warning"
-          tone="destructive"
-          confirmLabel={`Use ${lev.pending}x Leverage`}
-          onCancel={() => setLev((prev) => cancelLeverage(prev))}
-          onConfirm={() => setLev((prev) => confirmLeverage(prev))}
-          lines={leverageWarningLines(lev.pending, { side, price: px, qty: qtyNum, usdInrRate: rate })}
-          note={leverageWarningText(lev.pending)}
-        />
-      )}
 
       {alertMsg && (
         <Overlay onClose={dismissAlert}>
@@ -827,9 +771,11 @@ function Terminal() {
 
       <div className="grid min-h-0 flex-1 grid-cols-2 gap-4 p-4">
         {/* LEFT column: instruments / order / screener */}
-        {/* Screener gains ~25px of allocation; the Instrument List gives up
-            ~9-16px. It keeps every row at full height and scrolls as before. */}
-        <div className="grid min-h-0 grid-rows-[minmax(0,1.35fr)_auto_minmax(0,0.9fr)] gap-4">
+        {/* Back to the pre-leverage split now the pill row is gone: the height
+            it needed came out of the Instrument List, so that is where it
+            returns. The Screener keeps its internal tightening, which was an
+            independent win. */}
+        <div className="grid min-h-0 grid-rows-[minmax(0,1.45fr)_auto_minmax(0,0.8fr)] gap-4">
           <InstrumentList rows={rows} selected={selected} onSelect={setSelected} />
           <OrderWindow ticker={selected} row={row} roundActive={roundActive}
             rate={snap?.rate ?? 83} depth={snap?.depth ?? null} onConfirmPlace={setPending} />
