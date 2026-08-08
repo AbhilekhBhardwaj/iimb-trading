@@ -813,6 +813,7 @@ export class TradingService {
     cleared.accountsReset = (reset ?? []).length
 
     // --- 3. Audit, written AFTER the wipe so it survives ---------------------
+    this.startingCashCache.clear() // balances may legitimately change on reset
     await this.log(caller.accountId, 'event_reset', 'warning', { ...cleared })
     return { applied: true, cleared }
   }
@@ -1141,7 +1142,9 @@ export class TradingService {
    * only an account's own orders queue, and only for as long as one takes.
    */
   async placeOrder(input: PlaceOrderInput): Promise<PlaceOrderResult> {
-    return this.serializeAccountOp(input.accountId, () => this.placeOrderInner(input))
+    return this.serializeAccountOp(input.accountId, () =>
+      this.withBatchedLogs(() => this.placeOrderInner(input)),
+    )
   }
 
   /**
@@ -1202,7 +1205,10 @@ export class TradingService {
       return this.reject(input, 'no_reference_price', { code: 'no_reference_price' })
     }
     const rate = this.rateInr()
-    const existing = await this.cashPosition(input.accountId, instrumentId)
+    // ONE positions read for both the instrument's position and total posted
+    // margin, instead of two selects against the same table for this account.
+    const positionRows = await this.accountPositionRows(input.accountId)
+    const existing = this.cashPositionFrom(positionRows, instrumentId)
     const signedQty = input.side === 'buy' ? input.qty : -input.qty
     // Cash this order needs is exactly the cash it would move, negated: margin
     // posted less margin released less P&L realized. Opens/adds require cash;
@@ -1216,7 +1222,7 @@ export class TradingService {
     // starting_cash: a large balance is still a finite cap, and provisioning
     // rewrites starting_cash, so the exemption would silently disappear.
     if (!hasUnlimitedBuyingPower(input.role)) {
-      const availableInr = await this.availableCashInr(input.accountId)
+      const availableInr = await this.availableCashInr(input.accountId, positionRows)
       if (requiredInr > availableInr + EPS) {
         return this.reject(input, 'insufficient_margin', {
           code: 'insufficient_margin',
@@ -1301,7 +1307,7 @@ export class TradingService {
       affected.add(t.buyOrderId)
       affected.add(t.sellOrderId)
     }
-    for (const id of affected) await this.syncOrderState(id)
+    await this.syncOrderStates([...affected])
 
     return {
       accepted: true,
@@ -2284,6 +2290,51 @@ export class TradingService {
    * Carries the fixed INR basis alongside the USD entry price (the latter still
    * feeds liquidation math, which stays a USD risk measure).
    */
+  /**
+   * Every position row for an account, in ONE read.
+   *
+   * placeOrder needs both the position in the instrument being traded AND the
+   * margin posted across all of them. Those were two separate selects against
+   * the same table for the same account; the second is a superset of the first,
+   * so one read now serves both. Same rows, same numbers, one round-trip fewer.
+   */
+  private async accountPositionRows(accountId: string): Promise<Record<string, unknown>[]> {
+    const { data, error } = await this.db
+      .from('positions')
+      .select('instrument_id, qty, avg_price, leverage, notional_basis_inr')
+      .eq('account_id', accountId)
+    if (error) throw error
+    return (data ?? []) as Record<string, unknown>[]
+  }
+
+  /** The instrument's position, taken from an already-fetched row set. */
+  private cashPositionFrom(rows: Record<string, unknown>[], instrumentId: string): CashPosition {
+    const r = rows.find((x) => x.instrument_id === instrumentId)
+    return r
+      ? {
+          qty: Number(r.qty),
+          avgPrice: Number(r.avg_price),
+          notionalBasisInr: Number(r.notional_basis_inr),
+          leverage: Number(r.leverage),
+        }
+      : { qty: 0, avgPrice: 0, notionalBasisInr: 0, leverage: 1 }
+  }
+
+  /** Posted margin across a row set. Mirrors postedMarginTotalInr exactly. */
+  private postedMarginFrom(rows: Record<string, unknown>[]): number {
+    return rows.reduce(
+      (a, p) =>
+        a +
+        postedMarginInr({
+          qty: Number(p.qty),
+          avgPrice: 0, // unused by postedMarginInr
+          notionalBasisInr: Number(p.notional_basis_inr),
+          leverage: Number(p.leverage),
+        }),
+      0,
+    )
+  }
+
   private async cashPosition(accountId: string, instrumentId: string): Promise<CashPosition> {
     const { data, error } = await this.db
       .from('positions')
@@ -2342,10 +2393,14 @@ export class TradingService {
    * − margin reserved by resting orders. There is no unrealized term: a held
    * position contributes only the cash it has locked up.
    */
-  private async availableCashInr(accountId: string): Promise<number> {
+  private async availableCashInr(
+    accountId: string,
+    /** Pre-fetched position rows, to avoid re-reading what the caller has. */
+    rows?: Record<string, unknown>[],
+  ): Promise<number> {
     const startingInr = await this.startingCashInr(accountId)
     const realizedInr = this.realizedPnlInr.get(accountId) ?? 0
-    const marginUsedInr = await this.postedMarginTotalInr(accountId)
+    const marginUsedInr = rows ? this.postedMarginFrom(rows) : await this.postedMarginTotalInr(accountId)
     return startingInr + realizedInr - marginUsedInr - this.reservedMarginInr(accountId)
   }
 
@@ -2369,17 +2424,48 @@ export class TradingService {
     )
   }
 
+  /**
+   * Opening balance, cached for the life of the process.
+   *
+   * starting_cash is written only by provisioning — the trading service never
+   * touches it (verified across the whole file) — so re-reading it on every
+   * margin check was a round-trip for a constant. resetEvent clears the cache,
+   * which is the only moment it can legitimately change under a running server.
+   */
+  private readonly startingCashCache = new Map<string, number>()
+
   private async startingCashInr(accountId: string): Promise<number> {
+    const cached = this.startingCashCache.get(accountId)
+    if (cached !== undefined) return cached
     const { data, error } = await this.db
       .from('profiles')
       .select('starting_cash')
       .eq('id', accountId)
       .single()
     if (error || !data) throw error ?? new Error(`no profile for ${accountId}`)
-    return Number(data.starting_cash)
+    const value = Number(data.starting_cash)
+    this.startingCashCache.set(accountId, value)
+    return value
   }
 
   /** Push an order's current in-engine state (status, remaining) to its DB row. */
+  /**
+   * Push several orders' states CONCURRENTLY instead of one after another.
+   *
+   * A fill touches both sides, so this was two sequential round-trips on the
+   * critical path; now it is one round-trip of wall time.
+   *
+   * Deliberately parallel UPDATEs rather than a single multi-row upsert. An
+   * upsert carrying only id/status/remaining_qty would attempt an INSERT if a
+   * row were ever missing, and orders has NOT NULL columns it would not be
+   * supplying. These are independent rows keyed by primary key, so running the
+   * same updates concurrently is safe and changes no semantics. This touches
+   * order metadata only — never position or cash write ordering.
+   */
+  private async syncOrderStates(orderIds: readonly string[]): Promise<void> {
+    await Promise.all(orderIds.map((id) => this.syncOrderState(id)))
+  }
+
   private async syncOrderState(orderId: string): Promise<void> {
     const o = this.orders.get(orderId)
     if (!o) return
@@ -2437,9 +2523,57 @@ export class TradingService {
     severity: Severity,
     payload: Record<string, unknown>,
   ): Promise<void> {
-    const { error } = await this.db
-      .from('event_log')
-      .insert({ account_id: accountId, event_type: eventType, payload, severity })
+    const row = { account_id: accountId, event_type: eventType, payload, severity }
+    // Inside a batch, collect instead of writing: a filled order used to emit
+    // five separate event_log inserts (order_placed, two order_matched, two
+    // commission_charged), each its own round-trip on the critical path. They
+    // are pure audit and nothing reads them mid-order, so one multi-row insert
+    // is identical in outcome and four round-trips cheaper.
+    if (this.logBatch) {
+      this.logBatch.push(row)
+      return
+    }
+    const { error } = await this.db.from('event_log').insert(row)
+    if (error) throw error
+  }
+
+  /** Rows collected while a batch is open; null when logging writes directly. */
+  private logBatch: Record<string, unknown>[] | null = null
+
+  /**
+   * Run `fn` with event_log writes batched into a single insert at the end.
+   *
+   * The flush happens even if `fn` throws, so a failed order still leaves its
+   * audit trail — that is the whole point of the log. Nested calls share the
+   * outermost batch rather than flushing early.
+   */
+  private async withBatchedLogs<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.logBatch) return fn() // already inside a batch
+    const batch: Record<string, unknown>[] = []
+    this.logBatch = batch
+
+    let result: T
+    try {
+      result = await fn()
+    } catch (err) {
+      // Flush what was collected, then rethrow the ORIGINAL failure. Never throw
+      // from the flush here: a logging problem must not replace the real error,
+      // which is what a `throw` inside `finally` would silently do.
+      this.logBatch = null
+      await this.flushLogs(batch).catch(() => undefined)
+      throw err
+    }
+
+    // Success path: a flush failure DOES surface, matching the unbatched
+    // behaviour where a failed audit write failed the operation.
+    this.logBatch = null
+    await this.flushLogs(batch)
+    return result
+  }
+
+  private async flushLogs(batch: Record<string, unknown>[]): Promise<void> {
+    if (batch.length === 0) return
+    const { error } = await this.db.from('event_log').insert(batch)
     if (error) throw error
   }
 }

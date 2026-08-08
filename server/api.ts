@@ -156,6 +156,37 @@ function serveStatic(res: ServerResponse, path: string): void {
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
+/**
+ * Sign in, retrying a RATE-LIMIT response with exponential backoff and jitter.
+ *
+ * Every login now originates from this one server rather than 50 separate
+ * browsers, which is exactly what a per-IP limiter penalises — 7 of 50
+ * simultaneous logins failed under load test. Only 429 (and Supabase's
+ * over_request_rate / rate limit wording) is retried: a wrong password must
+ * fail immediately, not three times slowly.
+ *
+ * Jitter matters more than the delay here. Without it, 50 clients rejected at
+ * the same instant all retry at the same instant and collide again.
+ */
+async function signInWithRetry(
+  email: string,
+  password: string,
+  attempts = 3,
+): Promise<Awaited<ReturnType<typeof anon.auth.signInWithPassword>>> {
+  let last!: Awaited<ReturnType<typeof anon.auth.signInWithPassword>>
+  for (let i = 0; i < attempts; i++) {
+    last = await anon.auth.signInWithPassword({ email, password })
+    if (!last.error) return last
+    const status = (last.error as { status?: number }).status
+    const rateLimited = status === 429 || /rate limit|over_request_rate|too many/i.test(last.error.message)
+    if (!rateLimited || i === attempts - 1) return last
+    // 250ms, then 600ms, each with up to 40% jitter.
+    const base = i === 0 ? 250 : 600
+    await new Promise((r) => setTimeout(r, base + Math.random() * base * 0.4))
+  }
+  return last
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const url = new URL(req.url ?? '/', `http://localhost:${PORT}`)
   const path = url.pathname
@@ -191,10 +222,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       const password = String(b.password ?? '')
       if (!username || !password) return json(res, 400, { error: 'username and password are required' })
 
-      const { data, error } = await anon.auth.signInWithPassword({
-        email: usernameToEmail(username),
-        password,
-      })
+      const { data, error } = await signInWithRetry(usernameToEmail(username), password)
       // Deliberately one generic message for both a bad username and a bad
       // password, so this cannot be used to enumerate accounts.
       if (error || !data.user || !data.session) return json(res, 401, { error: 'invalid credentials' })
