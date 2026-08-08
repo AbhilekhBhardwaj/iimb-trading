@@ -13,6 +13,7 @@ import { ConfirmDialog, Overlay, RejectDialog, type RejectionResult, ResultDialo
 import { Panel } from '../components/Panel'
 import PriceChart from './PriceChart'
 import { CANDLE_SPAN, DOWN, intervalOf, type TF, UP, usd } from './terminalShared'
+import { roundLabel } from '../../lib/format'
 import {
   api,
   type Bootstrap,
@@ -83,7 +84,14 @@ function RoundBar({ snap, username, role, live, onSignOut }: {
         )}
         {active ? (
           <>
-            <span className="flex items-center gap-1.5 text-up"><PulseDot color={UP} />ROUND {(r!.index ?? 0) + 1}</span>
+            {/* roundLabel, NOT index + 1. `index` is 0-based across the whole
+                schedule INCLUDING the mock round (mock-1 -> 0, real-1 -> 1), so
+                index + 1 numbered real-11 as "ROUND 12" while the Master, which
+                reads the round id, showed "Round 11". One source of truth, and
+                it names a mock round as a mock round. */}
+            <span className="flex items-center gap-1.5 text-up">
+              <PulseDot color={UP} />{r!.id ? roundLabel(r!.id).toUpperCase() : 'ROUND —'}
+            </span>
             <span className="text-muted uppercase">{r!.mode?.replace(/_/g, ' ')}</span>
             <span className={r!.commissionEnabled ? 'text-[#E8C46A]' : 'text-subtle'}>
               COMMISSION {r!.commissionEnabled ? 'ON' : 'OFF'}
