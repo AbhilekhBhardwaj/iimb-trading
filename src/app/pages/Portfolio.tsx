@@ -362,6 +362,17 @@ function Portfolio() {
               </table>
             </div>
           )}
+          {/* Scoring consequence, stated where the positions are. Amber and
+              inline rather than a modal or a red alert: it is a deadline to plan
+              around, not an error — the same treatment as the "Round is live"
+              notice on the Master's Settlement Rate card. Shown even with no
+              open positions, since the point is to be read BEFORE one is
+              opened. */}
+          <p className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/[0.07] px-3 py-2 text-[12px] leading-relaxed text-muted">
+            <span className="font-semibold text-amber-300">Your final score is based on CLOSED trades only.</span>{' '}
+            Any position still open when the event ends will NOT count toward your final P&amp;L — close it
+            before time runs out if you want it to count.
+          </p>
         </section>
 
         {/* SECTION 2 — Working Orders. Sits between positions and history because
