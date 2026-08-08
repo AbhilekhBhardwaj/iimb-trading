@@ -8,15 +8,15 @@ import { api, type InventoryRow, type OrderType, type Portfolio as PortfolioData
 import { ConfirmDialog, Overlay, RejectDialog, type RejectionResult, ResultDialog, type TradeResult } from '../components/OrderDialogs'
 import { toCashPosition } from '../../lib/orderConfirm'
 import { buildCancelLines, buildConfirmLines, buildTradeOutcome, closingOrderFor, type MarketContext, type OrderTerms } from '../../lib/orderFlow'
-import { usd } from '../../lib/format'
+import { istDateTime, usd } from '../../lib/format'
 import { analytics } from '../../lib/analytics'
 
 const inrFmt = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 })
 const inr = (v: number) => inrFmt.format(v)
 const inrSigned = (v: number) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${inrFmt.format(Math.abs(v))}`
 const num = (v: number, d = 2) => v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })
-const dtLabel = (t: number) =>
-  new Date(t).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+// IST, pinned. History rows can span days, so the date stays in the label.
+const dtLabel = (t: number) => istDateTime(t)
 
 function fmtXirr(x: number | null): string {
   if (x === null || !Number.isFinite(x)) return '—'

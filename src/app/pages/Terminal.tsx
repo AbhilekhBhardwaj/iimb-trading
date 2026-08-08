@@ -13,7 +13,7 @@ import { ConfirmDialog, Overlay, RejectDialog, type RejectionResult, ResultDialo
 import { Panel } from '../components/Panel'
 import PriceChart from './PriceChart'
 import { CANDLE_SPAN, DOWN, intervalOf, type TF, UP, usd } from './terminalShared'
-import { roundLabel } from '../../lib/format'
+import { istTime, roundLabel } from '../../lib/format'
 import {
   api,
   type Bootstrap,
@@ -38,7 +38,9 @@ import { analytics } from '../../lib/analytics'
 // ---------------------------------------------------------------------------
 // Formatters
 // ---------------------------------------------------------------------------
-const clockHMS = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { hour12: false })
+// IST, pinned — not the machine's locale. A laptop set to another zone would
+// otherwise show a team the wrong time for their own fills.
+const clockHMS = (ms: number) => istTime(ms)
 function mmss(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds))
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`

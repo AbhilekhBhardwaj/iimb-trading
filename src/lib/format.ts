@@ -64,3 +64,65 @@ export function roundLabel(id: string): string {
   if (real) return `Round ${real[1]}`
   return id
 }
+
+// ---------------------------------------------------------------------------
+// Time display — IST
+// ---------------------------------------------------------------------------
+
+/**
+ * The event runs in Bangalore, so every time a team reads must be IST.
+ *
+ * Storage and every calculation stay in UTC — trades carry UTC timestamps, the
+ * engine buckets on UTC epoch seconds, and nothing here changes that. This is
+ * strictly a display layer.
+ *
+ * Pinned to Asia/Kolkata rather than the machine's locale on purpose: a laptop
+ * with its clock set to another zone would otherwise show a team the wrong time
+ * for their own fills. India observes no DST (verified: +5:30 in both January
+ * and July), so the offset is constant all year.
+ */
+const IST = 'Asia/Kolkata'
+
+/** `14:32:07` in IST. */
+export function istTime(ms: number, withSeconds = true): string {
+  if (!Number.isFinite(ms)) return '—'
+  return new Date(ms).toLocaleTimeString('en-GB', {
+    timeZone: IST,
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    ...(withSeconds ? { second: '2-digit' } : {}),
+  })
+}
+
+/** `08 Aug 14:32:07` in IST, for rows that can span days. */
+export function istDateTime(ms: number): string {
+  if (!Number.isFinite(ms)) return '—'
+  // en-GB renders "08 Aug, 14:32:07"; drop the comma for a tighter table cell.
+  return new Date(ms).toLocaleString('en-GB', {
+    timeZone: IST,
+    hour12: false,
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).replace(',', '')
+}
+
+/**
+ * Axis/crosshair label for lightweight-charts, which takes epoch SECONDS and
+ * would otherwise render them in UTC — it has no timezone support of its own.
+ *
+ * The candle's `time` value is left as true UTC epoch seconds; only the label
+ * is translated. That matters because the series must stay monotonically
+ * increasing in real time, and because shifting the values themselves is the
+ * common workaround that quietly corrupts the data.
+ *
+ * IST is +5:30, i.e. 19,800s, which divides every interval the chart offers
+ * (60/120/300/600), so a UTC bucket boundary is also an IST bucket boundary and
+ * labels land on round times.
+ */
+export function istChartTime(epochSeconds: number, withSeconds = false): string {
+  return istTime(epochSeconds * 1000, withSeconds)
+}

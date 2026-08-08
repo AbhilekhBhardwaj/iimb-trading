@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { motion } from 'motion/react'
 import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD, INPUT, MOTION } from '../../lib/design-patterns'
-import { roundLabel } from '../../lib/format'
+import { istTime, roundLabel } from '../../lib/format'
 import * as session from '../../lib/session'
 import {
   api,
@@ -20,7 +20,8 @@ const inr = (v: number) => inrFmt.format(v)
 const inrSigned = (v: number) => `${v > 0 ? '+' : v < 0 ? '−' : ''}${inrFmt.format(Math.abs(v))}`
 const num = (v: number, d = 2) => v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })
 const mmss = (s: number) => `${Math.floor(Math.max(0, s) / 60)}:${String(Math.floor(Math.max(0, s) % 60)).padStart(2, '0')}`
-const clock = (t: number) => new Date(t).toLocaleTimeString('en-GB', { hour12: false })
+// IST, pinned — the master's clock must agree with what teams see.
+const clock = (t: number) => istTime(t)
 const toneClass = (v: number) => (v > 0 ? 'text-up' : v < 0 ? 'text-destructive' : 'text-foreground')
 
 const KINDS = [

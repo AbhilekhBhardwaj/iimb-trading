@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { buildCandles, chartAction, visibleRange } from '../../lib/chartSync'
+import { istChartTime } from '../../lib/format'
 import {
   CandlestickSeries,
   ColorType,
@@ -81,10 +82,19 @@ export default function PriceChart({ snap, ticker, ltp, tf, onTf }: {
       // Fixed bar width: each candle is a constant ~8px regardless of how many
       // exist, so a single candle is a THIN candle, never a full-width block.
       // No fitContent() anywhere — that's what stretched one bar across the chart.
+      // lightweight-charts has no timezone support and renders epoch times in
+      // UTC, which put every candle 5:30 behind local time. The candle VALUES
+      // stay true UTC epoch seconds — only the labels are translated to IST.
+      localization: {
+        // Crosshair readout: seconds included, since it names one exact bar.
+        timeFormatter: (t: number) => istChartTime(t, true),
+      },
       timeScale: {
         borderColor: 'rgba(255,255,255,0.08)',
         timeVisible: true,
         secondsVisible: false,
+        // Axis ticks: no seconds, matching secondsVisible above.
+        tickMarkFormatter: (t: number) => istChartTime(t),
         barSpacing: 12,
         minBarSpacing: 2,
         maxBarSpacing: 24, // a lone candle can never stretch into a giant block
