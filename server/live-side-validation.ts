@@ -13,6 +13,18 @@ import { usernameToEmail } from '../src/lib/accounts'
 
 const API = 'https://iimb-tradingengine-production.up.railway.app'
 
+/** Just enough of each response to reason about; the rest is printed raw. */
+interface OrderResponse {
+  accepted?: boolean
+  reason?: string
+  orderId?: string
+  rejection?: { code?: string }
+}
+interface PortfolioResponse {
+  workingOrders?: unknown[]
+  openPositions?: number
+}
+
 function lines(path: string): string[] {
   return readFileSync(path, 'utf8').split('\n').map((l) => l.replace('\r', ''))
 }
@@ -41,7 +53,7 @@ const H = {
   'content-type': 'application/json',
 }
 
-const before = await (await fetch(`${API}/api/portfolio`, { headers: H })).json()
+const before = (await (await fetch(`${API}/api/portfolio`, { headers: H })).json()) as PortfolioResponse
 console.log(`account          ${username} (${auth.user!.id})`)
 console.log(`working orders   ${before.workingOrders?.length ?? 0}`)
 console.log(`open positions   ${before.openPositions}`)
@@ -50,20 +62,26 @@ console.log(`open positions   ${before.openPositions}`)
 const body = { ticker: 'AAPL', side: 'hold', type: 'limit', price: 1, qty: 1, leverage: 1 }
 console.log(`\nPOST /api/orders  ${JSON.stringify(body)}`)
 const res = await fetch(`${API}/api/orders`, { method: 'POST', headers: H, body: JSON.stringify(body) })
-const out = await res.json()
+const out = (await res.json()) as OrderResponse
 console.log(`HTTP ${res.status}`)
 console.log(JSON.stringify(out, null, 2))
 
 // ---- Did anything actually happen? ----------------------------------------
-const after = await (await fetch(`${API}/api/portfolio`, { headers: H })).json()
+const after = (await (await fetch(`${API}/api/portfolio`, { headers: H })).json()) as PortfolioResponse
 console.log(`\nworking orders   ${before.workingOrders?.length ?? 0} -> ${after.workingOrders?.length ?? 0}`)
 console.log(`open positions   ${before.openPositions} -> ${after.openPositions}`)
 
-console.log(
-  out.accepted === false && out.rejection?.code === 'invalid_side'
-    ? '\nPASS - rejected as invalid_side, nothing placed'
-    : '\nFAIL - the fix is NOT live on the deployed server',
-)
+// The round gate is check #1 and the side check is #2, so with no active round
+// the server answers `no_active_round` and this proves nothing either way. Say
+// so, rather than reporting a FAIL the server did not earn — that exact false
+// negative was reported as a regression once already.
+const verdict =
+  out.rejection?.code === 'no_active_round'
+    ? 'INCONCLUSIVE - no active round, so the round gate answered before the side check. Re-run during a round.'
+    : out.accepted === false && out.rejection?.code === 'invalid_side'
+      ? 'PASS - rejected as invalid_side, nothing placed'
+      : 'FAIL - the fix is NOT live on the deployed server'
+console.log(`\n${verdict}`)
 
 // ---- Clean up if the old behaviour created something ----------------------
 if (out.accepted && out.orderId) {
