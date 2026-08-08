@@ -26,3 +26,6 @@ scripts/output/
 *.njsproj
 *.sln
 *.sw?
+
+# Competition data book — fundamentals teams must not read ahead of the reveal.
+data/

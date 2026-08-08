@@ -64,6 +64,14 @@ export interface InstrumentRow {
   position: PositionView | null
 }
 
+/** One fundamentals data point. periodIndex 0 = Base, N = PN. */
+export interface FundamentalPoint {
+  ticker: string
+  metric: string
+  periodIndex: number
+  value: number
+}
+
 export interface DepthLevel {
   price: number
   /** TOTAL resting quantity at this price, across every account. */
@@ -526,6 +534,9 @@ export const api = {
   placeOrder: (input: PlaceOrderInput) => post<PlaceOrderResult>('/orders', input),
   cancelOrder: (orderId: string) => post<{ cancelled: boolean }>('/orders/cancel', { orderId }),
   portfolio: async () => normalizePortfolio(await get<Portfolio>('/portfolio')),
+  /** Revealed fundamentals for one instrument. The server applies the round gate. */
+  fundamentals: async (ticker: string) =>
+    (await get<{ points: FundamentalPoint[] }>(`/fundamentals?ticker=${encodeURIComponent(ticker)}`)).points ?? [],
 
   // Market-maker only. Both 403 for any other role.
   /** Positions currently past their liquidation threshold. Read-only. */

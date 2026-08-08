@@ -48,6 +48,7 @@ import {
   type Trade,
 } from '@iimb-trading/engine'
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { type FundamentalPoint, revealedThroughPeriod } from '../src/lib/fundamentals'
 import { randomUUID } from 'node:crypto'
 import { MAINTENANCE_MARGIN_RATE, USD_INR } from './config'
 
@@ -1778,6 +1779,31 @@ export class TradingService {
         (event.partial ? ` ${qty - filledQty} could not be filled — the book was too thin.` : ''),
     )
     return event
+  }
+
+  /**
+   * Fundamentals for one instrument, gated to what the current round reveals.
+   *
+   * The gate is applied HERE, server-side, and the query never returns an
+   * unrevealed period — so no future data reaches the client to be found in a
+   * network tab. Round N reveals period N, uncapped: the schedule-extension
+   * feature can mint real-21 and beyond and this keeps pace with no change.
+   */
+  async fundamentals(ticker: string): Promise<FundamentalPoint[]> {
+    const through = revealedThroughPeriod(this.activeRoundId)
+    const { data, error } = await this.db
+      .from('fundamentals')
+      .select('ticker, metric, period_index, value')
+      .eq('ticker', ticker)
+      .lte('period_index', through)
+      .order('period_index', { ascending: true })
+    if (error) throw error
+    return (data ?? []).map((r) => ({
+      ticker: r.ticker as string,
+      metric: r.metric as string,
+      periodIndex: Number(r.period_index),
+      value: Number(r.value),
+    }))
   }
 
   /** Publish an event-wide notification (Master Terminal / testing). */

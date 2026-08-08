@@ -6,6 +6,7 @@ import { CARD, CARD_SHADOW, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../..
 import { toCashPosition } from '../../lib/orderConfirm'
 import { depthCountLabel, spreadScrollTop } from '../../lib/depthLadder'
 import { buildLiquidationLines, closingSide, hasCrossed, liquidationWarning, pastLabel } from '../../lib/liquidationPanel'
+import { formatValue, metricRowsFor, periodColumns, periodLabel, valueAt } from '../../lib/fundamentals'
 import { buildConfirmLines, buildTradeOutcome, estimateFill, type MarketContext, previewPrice } from '../../lib/orderFlow'
 import * as session from '../../lib/session'
 import { NotificationStrip } from '../components/NotificationStrip'
@@ -18,6 +19,7 @@ import {
   api,
   type Bootstrap,
   type DepthView,
+  type FundamentalPoint,
   type LiquidatableRow,
   type InstrumentRow,
   type Notification,
@@ -435,7 +437,105 @@ function RiskPanel({ rows, busy, onClose }: {
 // ---------------------------------------------------------------------------
 // Left 3 — screener (placeholder fundamentals)
 // ---------------------------------------------------------------------------
+/**
+ * Fundamentals for the selected instrument, as an overlay.
+ *
+ * An overlay rather than an in-place expansion on purpose: the table is five
+ * metrics wide by up to twenty-one period columns, and the left column of the
+ * terminal is far too narrow to show that without cramped horizontal scrolling.
+ * Rendering over the top also means the terminal layout is never touched, so
+ * closing restores it exactly by construction — there is nothing to restore.
+ *
+ * Periods come from the server already gated to the current round; this
+ * component never sees an unrevealed one.
+ */
+function FundamentalsModal({ row, onClose }: { row: InstrumentRow; onClose: () => void }) {
+  const [points, setPoints] = useState<FundamentalPoint[] | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    setPoints(null)
+    setFailed(false)
+    api
+      .fundamentals(row.ticker)
+      .then((p) => alive && setPoints(p))
+      .catch(() => alive && setFailed(true))
+    return () => { alive = false }
+  }, [row.ticker])
+
+  // Esc to close, matching every other dialog in the app.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const cols = points ? periodColumns(points) : []
+  const rows = points ? metricRowsFor(points) : []
+
+  return (
+    <Overlay onClose={onClose} maxWidth="max-w-5xl">
+      <div className="flex items-baseline justify-between gap-4">
+        <h3 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>
+          {row.ticker} <span className="text-[13px] text-subtle" style={{ font: 'inherit' }}>· {row.name}</span>
+        </h3>
+        <span className="text-[11px] uppercase tracking-[0.16em] text-subtle">Fundamentals</span>
+      </div>
+
+      {failed ? (
+        <p className="mt-6 text-sm text-muted">Could not load fundamentals. Close and try again.</p>
+      ) : points === null ? (
+        <p className="mt-6 text-sm text-subtle">Loading…</p>
+      ) : cols.length === 0 ? (
+        <p className="mt-6 text-sm text-muted">No fundamentals published for {row.ticker}.</p>
+      ) : (
+        <>
+          {/* Scrolls only if the event runs long enough to reveal many periods;
+              at Base + a handful it fits without any scrollbar at all. */}
+          <div className="mt-4 max-h-[60vh] overflow-auto">
+            <table className="w-full border-collapse text-[12px]">
+              <thead>
+                <tr className="border-b border-white/[0.08] text-[10px] uppercase tracking-wider text-subtle">
+                  <th className="sticky left-0 z-10 bg-[#0b0b0b] py-2 pr-4 text-left font-medium">Metric</th>
+                  {cols.map((c) => (
+                    <th key={c} className="px-3 py-2 text-right font-medium tabular-nums">{periodLabel(c)}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody className="font-mono tabular-nums">
+                {rows.map((m) => (
+                  <tr key={m.key} className="border-b border-white/[0.04]">
+                    <th className="sticky left-0 z-10 bg-[#0b0b0b] py-2 pr-4 text-left font-sans font-normal text-muted">
+                      {m.label} <span className="text-subtle">({m.unit})</span>
+                    </th>
+                    {cols.map((c) => (
+                      <td key={c} className="px-3 py-2 text-right text-foreground">
+                        {formatValue(m.key, valueAt(points, m.key, c))}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-3 text-[11px] text-subtle">
+            Revealed through <span className="text-muted">{periodLabel(cols[cols.length - 1])}</span>. Each round
+            reveals one further period.
+          </p>
+        </>
+      )}
+
+      <button onClick={onClose}
+        className="mt-6 w-full rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">
+        Close
+      </button>
+    </Overlay>
+  )
+}
+
 function Screener({ row }: { row: InstrumentRow | undefined }) {
+  const [expanded, setExpanded] = useState(false)
   const metrics = [
     { k: 'Market Cap', v: '—' },
     { k: 'P/E (TTM)', v: '—' },
@@ -445,7 +545,22 @@ function Screener({ row }: { row: InstrumentRow | undefined }) {
     { k: 'Beta', v: '—' },
   ]
   return (
-    <Panel title="Main Share Reports (Screener)" delay={0.12}>
+    <Panel
+      title="Main Share Reports (Screener)"
+      delay={0.12}
+      // The toggle lives in the header, so the panel's body — and therefore the
+      // whole terminal grid — keeps exactly the size it had at rest.
+      right={
+        row ? (
+          <button
+            onClick={() => setExpanded(true)}
+            className="rounded border border-[#E8C46A]/40 bg-[#E8C46A]/10 px-2 py-0.5 text-[9px] uppercase tracking-wider text-[#E8C46A] transition-colors hover:bg-[#E8C46A]/20"
+          >
+            Expand
+          </button>
+        ) : undefined
+      }
+    >
       {/* Laid out for height, not decoration: six metrics in TWO rows of three
           rather than three rows of two, and a single-line placeholder note.
           That buys back more room than the panel gained from the grid split,
@@ -474,6 +589,8 @@ function Screener({ row }: { row: InstrumentRow | undefined }) {
           <div className="py-6 text-center text-xs text-subtle">Select an instrument.</div>
         )}
       </div>
+
+      {expanded && row && <FundamentalsModal row={row} onClose={() => setExpanded(false)} />}
     </Panel>
   )
 }

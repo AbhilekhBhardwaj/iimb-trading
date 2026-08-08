@@ -309,6 +309,14 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     })
   }
 
+  // Fundamentals for one instrument. Gated server-side: the response contains
+  // only periods the current round has revealed.
+  if (method === 'GET' && path === '/api/fundamentals') {
+    const ticker = url.searchParams.get('ticker') ?? ''
+    if (!ticker) return json(res, 400, { error: 'ticker is required' })
+    return json(res, 200, { ticker, points: await service.fundamentals(ticker) })
+  }
+
   if (method === 'GET' && path === '/api/portfolio') {
     return json(res, 200, await service.portfolio(caller.accountId))
   }

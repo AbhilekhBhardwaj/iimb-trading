@@ -13,11 +13,16 @@ import { CARD, CARD_SHADOW, EASE, EDITORIAL_SERIF, GOLD } from '../../lib/design
 import { type ConfirmLine } from '../../lib/orderConfirm'
 
 /** Dimmed, blurred modal shell. Clicking the backdrop closes; the card does not. */
-export function Overlay({ children, onClose }: { children: ReactNode; onClose?: () => void }) {
+export function Overlay({ children, onClose, maxWidth = 'max-w-sm' }: {
+  children: ReactNode
+  onClose?: () => void
+  /** Widen for content that is a table rather than a few rows. */
+  maxWidth?: string
+}) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-6 backdrop-blur-sm" onClick={onClose}>
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3, ease: EASE }}
-        className={`${CARD} w-full max-w-sm p-6`} style={{ boxShadow: CARD_SHADOW }} onClick={(e) => e.stopPropagation()}>
+        className={`${CARD} w-full ${maxWidth} p-6`} style={{ boxShadow: CARD_SHADOW }} onClick={(e) => e.stopPropagation()}>
         {children}
       </motion.div>
     </div>
