@@ -149,6 +149,25 @@ export interface OrderRejection {
   ticker?: string
 }
 
+/** One position closed (or attempted) by the risk engine. */
+export interface LiquidationEvent {
+  accountId: string
+  ticker: string
+  /** The side traded to CLOSE: sell a long, buy back a short. */
+  side: Side
+  /** Size the position held when it tripped. */
+  qty: number
+  /** How much actually filled. Less than `qty` when the book was too thin. */
+  filledQty: number
+  /** The mark that tripped it. */
+  markPrice: number
+  liquidationPrice: number | null
+  entryPrice: number
+  leverage: number
+  partial: boolean
+  usdInrRate: number
+}
+
 export interface PlaceOrderResult {
   accepted: boolean
   /** Present when the order was rejected before matching. */
@@ -1487,6 +1506,113 @@ export class TradingService {
       })
     }
     return out.sort((a, b) => b.price - a.price)
+  }
+
+  // -------------------------------------------------------------------------
+  // Auto-liquidation
+  //
+  // liquidationPrice was computed and displayed but never ENFORCED: a position
+  // could sail past the price at which its margin is exhausted and stay open.
+  // Under the 1x-only model this matters for SHORTS specifically — a long
+  // liquidates at E*(1 - 1/1) = 0 and is unreachable, but a short liquidates at
+  // E*(1 + 1/1), the moment the price doubles, which is entirely reachable.
+  //
+  // The sweep runs on the server's existing 1s timer, so it fires on prices the
+  // Master moves, on prices moved by trading, and while nobody is polling.
+  // -------------------------------------------------------------------------
+
+  /** Close every position whose mark has crossed its liquidation price. */
+  async sweepLiquidations(): Promise<LiquidationEvent[]> {
+    // No active round means no trading and no moving prices; nothing to enforce.
+    if (this.rounds.getMode() === null || this.activeRoundId === null) return []
+
+    const { data, error } = await this.db
+      .from('positions')
+      .select('account_id, instrument_id, qty, avg_price, leverage')
+      .neq('qty', 0)
+    if (error) throw error
+
+    const out: LiquidationEvent[] = []
+    for (const row of data ?? []) {
+      const ticker = this.idToTicker.get(row.instrument_id as string)
+      if (ticker === undefined) continue
+      const qty = Number(row.qty)
+      if (qty === 0) continue
+      const pos = { qty, avgPrice: Number(row.avg_price), leverage: Number(row.leverage) }
+      const mark = this.ltp(ticker)
+      if (!(mark > 0)) continue
+      if (!isLiquidatable(pos, mark)) continue
+
+      const done = await this.liquidate(row.account_id as string, ticker, pos, mark)
+      if (done) out.push(done)
+    }
+    return out
+  }
+
+  /**
+   * Force-close one position at market.
+   *
+   * Deliberately routed through the ORDINARY placeOrder path: a liquidation is a
+   * real trade with a real counterparty, so it settles, charges commission and
+   * lands in Trade History exactly like any other close. Nothing is synthesised
+   * against thin air — inventing the other side of a fill would create money the
+   * competition never had and break its zero-sum arithmetic.
+   *
+   * The consequence, stated plainly because it is an operational dependency: a
+   * liquidation can only fill against resting liquidity. If the book is empty
+   * the position survives and the log records how much actually closed.
+   */
+  private async liquidate(
+    accountId: string,
+    ticker: string,
+    pos: { qty: number; avgPrice: number; leverage: number },
+    mark: number,
+  ): Promise<LiquidationEvent | null> {
+    const liq = liquidationPrice(pos)
+    const side: Side = pos.qty > 0 ? 'sell' : 'buy'
+    const qty = Math.abs(pos.qty)
+
+    const res = await this.placeOrder({
+      accountId, ticker, side, type: 'market', qty,
+      leverage: pos.leverage, markPrice: mark,
+      // No role: the market maker's buying-power exemption must not apply here.
+      // A liquidation REDUCES exposure, so the margin gate passes on its merits.
+    })
+    if (!res.accepted) {
+      await this.log(accountId, 'position_liquidation_failed', 'error', {
+        instrument: ticker, markPrice: mark, liquidationPrice: liq, qty,
+        reason: res.reason ?? null,
+      })
+      return null
+    }
+
+    const filledQty = (res.trades ?? []).reduce((a, t) => a + t.qty, 0)
+    const event: LiquidationEvent = {
+      accountId, ticker, side, qty, filledQty,
+      markPrice: mark,
+      liquidationPrice: liq,
+      entryPrice: pos.avgPrice,
+      leverage: pos.leverage,
+      partial: filledQty < qty,
+      usdInrRate: this.rateInr(),
+    }
+    await this.log(accountId, 'position_liquidated', 'warning', { ...event })
+
+    // Nothing filled means the book had no liquidity on that side. The log says
+    // so; do not announce a liquidation that did not actually happen.
+    if (filledQty === 0) return event
+
+    const { data: prof } = await this.db
+      .from('profiles').select('username').eq('id', accountId).maybeSingle()
+    const who = (prof?.username as string | undefined) ?? 'An account'
+    await this.publishNotification(
+      'data',
+      `Liquidated — ${who} ${side === 'buy' ? 'short' : 'long'} ${ticker}`,
+      `${filledQty} ${ticker} force-closed at market: the mark reached ${mark.toFixed(2)}, ` +
+        `past the liquidation price of ${liq === null ? '—' : liq.toFixed(2)}.` +
+        (event.partial ? ` ${qty - filledQty} could not be filled — the book was too thin.` : ''),
+    )
+    return event
   }
 
   /** Publish an event-wide notification (Master Terminal / testing). */

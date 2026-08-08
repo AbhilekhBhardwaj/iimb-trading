@@ -382,6 +382,14 @@ async function main(): Promise<void> {
     service.maybeAutoEndRound().catch((err) =>
       console.error('auto-end round failed:', err instanceof Error ? err.message : err),
     )
+    // Risk enforcement. Rides the same timer so it fires on prices the Master
+    // moves, on prices moved by trading, and while nobody is polling — a
+    // position must not survive being underwater just because its owner closed
+    // the tab. Failures are logged and swallowed: a sweep that throws must
+    // never take down the round timer beside it.
+    service.sweepLiquidations().catch((err) =>
+      console.error('liquidation sweep failed:', err instanceof Error ? err.message : err),
+    )
   }, 1000)
   ;(roundTimer as { unref?: () => void }).unref?.()
 
