@@ -23,6 +23,7 @@ import { extname, join, normalize, resolve } from 'node:path'
 // pinned per round and only the Master changes it (POST /api/round/rate).
 import { createAdminClient } from './supabaseAdmin'
 import { TradingService } from './tradingService'
+import { JSON_HEADERS } from './httpHeaders'
 
 // API_PORT wins in local dev (Vite proxies /api → 8787); on Railway/PaaS the
 // platform injects PORT and there is no API_PORT, so we bind that instead.
@@ -89,12 +90,7 @@ async function authenticate(req: IncomingMessage): Promise<Caller | null> {
 // ---------------------------------------------------------------------------
 function json(res: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body)
-  res.writeHead(status, {
-    'content-type': 'application/json',
-    'access-control-allow-origin': '*',
-    'access-control-allow-headers': 'authorization, content-type',
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
-  })
+  res.writeHead(status, { ...JSON_HEADERS })
   res.end(payload)
 }
 

@@ -398,7 +398,10 @@ async function get<T>(path: string, tries = 3): Promise<T> {
   for (let attempt = 0; attempt < tries; attempt++) {
     let res: Response | null = null
     try {
-      res = await fetch(`/api${path}`, { headers: await authHeaders() })
+      // `no-store`: never serve a trading read from the HTTP cache. The server
+      // sends no-store too; this is the half we control when an intermediary
+      // does not honour it.
+      res = await fetch(`/api${path}`, { headers: await authHeaders(), cache: 'no-store' })
     } catch (err) {
       lastErr = err // network/connection error → transient, retry
     }

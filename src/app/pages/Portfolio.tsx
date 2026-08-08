@@ -83,7 +83,10 @@ function Portfolio() {
         }
       }
       await tick()
-      id = window.setInterval(tick, 2000)
+      // 1.5s, near the Terminal's 1s. Not 1s: portfolio() is the heaviest
+      // endpoint (four DB round-trips including a full trades replay) and every
+      // account polls it, so the extra load buys little over 1.5s.
+      id = window.setInterval(tick, 1500)
     })()
     return () => { alive = false; if (id) window.clearInterval(id) }
   }, [navigate])
