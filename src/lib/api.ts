@@ -307,6 +307,26 @@ export interface ResetEventResult {
   round: RoundStatus
 }
 
+/**
+ * One position past its liquidation threshold, as the market-maker desk sees it.
+ * Mirrors server/tradingService.ts LiquidatableView.
+ */
+export interface LiquidatableRow {
+  accountId: string
+  username: string
+  ticker: string
+  side: 'long' | 'short'
+  qty: number
+  entryPrice: number
+  markPrice: number
+  liquidationPrice: number
+  /** How far BEYOND the threshold, in USD. Positive means past it. */
+  pastByUsd: number
+  pastByPct: number
+  leverage: number
+  notionalBasisInr: number
+}
+
 /** Mirrors the server's RejectionCode — see server/tradingService.ts. */
 export type RejectionCode =
   | 'no_active_round'
@@ -481,6 +501,13 @@ export const api = {
   placeOrder: (input: PlaceOrderInput) => post<PlaceOrderResult>('/orders', input),
   cancelOrder: (orderId: string) => post<{ cancelled: boolean }>('/orders/cancel', { orderId }),
   portfolio: async () => normalizePortfolio(await get<Portfolio>('/portfolio')),
+
+  // Market-maker only. Both 403 for any other role.
+  /** Positions currently past their liquidation threshold. Read-only. */
+  liquidations: async () => (await get<{ positions: LiquidatableRow[] }>('/liquidations')).positions ?? [],
+  /** Force-close one position at market. Never automatic — this is the button. */
+  liquidate: (accountId: string, ticker: string) =>
+    post<{ applied: boolean; event?: unknown }>('/liquidations/close', { accountId, ticker }),
   leaderboard: () => get<{ leaderboard: LeaderboardEntry[] }>('/leaderboard'),
 
   // Master Terminal

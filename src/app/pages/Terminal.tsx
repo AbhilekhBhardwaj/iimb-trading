@@ -5,6 +5,7 @@ import { applyLeveredFill, DEFAULT_COMMISSION_RATE, liquidationPrice, requiredMa
 import { CARD, CARD_SHADOW, EDITORIAL_SERIF, GOLD, INPUT, LIST_ROW } from '../../lib/design-patterns'
 import { toCashPosition } from '../../lib/orderConfirm'
 import { depthCountLabel, spreadScrollTop } from '../../lib/depthLadder'
+import { buildLiquidationLines, closingSide, hasCrossed, liquidationWarning, pastLabel } from '../../lib/liquidationPanel'
 import { buildConfirmLines, buildTradeOutcome, estimateFill, type MarketContext, previewPrice } from '../../lib/orderFlow'
 import { supabase } from '../../lib/supabase'
 import { NotificationStrip } from '../components/NotificationStrip'
@@ -16,6 +17,7 @@ import {
   api,
   type Bootstrap,
   type DepthView,
+  type LiquidatableRow,
   type InstrumentRow,
   type Notification,
   type OrderType,
@@ -345,6 +347,80 @@ function OrderWindow({ ticker, row, roundActive, rate, depth, onConfirmPlace }: 
   )
 }
 
+
+// ---------------------------------------------------------------------------
+// Left 3 (market maker only) — risk desk
+// ---------------------------------------------------------------------------
+/**
+ * Positions past their liquidation threshold, and the button that closes them.
+ *
+ * Detection is continuous; enforcement is not. Nothing here fires on a timer —
+ * a position is only ever closed because someone on this desk decided it should
+ * be. The list informs that judgement rather than constraining it: the server
+ * permits closing anything, so a row that has NOT crossed can still be acted on
+ * and is labelled accordingly.
+ *
+ * Market maker only. No team or master can reach the endpoints behind it.
+ */
+function RiskPanel({ rows, busy, onClose }: {
+  rows: LiquidatableRow[]
+  busy: string | null
+  onClose: (r: LiquidatableRow) => void
+}) {
+  return (
+    <Panel
+      title="Risk — Liquidatable"
+      delay={0.12}
+      right={
+        <span className={`font-mono text-[10px] tabular-nums ${rows.length > 0 ? 'text-destructive' : 'text-subtle'}`}>
+          {rows.length}
+        </span>
+      }
+    >
+      <div className="min-h-0 flex-1 overflow-y-auto p-2 text-[11px]">
+        <div className="mb-1 flex items-center gap-2 px-2 text-[9px] uppercase tracking-wider text-subtle">
+          <span className="w-16">Account</span>
+          <span className="w-12">Script</span>
+          <span className="w-10 text-right">Qty</span>
+          <span className="w-14 text-right">Mark</span>
+          <span className="w-14 text-right">Liq</span>
+          <span className="w-12 text-right">Past</span>
+          <span className="w-12" />
+        </div>
+        {rows.length === 0 ? (
+          <div className="py-6 text-center text-subtle">No positions past their liquidation price.</div>
+        ) : (
+          rows.map((r) => {
+            const key = `${r.accountId}:${r.ticker}`
+            return (
+              <div key={key} className="flex items-center gap-2 rounded px-2 py-1 font-mono tabular-nums hover:bg-white/[0.03]">
+                <span className="w-16 truncate text-foreground">{r.username}</span>
+                <span className="w-12 text-[#E8C46A]">{r.ticker}</span>
+                <span className={`w-10 text-right ${r.side === 'short' ? 'text-destructive' : 'text-up'}`}>{r.qty}</span>
+                <span className="w-14 text-right text-foreground">{usd(r.markPrice)}</span>
+                <span className="w-14 text-right text-muted">{usd(r.liquidationPrice)}</span>
+                {/* Positive = past the threshold. A row that has not crossed is
+                    still listed if the desk asked for it, but must not look the
+                    same as one that has. */}
+                <span className={`w-12 text-right ${hasCrossed(r) ? 'text-destructive' : 'text-subtle'}`}>
+                  {pastLabel(r.pastByPct)}
+                </span>
+                <button
+                  disabled={busy === key}
+                  onClick={() => onClose(r)}
+                  className="w-12 rounded border border-destructive/40 bg-destructive/10 py-0.5 text-[9px] uppercase tracking-wide text-destructive transition-colors hover:bg-destructive/20 disabled:opacity-40"
+                >
+                  {busy === key ? '…' : 'Close'}
+                </button>
+              </div>
+            )
+          })
+        )}
+      </div>
+    </Panel>
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Left 3 — screener (placeholder fundamentals)
 // ---------------------------------------------------------------------------
@@ -625,6 +701,11 @@ function Terminal() {
   const [result, setResult] = useState<TradeResult | null>(null)
   /** A refused order. Modal, like a fill — never a toast that fades away. */
   const [rejected, setRejected] = useState<RejectionResult | null>(null)
+  // Market-maker risk desk. Polled separately from the snapshot because only one
+  // role can see it; every other account never issues the request at all.
+  const [risk, setRisk] = useState<LiquidatableRow[]>([])
+  const [riskPending, setRiskPending] = useState<LiquidatableRow | null>(null)
+  const [riskBusy, setRiskBusy] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [announcement, setAnnouncement] = useState<Notification | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -695,6 +776,46 @@ function Terminal() {
   const rows = snap?.instruments ?? []
   const row = rows.find((r) => r.ticker === selected)
   const roundActive = !!snap?.round.active
+
+  // Risk desk polling. Market maker only, so no other account ever issues the
+  // request. Same 1s cadence as the snapshot: a threshold crossing should be
+  // visible on the desk about as fast as the price that caused it.
+  const isMarketMaker = boot?.role === 'market_maker'
+  useEffect(() => {
+    if (!isMarketMaker) return
+    let alive = true
+    const tick = async () => {
+      try {
+        const list = await api.liquidations()
+        if (alive) setRisk(list)
+      } catch {
+        // Silent: the snapshot poll already owns the "Reconnecting…" indicator,
+        // and a failed risk poll must not add a second competing signal.
+      }
+    }
+    void tick()
+    const id = window.setInterval(tick, 1000)
+    return () => { alive = false; window.clearInterval(id) }
+  }, [isMarketMaker])
+
+  /** Force-close one position, then refresh the list immediately. */
+  async function doLiquidate(r: LiquidatableRow) {
+    setRiskPending(null)
+    const key = `${r.accountId}:${r.ticker}`
+    setRiskBusy(key)
+    analytics.capture('position_liquidated', {
+      ticker: r.ticker, side: r.side, qty: r.qty, pastByPct: r.pastByPct, crossed: hasCrossed(r),
+    })
+    try {
+      await api.liquidate(r.accountId, r.ticker)
+      pushToast(true, 'Position closed', `${r.username} ${r.side.toUpperCase()} ${r.ticker} — ${closingSide(r).toUpperCase()} at market`)
+      setRisk(await api.liquidations())
+    } catch (err) {
+      pushToast(false, 'Liquidation failed', err instanceof Error ? err.message : 'The position was not closed.')
+    } finally {
+      setRiskBusy(null)
+    }
+  }
 
   /**
    * The market/account context both dialogs read. Captured fresh at each use so
@@ -779,7 +900,12 @@ function Terminal() {
           <InstrumentList rows={rows} selected={selected} onSelect={setSelected} />
           <OrderWindow ticker={selected} row={row} roundActive={roundActive}
             rate={snap?.rate ?? 83} depth={snap?.depth ?? null} onConfirmPlace={setPending} />
-          <Screener row={row} />
+          {/* The market maker gets the risk desk in the Screener's slot: the
+              Screener is placeholder fundamentals, and the desk needs this in
+              front of it the whole time. */}
+          {boot.role === 'market_maker'
+            ? <RiskPanel rows={risk} busy={riskBusy} onClose={setRiskPending} />
+            : <Screener row={row} />}
         </div>
 
         {/* RIGHT column: chart / depth / times & sales */}
@@ -824,6 +950,18 @@ function Terminal() {
           <button onClick={() => setAnnouncement(null)} className="mt-6 w-full rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Dismiss</button>
         </Overlay>
       )}
+      {riskPending && (
+        <ConfirmDialog
+          title="Force-Close Position"
+          tone="destructive"
+          confirmLabel={`${closingSide(riskPending).toUpperCase()} at Market`}
+          onCancel={() => setRiskPending(null)}
+          onConfirm={() => doLiquidate(riskPending)}
+          lines={buildLiquidationLines(riskPending)}
+          note={liquidationWarning(riskPending)}
+        />
+      )}
+
       {rejected && <RejectDialog title={rejected.title} detail={rejected.detail} onClose={() => setRejected(null)} />}
 
       <Toasts toasts={toasts} />

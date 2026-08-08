@@ -39,11 +39,18 @@ function Rows({ lines }: { lines: ConfirmLine[] }) {
 }
 
 /** Pre-trade confirmation. Rows come from buildConfirmLines. */
-export function ConfirmDialog({ title, lines, confirmLabel, tone, onConfirm, onCancel }: {
+export function ConfirmDialog({ title, lines, confirmLabel, tone, note, onConfirm, onCancel }: {
   title: string
   lines: ConfirmLine[]
   confirmLabel: string
   tone: 'up' | 'destructive'
+  /**
+   * Optional prose beneath the rows, for a confirmation whose consequence the
+   * numbers alone do not convey — the market maker's force-close, where the
+   * rows say what will happen and this says who it happens to and that it
+   * cannot be undone.
+   */
+  note?: string
   onConfirm: () => void
   onCancel: () => void
 }) {
@@ -51,6 +58,11 @@ export function ConfirmDialog({ title, lines, confirmLabel, tone, onConfirm, onC
     <Overlay onClose={onCancel}>
       <h3 className="text-bright" style={{ ...EDITORIAL_SERIF, fontSize: '1.35rem' }}>{title}</h3>
       <Rows lines={lines} />
+      {note && (
+        <p className="mt-4 rounded-lg border border-destructive/25 bg-destructive/[0.06] p-3 text-[12px] leading-relaxed text-muted">
+          {note}
+        </p>
+      )}
       <div className="mt-6 flex gap-2">
         <button onClick={onCancel} className="flex-1 rounded-full border border-white/10 py-2.5 text-sm text-muted transition-colors hover:bg-white/[0.04]">Cancel</button>
         <button onClick={onConfirm}

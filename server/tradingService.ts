@@ -166,6 +166,27 @@ export interface LiquidationEvent {
   leverage: number
   partial: boolean
   usdInrRate: number
+  /** Always 'market_maker' — liquidation is never automatic. */
+  triggeredBy: 'market_maker'
+  /** The market-maker account that triggered it. */
+  triggeredByAccountId: string
+}
+
+/** One position past its liquidation threshold, as the market maker sees it. */
+export interface LiquidatableView {
+  accountId: string
+  username: string
+  ticker: string
+  side: 'long' | 'short'
+  qty: number
+  entryPrice: number
+  markPrice: number
+  liquidationPrice: number
+  /** How far BEYOND the threshold, in USD. Positive means past it. */
+  pastByUsd: number
+  pastByPct: number
+  leverage: number
+  notionalBasisInr: number
 }
 
 export interface PlaceOrderResult {
@@ -1517,36 +1538,114 @@ export class TradingService {
   // liquidates at E*(1 - 1/1) = 0 and is unreachable, but a short liquidates at
   // E*(1 + 1/1), the moment the price doubles, which is entirely reachable.
   //
-  // The sweep runs on the server's existing 1s timer, so it fires on prices the
-  // Master moves, on prices moved by trading, and while nobody is polling.
+  // Detection is continuous; ENFORCEMENT is manual. The market maker sees the
+  // list and decides, position by position, whether to close — nothing fires on
+  // a timer, so no position is ever closed without a human pressing the button.
   // -------------------------------------------------------------------------
 
-  /** Close every position whose mark has crossed its liquidation price. */
-  async sweepLiquidations(): Promise<LiquidationEvent[]> {
-    // No active round means no trading and no moving prices; nothing to enforce.
+  /**
+   * Every position currently past its liquidation threshold.
+   *
+   * READ-ONLY. Detection is continuous; closing is not. Nothing here changes a
+   * position — the market maker decides, per position, whether and when to act.
+   */
+  async liquidatablePositions(caller: { accountId: string; role: string }): Promise<LiquidatableView[]> {
+    if (caller.role !== 'market_maker') return []
     if (this.rounds.getMode() === null || this.activeRoundId === null) return []
 
     const { data, error } = await this.db
       .from('positions')
-      .select('account_id, instrument_id, qty, avg_price, leverage')
+      .select('account_id, instrument_id, qty, avg_price, leverage, notional_basis_inr')
       .neq('qty', 0)
     if (error) throw error
 
-    const out: LiquidationEvent[] = []
-    for (const row of data ?? []) {
+    const rows = (data ?? []).filter((r) => Number(r.qty) !== 0)
+    if (rows.length === 0) return []
+
+    const { data: profs } = await this.db
+      .from('profiles')
+      .select('id, username')
+      .in('id', [...new Set(rows.map((r) => r.account_id as string))])
+    const nameById = new Map((profs ?? []).map((pr) => [pr.id as string, pr.username as string]))
+
+    const out: LiquidatableView[] = []
+    for (const row of rows) {
       const ticker = this.idToTicker.get(row.instrument_id as string)
       if (ticker === undefined) continue
       const qty = Number(row.qty)
-      if (qty === 0) continue
       const pos = { qty, avgPrice: Number(row.avg_price), leverage: Number(row.leverage) }
-      const mark = this.ltp(ticker)
-      if (!(mark > 0)) continue
-      if (!isLiquidatable(pos, mark)) continue
+      const markPrice = this.ltp(ticker)
+      if (!(markPrice > 0)) continue
+      if (!isLiquidatable(pos, markPrice)) continue
+      const liq = liquidationPrice(pos)
+      if (liq === null) continue
 
-      const done = await this.liquidate(row.account_id as string, ticker, pos, mark)
-      if (done) out.push(done)
+      // Distance BEYOND the threshold, signed so that positive always means
+      // "past it" whichever way the position runs.
+      const pastByUsd = qty > 0 ? liq - markPrice : markPrice - liq
+      out.push({
+        accountId: row.account_id as string,
+        username: nameById.get(row.account_id as string) ?? 'unknown',
+        ticker,
+        side: qty > 0 ? 'long' : 'short',
+        qty,
+        entryPrice: pos.avgPrice,
+        markPrice,
+        liquidationPrice: liq,
+        pastByUsd,
+        pastByPct: liq > 0 ? (pastByUsd / liq) * 100 : 0,
+        leverage: pos.leverage,
+        notionalBasisInr: Math.abs(Number(row.notional_basis_inr)),
+      })
     }
-    return out
+    // Worst first: the market maker should see the most urgent at the top.
+    return out.sort((a, b) => b.pastByPct - a.pastByPct)
+  }
+
+  /**
+   * Close ONE position at market, on the market maker's explicit instruction.
+   *
+   * Market-maker only — no team or master can reach this. Within that role the
+   * authority is unrestricted: any open position, whether or not it has crossed
+   * its liquidation price. `liquidatablePositions` exists to inform that
+   * judgement, not to constrain it.
+   *
+   * Every close is logged with the account, the mark, the threshold and who
+   * pressed the button, so the record shows precisely what was done.
+   */
+  async liquidatePosition(
+    caller: { accountId: string; role: string },
+    accountId: string,
+    ticker: string,
+  ): Promise<{ applied: boolean; reason?: string; event?: LiquidationEvent }> {
+    if (caller.role !== 'market_maker') return { applied: false, reason: 'forbidden' }
+    if (this.rounds.getMode() === null || this.activeRoundId === null) {
+      return { applied: false, reason: 'no active round' }
+    }
+    const instrumentId = this.tickerToId.get(ticker)
+    if (!instrumentId) return { applied: false, reason: `unknown instrument: ${ticker}` }
+
+    const { data, error } = await this.db
+      .from('positions')
+      .select('qty, avg_price, leverage')
+      .eq('account_id', accountId)
+      .eq('instrument_id', instrumentId)
+      .maybeSingle()
+    if (error) throw error
+    const qty = data ? Number(data.qty) : 0
+    if (!data || qty === 0) return { applied: false, reason: 'no open position' }
+
+    const pos = { qty, avgPrice: Number(data.avg_price), leverage: Number(data.leverage) }
+    const markPrice = this.ltp(ticker)
+    if (!(markPrice > 0)) return { applied: false, reason: 'no_reference_price' }
+    // Deliberately NOT re-checked against isLiquidatable. The market maker desk
+    // is trusted to judge when a position must go; the list is a reference, not
+    // a permission check. The audit trail records exactly what was closed and at
+    // what mark, which is the accountability that matters here.
+
+    const event = await this.liquidate(accountId, ticker, pos, markPrice, caller.accountId)
+    if (!event) return { applied: false, reason: 'liquidation order rejected' }
+    return { applied: true, event }
   }
 
   /**
@@ -1567,6 +1666,8 @@ export class TradingService {
     ticker: string,
     pos: { qty: number; avgPrice: number; leverage: number },
     mark: number,
+    /** The market-maker account that pressed the button. */
+    triggeredByAccountId: string,
   ): Promise<LiquidationEvent | null> {
     const liq = liquidationPrice(pos)
     const side: Side = pos.qty > 0 ? 'sell' : 'buy'
@@ -1582,6 +1683,7 @@ export class TradingService {
       await this.log(accountId, 'position_liquidation_failed', 'error', {
         instrument: ticker, markPrice: mark, liquidationPrice: liq, qty,
         reason: res.reason ?? null,
+        triggeredBy: 'market_maker', triggeredByAccountId,
       })
       return null
     }
@@ -1595,6 +1697,9 @@ export class TradingService {
       leverage: pos.leverage,
       partial: filledQty < qty,
       usdInrRate: this.rateInr(),
+      // Never automatic: a human on the market-maker desk chose this.
+      triggeredBy: 'market_maker',
+      triggeredByAccountId,
     }
     await this.log(accountId, 'position_liquidated', 'warning', { ...event })
 
@@ -1608,8 +1713,8 @@ export class TradingService {
     await this.publishNotification(
       'data',
       `Liquidated — ${who} ${side === 'buy' ? 'short' : 'long'} ${ticker}`,
-      `${filledQty} ${ticker} force-closed at market: the mark reached ${mark.toFixed(2)}, ` +
-        `past the liquidation price of ${liq === null ? '—' : liq.toFixed(2)}.` +
+      `${filledQty} ${ticker} force-closed at market by the market maker. ` +
+        `Mark ${mark.toFixed(2)}; liquidation price ${liq === null ? '—' : liq.toFixed(2)}.` +
         (event.partial ? ` ${qty - filledQty} could not be filled — the book was too thin.` : ''),
     )
     return event

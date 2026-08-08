@@ -248,6 +248,30 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return json(res, 200, { cancelled })
   }
 
+  // -- market-maker-only: liquidation ---------------------------------------
+  // Detection is continuous, enforcement is manual. The market maker sees who
+  // is past their threshold and decides, position by position, whether to close.
+  const requireMarketMaker = () => caller.role === 'market_maker'
+
+  if (method === 'GET' && path === '/api/liquidations') {
+    if (!requireMarketMaker()) return json(res, 403, { error: 'forbidden' })
+    return json(res, 200, {
+      positions: await service.liquidatablePositions({ accountId: caller.accountId, role: caller.role }),
+    })
+  }
+
+  if (method === 'POST' && path === '/api/liquidations/close') {
+    if (!requireMarketMaker()) return json(res, 403, { error: 'forbidden' })
+    const b = await readJson(req)
+    const result = await service.liquidatePosition(
+      { accountId: caller.accountId, role: caller.role },
+      String(b.accountId ?? ''),
+      String(b.ticker ?? ''),
+    )
+    if (!result.applied) return json(res, 400, { error: result.reason, applied: false })
+    return json(res, 200, { applied: true, event: result.event })
+  }
+
   // -- master-only (Master Terminal wires the UI for these next) -----------
   if (method === 'POST' && path === '/api/round/start') {
     if (!requireMaster()) return json(res, 403, { error: 'forbidden' })
@@ -381,14 +405,6 @@ async function main(): Promise<void> {
   const roundTimer = setInterval(() => {
     service.maybeAutoEndRound().catch((err) =>
       console.error('auto-end round failed:', err instanceof Error ? err.message : err),
-    )
-    // Risk enforcement. Rides the same timer so it fires on prices the Master
-    // moves, on prices moved by trading, and while nobody is polling — a
-    // position must not survive being underwater just because its owner closed
-    // the tab. Failures are logged and swallowed: a sweep that throws must
-    // never take down the round timer beside it.
-    service.sweepLiquidations().catch((err) =>
-      console.error('liquidation sweep failed:', err instanceof Error ? err.message : err),
     )
   }, 1000)
   ;(roundTimer as { unref?: () => void }).unref?.()
